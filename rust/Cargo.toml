@@ -1,0 +1,11 @@
+[package]
+name = "rsbench"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+png = "0.17"
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
