@@ -14,6 +14,7 @@ import (
 	"image/png"
 	"math"
 	"os"
+	"runtime/pprof"
 	"sort"
 	"time"
 
@@ -320,6 +321,18 @@ func main() {
 	in := os.Args[2]
 	out := os.Args[3]
 	warm, iters := 3, 15
+	// CPU profiling is opt-in via CPUPROFILE=<path>; the profile covers the whole
+	// warm+timed loop so the phase attribution matches the reported medians.
+	if pp := os.Getenv("CPUPROFILE"); pp != "" {
+		pf, err := os.Create(pp)
+		if err != nil {
+			panic(err)
+		}
+		if err := pprof.StartCPUProfile(pf); err != nil {
+			panic(err)
+		}
+		defer func() { pprof.StopCPUProfile(); pf.Close() }()
+	}
 	raw, err := os.ReadFile(in)
 	if err != nil {
 		panic(err)
@@ -344,6 +357,24 @@ func main() {
 			g = preprocessFast(img, scale)
 		case "B2":
 			g = preprocessFast2(img, scale)
+		case "D":
+			g = preprocessD(img, scale)
+		case "D1":
+			g = preprocessD1(img, scale)
+		case "D2":
+			g = preprocessD2(img, scale)
+		case "D3":
+			g = preprocessD3(img, scale)
+		case "D4":
+			g = preprocessD4(img, scale)
+		case "E":
+			g = preprocessE(img, scale)
+		case "F64":
+			g = preprocessF64(img, scale)
+		case "F32":
+			g = preprocessF32(img, scale)
+		default:
+			panic("unknown variant " + variant)
 		}
 		t2 := time.Now()
 		if variant == "A" {

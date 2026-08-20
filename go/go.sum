@@ -1,2 +1,6 @@
+github.com/gameparrot/fastpng v0.0.0-20250305185850-d72e123a2123 h1:sThO6jXyngtFu/mCwB4a19gkyGtQ9Ae0GALfOsoR1hY=
+github.com/gameparrot/fastpng v0.0.0-20250305185850-d72e123a2123/go.mod h1:4dreA1wSeh5wAyHlrnWvFL4Qd56NNP9MVhC2G8lxexc=
+github.com/klauspost/compress v1.19.2 h1:hMRETovs/pu/dVWN7zIT1PGG8t509MwT6bO7XSi26R8=
+github.com/klauspost/compress v1.19.2/go.mod h1:cwPg85FWrGar70rWktvGQj8/hthj3wpl0PGDogxkrSQ=
 golang.org/x/image v0.25.0 h1:Y6uW6rH1y5y/LK1J8BPWZtr6yZ7hrsy6hFrXjgsc2fQ=
 golang.org/x/image v0.25.0/go.mod h1:tCAmOEGthTtkalusGp1g3xa2gke8J6c2N565dTyl9Rs=

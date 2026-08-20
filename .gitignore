@@ -3,3 +3,5 @@
 /out/
 rust/target/
 *.exe
+go/bin/
+prof/
