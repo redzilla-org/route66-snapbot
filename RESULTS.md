@@ -1071,3 +1071,44 @@ pixels loses to Pillow's fused C loops.
    it today; no amount of transform work in Go can reach it.
 3. **Ship variant K regardless of language.** A free 1.4-1.5x on the transform in both
    Go and Rust, with byte-identical output.
+
+## The handoff-format ladder, measured
+
+Part 4's first recommendation is "stop decoding PNG at the producer". It was measured
+rather than asserted, and **the cheap-looking version of it does not work.**
+
+Decode share of total, for scale: Go 45.3 ms (37%) on `typical`, 143.5 ms (**69%**) on
+`big` -- more than twice the transform that Parts 2-4 spent their effort on.
+
+| handoff format | file size (big) | Go decode | saved vs PNG |
+|---|---|---|---|
+| PNG as-is | 2.6 MB | 143.5 ms | -- |
+| PNG, `compress_level=0` | 22.5 MB | 92.7 ms | 35% |
+| BMP, uncompressed | 22.5 MB | 40.6 ms | 56% |
+| raw bytes, no container | 22.4 MB | **12.0 ms** | **92%** |
+| raw bytes, `typical` | 11.9 MB | 6.1 ms | 87% |
+
+**Turning DEFLATE off while keeping the PNG container recovers only a third**, because
+the row filters, the adler32 pass and the row-by-row buffer plumbing all survive while
+the file inflates 8.7x. The win needs the container gone too.
+
+Why decode is expensive, from the Go profile on `big.png`: `filterPaeth` 16.5% flat plus
+`png.abs` 5.3% (Paeth predicts each byte from its neighbours, a loop-carried dependency
+on every byte -- unvectorizable), `flate.huffmanBlock`/`huffSym`/`dictDecoder` ~15%
+(bit-serial Huffman), `adler32.update` 6.3%. None of it is the pipeline's own
+computation; it is undoing a compression the producer just paid more CPU to apply.
+
+The trade is size: raw is 8.7x bigger on `big` and 23x on `typical` (510 KB -> 11.9 MB).
+Same machine, temp file, pipe or shared memory -- take it. Crosses a network or gets
+archived -- PNG stays, and the lever is then Go's decoder specifically, which the `png`
+crate beats by 2.8-3.3x and libpng by 1.5-1.8x on the identical file.
+
+**The stronger form: hand over raw 8-bit gray, not RGBA.** The consumer's first act is
+to discard colour, so a quarter of the bytes (7.5 MB on `big` -- smaller than the
+level-0 PNG *and* faster than every row above) also deletes the luma pass, currently the
+largest remaining item in the profile at 25.9% flat. This is the same move already made
+on the output side, where PNG -> PGM saved 131 ms of encode; on the input side it is
+worth more.
+
+Caveat: the producer is outside this repo and was not inspected. This is an argument
+about the handoff, not a claim about any specific upstream step.
