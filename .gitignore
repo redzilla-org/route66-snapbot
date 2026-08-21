@@ -1,7 +1,5 @@
-# Build output
-/bin/
-/out/
+# Build and measurement outputs are reproducible; only sources and results are tracked.
+out/
+bin/
 rust/target/
-*.exe
-go/bin/
-prof/
+__pycache__/

@@ -1,5 +1,16 @@
 # Results
 
+> **RETRACTION -- read this before Parts 1 and 2.** Every cross-language claim in
+> Parts 1 and 2 is **withdrawn**, including the headline "Go's transform is 2.77x
+> faster than Rust". Those parts compared a four-times-optimized Go implementation
+> against Rust variant C, which was a faithful port of Go's *naive* variant -- an
+> optimized/unoptimized comparison reported as a language result -- and they compared
+> medians collected in *different sessions* on a host that drifts by up to 7.4% between
+> sessions. Parts 1 and 2 are kept in full because their *within-language* findings and
+> their method are still the record of how the optimizations were attributed. The
+> corrected, paired, single-session head-to-head is **[Part 3](#part-3-the-retraction-and-the-corrected-head-to-head)**,
+> which supersedes them on every cross-language number.
+
 Measured 2026-08-20 on Windows 11 (x86-64), Go 1.27.0, cargo 1.93.1 (rustc release
 profile, `opt-level = 3`, `codegen-units = 1`). Every variant is single-threaded.
 15 timed iterations after 3 warmup iterations; each iteration re-decodes the PNG
@@ -150,6 +161,8 @@ End to end, best Go against the original: `typical` 565.84 -> 263.13 ms (2.15x),
 `big` 622.61 -> 208.64 ms (2.98x).
 
 ### Does Rust beat optimized Go on the transform phase, and by what factor?
+
+> **RETRACTED.** "Rust" here is variant C, an unoptimized reference port. See Part 3.
 
 No. Rust is marginally slower on transform, in both fixtures:
 
@@ -558,6 +571,13 @@ in this document is single-threaded, and this should not be re-proposed.
 
 ## Verdict: does optimized Go beat Rust?
 
+> **RETRACTED IN FULL.** This whole section pits optimized Go against *unoptimized*
+> Rust, across two sessions on a drifting host. The 2.77x below is not a language
+> result. The corrected paired measurement -- Go 1.51x on typical, 1.26x on big, with
+> Rust winning decode by 2.6-2.8x and total time on big.png by 1.58x -- is in Part 3.
+> The section is kept, unedited, so the retraction can be checked against what it
+> retracts.
+
 **On the transform phase -- yes, decisively, on both fixtures.**
 
 | Fixture | Rust C | Go D | Go E | D vs Rust |
@@ -600,3 +620,454 @@ in Go. It is 2.10x faster end to end than B2 on typical.png (284.79 -> 135.28) a
 byte-identical to A wherever the published gate requires it. Then take the upstream
 change and delete the PNG decode entirely, which is worth more than everything in
 Part 2 put together.
+
+---
+
+# Part 3: the retraction, and the corrected head-to-head
+
+Measured 2026-08-20, same host, Go 1.25.1, cargo release profile. This part supersedes
+the cross-language verdict in Parts 1 and 2.
+
+## RETRACTION
+
+**Part 2's headline -- "optimized Go's transform is 2.77x faster than Rust" -- is
+withdrawn. It was not a language result and it should not be cited.**
+
+It compared Go variant D, which had been through four rounds of profile-guided
+optimization, against Rust variant C, which was a faithful port of Go's *naive*
+variant A: an `f64` luma side-buffer, a fused four-tap `f64` bilinear kernel, no axis
+tables, no separable pass. C was written as a correctness reference, and it was
+correct; it was never an optimized implementation, and reporting it as "Rust" made the
+comparison a measurement of two different algorithms wearing two different languages.
+
+A second, independent defect: the Part 1 and Part 2 numbers for the two languages were
+collected in different sessions. This host drifts. The same Go binary running the same
+variant on the same fixture moved 82.8 -> 88.9 ms on transform across two sessions --
+7.4%, which is larger than several of the differences Part 2 reported as findings.
+Two medians from two sessions are not comparable at that resolution, in either
+direction.
+
+Both defects are fixed below: each language's four optimizations were ported into the
+other, and the final contestants were re-measured **in one interleaved session**.
+
+## Method: paired, interleaved, order-shuffled
+
+`prof/paired_xlang.py` (a cross-language sibling of `prof/paired_ab.py`, which could
+only resolve Go binaries) runs every contestant **back to back inside one pair**, with
+the order **shuffled per pair**, 11 pairs per fixture. Each invocation is itself the
+standard 15 timed iterations after 3 warmups and reports its own median.
+
+The reported statistic is therefore the **median of per-pair ratios**, not the ratio of
+two independently drifting medians. Drift that is slow relative to one pair cancels
+out. Alongside it is a **sign count**: the number of pairs in which the direction held.
+
+**How to read a sign count.** 11/11 or 0/11 means the direction was consistent in every
+pair and the median ratio is a result. A count near 5-6 out of 11 means the two
+configurations traded places from pair to pair -- that is a **tie**, and the median
+ratio must not be quoted as a margin no matter how far from 1.000 it happens to land.
+
+Contestants:
+
+| Label | Build |
+|-------|-------|
+| `goK_v1` | Go variant K, `GOAMD64=v1`, `-pgo=off` -- the Go recommendation |
+| `rsDB_native` | Rust variant DB, `RUSTFLAGS="-C target-cpu=native"`, `lto="fat"`, `panic="abort"` -- the Rust recommendation |
+| `rsDB_baseflags` | Rust variant DB, same source and same `lto`/`panic`, **without** `-C target-cpu=native` |
+| `goK_v3` | Go variant K, `GOAMD64=v3`, `-pgo=off` -- a labelled data point, **not** the recommendation (see the 80-pixel note) |
+
+## The corrected head-to-head
+
+Absolute medians of the 11 per-pair medians, milliseconds:
+
+### typical.png (1366 x 2915, factor 2)
+
+| Config | decode | transform | encode+write | total |
+|--------|--------|-----------|--------------|-------|
+| goK_v1 | 46.77 | **59.45** | 14.07 | 120.06 |
+| rsDB_native | **17.05** | 87.69 | **10.41** | **115.66** |
+| rsDB_baseflags | 16.58 | 100.91 | 10.80 | 127.49 |
+| goK_v3 | 47.29 | 57.71 | 14.31 | 119.49 |
+
+### big.png (1366 x 5477, factor 1 -- no scaler in the path)
+
+| Config | decode | transform | encode+write | total |
+|--------|--------|-----------|--------------|-------|
+| goK_v1 | 144.31 | **57.51** | 6.56 | 208.84 |
+| rsDB_native | **53.94** | 72.32 | **5.42** | **131.77** |
+| rsDB_baseflags | 52.67 | 80.20 | 5.29 | 136.79 |
+| goK_v3 | 142.77 | 54.18 | 6.71 | 203.09 |
+
+### Per-pair ratios, Go K (v1) over Rust DB (native)
+
+A ratio above 1.000 means Go is slower.
+
+| Fixture | Phase | Median ratio | Sign count | Verdict |
+|---------|-------|--------------|-----------|---------|
+| typical | decode | 2.752 | 11/11 Rust faster | **Rust 2.75x** |
+| typical | transform | 0.662 | 0/11 Rust faster | **Go 1.51x** |
+| typical | encode+write | 1.353 | 11/11 Rust faster | Rust 1.35x |
+| typical | **total** | 1.031 | 8/11 Rust faster | **tie, leaning Rust** |
+| big | decode | 2.640 | 11/11 Rust faster | **Rust 2.64x** |
+| big | transform | 0.793 | 1/11 Rust faster | **Go 1.26x** |
+| big | encode+write | 1.313 | 9/11 Rust faster | Rust 1.31x |
+| big | **total** | 1.582 | 11/11 Rust faster | **Rust 1.58x** |
+
+**The corrected statement.** Optimized Go beats optimized Rust on the transform phase
+on both fixtures, by **1.51x on typical and 1.26x on big** -- not by 2.77x. Optimized
+Rust beats Go on PNG decode by **2.6-2.8x** and on the PGM write by **1.3x**. End to
+end the two are a **tie on typical.png** (median 1.031, but only 8/11 pairs in the same
+direction, and the per-pair range 0.938-1.188 straddles 1.0) and **Rust wins big.png
+by 1.58x**, entirely on decode.
+
+Every direction reported as a result above held in at least 9 of 11 pairs. The one
+number that did not -- typical total -- is reported as a tie rather than as a 3% Rust
+win, which is exactly what the sign count is for.
+
+## Is Rust's lead just AVX-512 that the Go build is not allowed to use?
+
+No. Rust at baseline flags (no `-C target-cpu=native`) still wins:
+
+| Fixture | Phase | Go K v1 / Rust DB baseflags | Sign count |
+|---------|-------|------------------------------|-----------|
+| typical | decode | 2.841 | 11/11 Rust faster |
+| typical | transform | 0.617 | 0/11 Rust faster |
+| typical | total | 0.948 | 3/11 Rust faster |
+| big | decode | 2.713 | 11/11 Rust faster |
+| big | transform | 0.728 | 3/11 Rust faster |
+| big | total | 1.535 | 11/11 Rust faster |
+
+`target-cpu=native` costs Rust nothing on decode (2.84x -> 2.75x is inside the pair
+noise) and buys it 13% on the typical transform (100.91 -> 87.69 ms) and 10% on big
+(80.20 -> 72.32 ms). Rust's decode advantage -- which is the whole of its `big.png`
+total-time win -- is a property of the `png` crate, not of AVX-512. Conversely, Rust's
+transform **loses to Go by more** at baseline flags (0.617 vs 0.662 on typical), so the
+native-CPU flag is what narrows Go's transform lead, not what creates Rust's.
+
+The nearest Go analogue, `GOAMD64=v3`, is included as a labelled data point:
+
+| Fixture | Phase | Go K v1 / Go K v3 | Sign count |
+|---------|-------|--------------------|-----------|
+| typical | transform | 1.024 | 8/11 v3 faster |
+| typical | total | 1.009 | 7/11 v3 faster |
+| big | transform | 1.036 | 9/11 v3 faster |
+| big | total | 1.005 | 7/11 v3 faster |
+
+v3 is worth 2-4% on transform and nothing measurable on total, and it **forfeits
+byte-exactness** -- see below. It is not the recommendation.
+
+## GOAMD64=v3: the win is the FMA, and it costs 80 pixels
+
+The v3 build is not byte-identical to the v1 build:
+
+| Fixture | Differing pixels, K@v3 vs K@v1 | Max delta |
+|---------|-------------------------------|-----------|
+| big | **80** / 7,481,582 (0.0011%) | 1 |
+| typical | 23 / 15,927,560 (0.0001%) | 1 |
+
+The mechanism is pinned, not guessed. The only changed instructions in the hot path are
+in the luma expression, where v3 contracts `0.299r + 0.587g + 0.114b` into two
+`VFMADD231SD`. FMA rounds once instead of twice, so the stretched value lands on the
+other side of a rounding boundary for a handful of pixels. Variant `I` is the control:
+it is the stretch with each product wrapped in an explicit `float64()` conversion,
+which the Go spec forbids the compiler to fuse across; built at v3, `I` gives the win
+back.
+
+So `GOAMD64=v3` is a **product decision, not a performance one**: it trades exact
+reproducibility against a v1-built reference for 2-4% of one phase. On this pipeline
+the byte-identity gate at factor 1 is worth more than the 2-4%, so v1 is recommended.
+
+## PGO is worth nothing here
+
+Building with `go/default.pgo` (collected from this workload's own profile) produces
+exactly **two** PGO devirtualizations in the entire program, verified with
+`go build -a -gcflags="all=-m=2"`:
+
+```
+compress/flate/inflate.go:697:24: PGO devirtualizing interface call f.r.ReadByte to bufio.(*Reader).ReadByte
+compress/flate/inflate.go:720:26: PGO devirtualizing interface call f.r.ReadByte to bufio.(*Reader).ReadByte
+```
+
+Both are inside `compress/flate`, i.e. inside the PNG decoder. **Not one is in the
+pipeline's own code.** That is the expected outcome once variant D removed the
+`At()`/`color.Color` interface traffic: PGO's main lever on this program was the
+indirect calls that the optimization had already deleted. PGO is a dud on this
+workload, and it is reported as such.
+
+## What each optimization actually paid, per language
+
+Four optimizations were ported both ways. **Two of the four do not transfer.**
+
+### 1. Kill the luma side-buffer -- a win in Go, a REGRESSION in Rust
+
+| Language | Effect on transform |
+|----------|---------------------|
+| Go (D1 vs B2) | **-5.5% typical, -4.1% big** (a win) |
+| Rust (D vs DB, native) | **+9.6% typical, +22.4% big** (a loss) |
+
+Same idea, opposite sign, and the cause is a decode-format difference, not a language
+difference. Go's `image/png` hands back an `*image.RGBA` whose `Pix` is **already
+alpha-premultiplied**, so recomputing luma in pass 2 is three multiplies and two adds.
+The Rust `png` crate hands back **non-premultiplied** RGBA bytes, so the reference
+semantics require the premultiply to happen in the pipeline -- and a second pass
+therefore re-pays **three integer divides per pixel** on top of the luma. Divides are
+the most expensive thing in the loop, and paying them twice costs more than the 8 bytes
+per pixel of buffer traffic it saves.
+
+This is why the Rust recommendation is `DB` (keep the buffer) while the Go
+recommendation is `K` (drop it). Porting the optimization faithfully would have made
+Rust slower.
+
+### 2. Precompute the per-column axis tables from the integer factor -- a win in both
+
+The largest single win on both sides. In Go, `D2 vs B2` is **-54.2%, i.e. 2.18x** on
+the typical transform. In Rust the same restructuring carries variant `D`/`DB` from
+C's 213.7 ms to 58-64 ms on typical.
+
+### 3. Fixed point instead of float -- confirmed in Go against f64, and the "f32 is just as good" result does NOT transfer
+
+| Language | 16.16 fixed | f32 | f64 |
+|----------|-------------|-----|-----|
+| Go (typical transform) | 80.54 | 79.97 (**-0.7%, a tie**) | 89.03 (+10.5%) |
+| Rust (typical transform, native) | 63.7 | 83.2 (**+30.6%, i.e. fixed wins by 23%**) | 86.1 (+35.2%) |
+
+In Go, "stop using `float64`" is the whole finding -- `float32` and 16.16 fixed point
+are indistinguishable. In Rust they are **not**: fixed point beats `f32` by 23%. Rust's
+autovectorizer packs 16- and 32-bit integer lanes far more densely than `f32` lanes, so
+the integer form is not merely equal-cost arithmetic, it is more work per vector
+instruction.
+
+### 4. Separable two-pass scaling -- a win in both
+
+Confirmed on both sides, against the stated doubt that cache effects would eat it.
+
+## The SIMD verdict, both sides
+
+**Rust: the autovectorizer wins, and hand-written intrinsics lose to it.** Under
+`-C target-cpu=native` on this host the compiler emits AVX-512 for the scaler loops.
+Variant `DS`, an explicit hand-written AVX2 vertical pass, was written to test whether
+intrinsics beat the autovectorizer. They do not: `DS` is **6.6% slower** than the
+plain-Rust `D` at the same flags (67.9 vs 63.7 ms, typical transform). The hand-written
+code is pinned to 256-bit lanes; the autovectorizer is not.
+
+**Go: nothing is auto-vectorized, and it did not matter.** The Go compiler emits no
+vector code for these loops -- the scaler's assembly is unchanged between `GOAMD64=v1`
+and `v3`, and v3's entire delta is the two FMA instructions in the luma expression.
+That looks like a structural disadvantage, and the interesting result is that it was
+not one on this pipeline: **the SIMD-shaped headroom was collectable in scalar Go.**
+
+Variant `J` measures the ceiling. It is the separable scaler with **all arithmetic
+stripped out of both inner loops**, keeping only the loads, stores and loop overhead --
+a deliberately wrong output that exists only to put a number on "what if the arithmetic
+were free". Against `J`, variant `D` was 1.45x slower, i.e. roughly half the scaler's
+time was arithmetic and there was real headroom to chase.
+
+Variant `K` collects it without a single vector instruction, by exploiting that the
+factor is not merely an integer but is 2 (the pixel budget caps it at 3, and 1 is a
+no-op). At factor 2 the bilinear weights are exactly 1/4 and 3/4, so the whole 16.16
+apparatus collapses to shift-and-add on 16-bit data: `mid = 3a+b` and `a+3b`
+horizontally, `out = (3*M0 + M1 + 8) >> 4` vertically. Two 32-bit and two 64-bit
+multiplies per pixel disappear, and the intermediate halves from `uint32` to `uint16`
+(31.8 MB -> 15.9 MB on typical.png).
+
+Paired measurement, 7 pairs, typical transform:
+
+| Comparison | Median ratio | Sign count | Verdict |
+|------------|--------------|-----------|---------|
+| K vs D | 0.723 | 0/7 D faster | **K is 1.38x faster than D** |
+| K vs J (the arithmetic-free ceiling) | 0.994 | 3/7 J faster | **tie -- K is AT the ceiling** |
+
+K does not merely approach the memory floor, it reaches it: 3/7 is a coin flip, so the
+remaining arithmetic in K is free relative to the load/store traffic. There is nothing
+left for SIMD to collect in this loop, which is why Go's lack of an autovectorizer
+costs it nothing here. And K is **bit-identical to D by construction**, not by luck --
+1/4 and 3/4 are exact in binary, and `(3*M0+M1+8)>>4` is the same round-half-up of the
+same rational value that D's single final rounding produces.
+
+## Negative results, published as results
+
+These are findings. They cost time, they are true, and they belong in the record.
+
+- **Bounds-check elimination by reslicing rows -- REFUTED.** Verified against
+  `-gcflags=-d=ssa/check_bce/debug=1` rather than assumed. Reslicing each row to its
+  exact length did not empty the hot loops: table-driven indices are unprovable to the
+  compiler, so the checks stay.
+- **Variant G, removing the horizontal gather -- DEAD END.** D's horizontal pass reads
+  `x0s[ox]`, `x1s[ox]`, `row[x0s[ox]]`, `row[x1s[ox]]` -- five bounds checks and two
+  data-dependent loads. Because the factor is an integer, `x0` is constant across runs
+  of exactly `scale` output columns, so G walks runs and hoists both source loads into
+  registers. It is bit-identical to D by construction and it did not pay. The gather
+  was not the bottleneck.
+- **Variant H, a 32-bit vertical pass via an 8.8 intermediate -- DEAD END, and not
+  free.** The vertical pass is the bigger of the two and D runs it in 64-bit. Rounding
+  the intermediate to 8.8 makes it fit in 32-bit lanes. It did not pay enough to be
+  worth its cost, and unlike G it is **not bit-exact** -- it adds a rounding step. A
+  non-exact change that is also not faster is an easy call.
+- **PGO -- A DUD.** Two devirtualizations, both in `compress/flate`, none in the
+  pipeline's own code. See above.
+- **Hand-written AVX2 in Rust (variant DS) -- LOST to the autovectorizer** by 6.6%.
+- **Porting "kill the luma buffer" into Rust -- ACTIVELY HARMFUL**, +10%/+22%. See
+  above.
+
+## Profiling coverage, stated plainly
+
+**Go: sampled profiles exist.** `prof/*.flame.svg` are flamegraphs rendered from
+`runtime/pprof` CPU profiles of the full warm+timed loop --
+`prof/k_typical.flame.svg`, `prof/k_big.flame.svg`, `prof/d_typical.flame.svg`,
+`prof/d_big.flame.svg`, plus `prof/k_typical.callgraph.svg`. Every Go attribution in
+this report traces to one of them.
+
+**Rust: NO sampling profiler was available on this host, and none was used.** `wpr`/ETW
+refuses to start without elevation; there is no `blondie` or `dtrace` backend for
+`cargo-flamegraph` on Windows, and no Superluminal or VTune. There is **no Rust
+flamegraph** and nothing in this report should be read as if there were. The Rust
+attribution in `prof/rust_stages.txt` is **manual `Instant` instrumentation** of stage
+boundaries -- median of 15 iterations, coarse-grained by construction, and unable to
+see inside a stage. Where the Go and Rust attributions are compared, that asymmetry in
+method is the reason to prefer the paired end-to-end numbers over either attribution.
+
+## Correctness cross-check: Go K vs Rust DB vs the naive reference
+
+Freshly regenerated from the same binaries used in the paired session, compared with
+`bin/compare.exe` and cross-checked with `md5sum`:
+
+| Comparison | Fixture | Dimensions | Differing pixels | Max delta |
+|------------|---------|-----------|------------------|-----------|
+| **Go K vs Rust DB** | typical | 2732 x 5830 | **0 / 15,927,560 (0.0000%)** | **0** |
+| **Go K vs Rust DB** | big | 1366 x 5477 | **0 / 7,481,582 (0.0000%)** | **0** |
+| Go K vs A (naive) | typical | 2732 x 5830 | 94,985 (0.5964%) | 1 |
+| Go K vs A (naive) | big | 1366 x 5477 | **0 (0.0000%)** | **0** |
+| Rust DB vs A (naive) | typical | 2732 x 5830 | 94,985 (0.5964%) | 1 |
+| Rust DB vs A (naive) | big | 1366 x 5477 | **0 (0.0000%)** | **0** |
+
+The two recommended implementations are **byte-identical to each other on both
+fixtures** -- identical MD5, not merely a zero pixel diff. The Rust agent's earlier
+finding that `typical_rsDB.pgm` matched Go D byte for byte therefore still holds for K,
+as it must: K is bit-identical to D by construction.
+
+Both are byte-identical to the naive reference on `big.png`, the factor-1 fixture,
+which pins the decode, luma, min/max and contrast-stretch math as exactly equivalent
+across both languages -- including the alpha premultiplication, which Go's `At()` path
+performs implicitly and both optimized paths must perform explicitly.
+
+The residual 94,985 pixels on `typical.png` are confined to the scaler, are all
+**delta = 1** (one gray level), and are a property of the algorithm, not of either
+language: A interpolates raw luma and then stretches, while K and DB stretch first and
+interpolate the stretched 8-bit plane, rounding to `uint8` one step earlier. Both
+optimized implementations make that choice identically, which is why they agree with
+each other exactly and disagree with A identically.
+
+## Part 3 verdict
+
+- **Transform, optimized vs optimized: Go wins, by 1.51x (typical) and 1.26x (big).**
+  Not 2.77x. That number is retracted.
+- **PNG decode: Rust wins by 2.6-2.8x**, and that is a decoder-quality gap (`png` crate
+  vs `image/png`), not a language gap. It is unchanged by `target-cpu=native`.
+- **End to end: a tie on `typical.png`; Rust by 1.58x on `big.png`**, and the whole of
+  the `big.png` deficit is decode. Go's decode is 144 ms of a 209 ms total there,
+  against a 58 ms transform.
+- **The lever that dominates both languages is not the language.** It is the PNG
+  decode, and above it, the decision to hand this pipeline a PNG at all. Removing the
+  PNG from the input side is worth more than every optimization in Parts 2 and 3
+  combined, in either language.
+- **Recommendation for this pipeline: Go variant K at `GOAMD64=v1`, no PGO.** It is
+  byte-identical to the naive reference wherever the gate requires it, byte-identical
+  to the Rust recommendation everywhere, and it keeps the existing toolchain. The
+  transform is at its measured memory floor, so further transform work in either
+  language is not where the remaining time is.
+
+
+---
+
+# Part 4: variant K on both sides, and Python as a third contestant
+
+Part 3 corrected Parts 1 and 2 but repeated their structural error, inverted. Go
+variant K carries the factor-2 exact-weight collapse (weights `1/4` and `3/4` become
+shift-adds, worth ~1.4x on the transform); Rust DB did not have it, because K was
+discovered after the Rust work was briefed. So Part 3's "Go wins transform by 1.51x"
+compared Go-with-five-optimizations against Rust-with-four.
+
+K has now been ported to Rust (`rust/src/main.rs`, `upscale_2x` / `upscale_k`) and the
+same paired harness re-run. **Part 3's transform verdict is superseded by this
+section.** Part 3's decode and end-to-end findings are unaffected — on `big.png` the
+factor is 1, where K reduces to D and the two rounds measure the same code.
+
+A Python contestant (`py/bench_py.py`) was added on the same 3-warmup + 15-timed
+protocol and the same external correctness gate.
+
+## Leaderboard, ms per image (median of 3 reps x 15 iters, single-threaded)
+
+### typical.png (factor 2)
+
+| impl | decode | transform | encode | total | exact vs A? |
+|---|---|---|---|---|---|
+| Rust K @ native | 14.17 | 46.41 | 9.87 | **70.27** | yes |
+| Rust K @ lto | 13.62 | 53.16 | 9.20 | 75.80 | yes |
+| Rust DS @ native (hand AVX2) | 13.84 | 64.09 | 9.63 | 87.76 | yes |
+| Rust D @ lto | 13.88 | 76.59 | 10.00 | 100.25 | yes |
+| Go K @ v3+PGO | 45.74 | 55.54 | 11.65 | 112.46 | **no (FMA)** |
+| Go K @ v1 | 48.31 | 59.63 | 11.19 | 121.05 | yes |
+| Go D @ v1 | 45.92 | 81.47 | 10.67 | 139.69 | yes |
+| Python Pillow | 25.41 | 135.36 | 9.60 | 173.19 | delta 1 on 1.70% px |
+| Rust C @ base (naive) | 16.44 | 238.64 | 10.20 | 265.93 | yes |
+| Python numpy | 25.84 | 1005.78 | 10.77 | 1040.28 | delta 1 on 47 px |
+
+### big.png (factor 1, no scaler in the path)
+
+| impl | decode | transform | encode | total | exact vs A? |
+|---|---|---|---|---|---|
+| Rust C @ native | 50.11 | 47.86 | 4.97 | **104.63** | byte-exact |
+| Rust K @ native | 48.87 | 56.43 | 4.66 | 110.07 | byte-exact |
+| Python Pillow | 90.28 | 39.16 | 4.47 | 134.55 | delta 1 on 129 px |
+| Go E @ v1 | 146.38 | 36.64 | 5.65 | 189.05 | delta 1 on 77 px |
+| Go K/D @ v1 | 144.69 | 58.60 | 5.59 | 211.16 | byte-exact |
+
+## Paired, interleaved, order-shuffled (median of per-pair ratios, sign count)
+
+| pair | decode | transform | total |
+|---|---|---|---|
+| Go K vs Rust K, typical | Rust 3.34x (7/7) | Rust 1.25x (7/7) | **Rust 1.67x (7/7)** |
+| Go K vs Rust K, big | Rust 2.76x (7/7) | Go 1.03x (2/7 -- parity) | **Rust 1.80x (7/7)** |
+| Go K vs Python Pillow, typical | Python 1.84x (5/5) | Go 2.34x (5/5) | Go 1.44x (5/5) |
+| Go K vs Python Pillow, big | Python 1.46x (5/5) | Python 1.39x (5/5) | Python 1.41x (5/5) |
+
+Go K and Rust K produce byte-identical output (0 / 15,927,560 differing), which is what
+makes the timing comparison legitimate.
+
+## What changed, and what did not
+
+- **Transform, K on both sides: Rust by 1.25x on `typical`, parity on `big`** (2/7
+  pairs, inside noise). Part 3's "Go by 1.51x" was the missing K, and almost nothing
+  else. Both the 2.77x of Part 1 and the 1.51x of Part 3 are retracted.
+- **The transform gap is the small part.** End to end Rust wins 1.67x / 1.80x, and the
+  whole of it is decode: the `png` crate is 2.76-3.34x faster than `image/png`, 7/7
+  pairs on both fixtures. Part 3 reached this conclusion and it stands.
+- **`GOAMD64=v3` still moves 80 pixels on `big.png`** via FMA contraction; Rust's
+  `-C target-cpu=native` is bit-identical on both fixtures while being the larger win.
+  Same flag category, opposite safety, because Rust forbids FP contraction by default.
+- **The SIMD negative result is now cross-validated from the other side.** Rust's
+  hand-written AVX2 vertical pass (DS) loses to scalar K, 64.09 ms against 46.41 ms on
+  `typical` -- 38% slower. Explicit intrinsics in a language with first-class SIMD lose
+  to getting the algorithm right.
+
+## Python
+
+Pillow beats fully-optimized Go end to end on `big.png` by 1.41x (5/5 pairs) and beats
+Go's decode on both fixtures (1.46-1.84x). Go's `image/png` is the weakest single
+component in this entire comparison -- slower than libpng and slower than the Rust
+crate. Python loses `typical.png` (Go by 1.44x total) only because `resize(BILINEAR)`
+is a general support-based filter and cannot exploit the integer factor the way K does.
+
+Interpreter cost, for scale: the pure-Python probe runs at ~1350 ns per output pixel,
+which extrapolates to ~21.5 s on `typical.png`, ~360x slower than Go K. Every Python
+number above is C code driven by roughly five interpreter statements per image. numpy
+is not the fast answer here (1006 ms): whole-array fancy-indexing over 15.9M float64
+pixels loses to Pillow's fused C loops.
+
+## Part 4 verdict
+
+1. **Stop decoding PNG at the producer.** Worth ~95% of decode, which is larger than
+   every other finding in this document combined.
+2. **If the format is fixed, Go's decoder is the problem.** Rust and Pillow both solve
+   it today; no amount of transform work in Go can reach it.
+3. **Ship variant K regardless of language.** A free 1.4-1.5x on the transform in both
+   Go and Rust, with byte-identical output.

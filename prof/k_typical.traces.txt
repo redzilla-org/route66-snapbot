@@ -1,0 +1,976 @@
+File: bench_base.exe
+Build ID: D:\git\img-scaling-benchmark\bin\bench_base.exe2026-08-20 18:12:54.9696235 -0700 PDT
+Type: cpu
+Time: 2026-08-20 18:21:17 PDT
+Duration: 2.21s, Total samples = 2.12s (95.80%)
+-----------+-------------------------------------------------------
+      30ms   image/png.filterPaeth
+             image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      50ms   image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      40ms   image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      30ms   main.grayStretchNoBuf
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      30ms   main.grayStretchNoBuf
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      40ms   main.grayStretchNoBuf
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      20ms   main.upscaleBilinear2x
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      20ms   main.upscaleBilinear2x.func1 (inline)
+             main.upscaleBilinear2x
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+     130ms   runtime.cgocall
+             runtime.syscall_syscalln
+             syscall.Syscall6
+             syscall.writeFile
+             syscall.WriteFile (inline)
+             internal/poll.(*FD).Write.func1
+             internal/poll.execIO
+             internal/poll.(*FD).Write
+             os.(*File).write (inline)
+             os.(*File).Write
+             bufio.(*Writer).Flush
+             bufio.(*Writer).Write
+             main.writePGM
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      20ms   bufio.(*Reader).ReadByte
+             compress/flate.(*decompressor).huffSym
+             compress/flate.(*decompressor).huffmanBlock
+             compress/flate.(*decompressor).Read
+             compress/zlib.(*reader).Read
+             io.ReadAtLeast
+             io.ReadFull (inline)
+             image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   compress/flate.(*decompressor).huffSym
+             compress/flate.(*decompressor).huffmanBlock
+             compress/flate.(*decompressor).Read
+             compress/zlib.(*reader).Read
+             io.ReadAtLeast
+             io.ReadFull (inline)
+             image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      70ms   image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      40ms   hash/adler32.update
+             hash/adler32.(*digest).Write
+             compress/zlib.(*reader).Read
+             io.ReadAtLeast
+             io.ReadFull (inline)
+             image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   compress/flate.(*decompressor).huffSym
+             compress/flate.(*decompressor).readHuffman
+             compress/flate.(*decompressor).nextBlock
+             compress/flate.(*decompressor).Read
+             compress/zlib.(*reader).Read
+             io.ReadAtLeast
+             io.ReadFull (inline)
+             image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      20ms   main.grayStretchNoBuf
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      20ms   main.grayStretchNoBuf
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   main.grayStretchNoBuf
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   main.upscaleBilinear2x
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   main.upscaleBilinear2x.func1 (inline)
+             main.upscaleBilinear2x
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   runtime.asyncPreempt
+             image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   image/png.filterPaeth
+             image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   compress/flate.(*dictDecoder).tryWriteCopy (inline)
+             compress/flate.(*decompressor).huffmanBlock
+             compress/flate.(*decompressor).Read
+             compress/zlib.(*reader).Read
+             io.ReadAtLeast
+             io.ReadFull (inline)
+             image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      20ms   main.grayStretchNoBuf
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      20ms   main.grayStretchNoBuf
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      40ms   runtime.memclrNoHeapPointers
+             runtime.memclrNoHeapPointersChunked
+             runtime.mallocgcLarge
+             runtime.mallocgc
+             runtime.makeslice
+             main.upscaleBilinear2x
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   main.upscaleBilinear2x
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      20ms   main.upscaleBilinear2x.func1 (inline)
+             main.upscaleBilinear2x
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   compress/flate.(*decompressor).huffmanBlock
+             compress/flate.(*decompressor).nextBlock
+             compress/flate.(*decompressor).Read
+             compress/zlib.(*reader).Read
+             io.ReadAtLeast
+             io.ReadFull (inline)
+             image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      30ms   hash/adler32.update
+             hash/adler32.(*digest).Write
+             compress/zlib.(*reader).Read
+             io.ReadAtLeast
+             io.ReadFull (inline)
+             image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   compress/flate.(*decompressor).huffSym
+             compress/flate.(*decompressor).huffmanBlock
+             compress/flate.(*decompressor).Read
+             compress/zlib.(*reader).Read
+             io.ReadAtLeast
+             io.ReadFull (inline)
+             image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      30ms   main.grayStretchNoBuf
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      50ms   runtime.memclrNoHeapPointers
+             runtime.memclrNoHeapPointersChunked
+             runtime.mallocgcLarge
+             runtime.mallocgc
+             runtime.makeslice
+             image.NewGray
+             main.upscaleBilinear2x
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   main.upscaleBilinear2x
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   main.upscaleBilinear2x.func1 (inline)
+             main.upscaleBilinear2x
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      30ms   image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   compress/flate.(*decompressor).huffSym
+             compress/flate.(*decompressor).huffmanBlock
+             compress/flate.(*decompressor).Read
+             compress/zlib.(*reader).Read
+             io.ReadAtLeast
+             io.ReadFull (inline)
+             image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      20ms   main.grayStretchNoBuf
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      30ms   main.grayStretchNoBuf
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   runtime.(*mheap).freeSpanLocked
+             runtime.(*sweepLocked).sweep.(*mheap).freeSpan.func3
+             runtime.systemstack
+             runtime.(*mheap).freeSpan (inline)
+             runtime.(*sweepLocked).sweep
+             runtime.sweepone
+             runtime.bgsweep
+-----------+-------------------------------------------------------
+      10ms   main.upscaleBilinear2x
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      20ms   main.upscaleBilinear2x.func1 (inline)
+             main.upscaleBilinear2x
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   runtime.memmove
+             bufio.(*Writer).Write
+             main.writePGM
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   hash/adler32.update
+             hash/adler32.(*digest).Write
+             compress/zlib.(*reader).Read
+             io.ReadAtLeast
+             io.ReadFull (inline)
+             image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      20ms   image/png.filterPaeth
+             image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      20ms   hash/adler32.update
+             hash/adler32.(*digest).Write
+             compress/zlib.(*reader).Read
+             io.ReadAtLeast
+             io.ReadFull (inline)
+             image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      20ms   hash/adler32.update
+             hash/adler32.(*digest).Write
+             compress/zlib.(*reader).Read
+             io.ReadAtLeast
+             io.ReadFull (inline)
+             image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   main.grayStretchNoBuf
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      30ms   main.grayStretchNoBuf
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   main.grayStretchNoBuf
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      30ms   main.upscaleBilinear2x
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      20ms   main.upscaleBilinear2x.func1 (inline)
+             main.upscaleBilinear2x
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      20ms   image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   compress/flate.(*dictDecoder).tryWriteCopy (inline)
+             compress/flate.(*decompressor).huffmanBlock
+             compress/flate.(*decompressor).Read
+             compress/zlib.(*reader).Read
+             io.ReadAtLeast
+             io.ReadFull (inline)
+             image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   compress/flate.(*decompressor).huffmanBlock
+             compress/flate.(*decompressor).Read
+             compress/zlib.(*reader).Read
+             io.ReadAtLeast
+             io.ReadFull (inline)
+             image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   compress/flate.(*decompressor).huffmanBlock
+             compress/flate.(*decompressor).Read
+             compress/zlib.(*reader).Read
+             io.ReadAtLeast
+             io.ReadFull (inline)
+             image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      40ms   main.grayStretchNoBuf
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      20ms   main.upscaleBilinear2x.func1 (inline)
+             main.upscaleBilinear2x
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      20ms   runtime.memclrNoHeapPointers
+             runtime.memclrNoHeapPointersChunked
+             runtime.mallocgcLarge
+             runtime.mallocgc
+             runtime.makeslice
+             image.NewRGBA
+             image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   main.upscaleBilinear2x
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   main.upscaleBilinear2x.func1 (inline)
+             main.upscaleBilinear2x
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      40ms   runtime.cgocall
+             runtime.syscall_syscalln
+             syscall.Syscall6
+             syscall.setFileInformationByHandle
+             syscall.Ftruncate (inline)
+             syscall.Open
+             os.openFileNolog
+             os.OpenFile
+             os.Create (inline)
+             main.writePGM
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   runtime.cgocall
+             runtime.syscall_syscalln
+             syscall.Syscall6
+             syscall.writeFile
+             syscall.WriteFile (inline)
+             internal/poll.(*FD).Write.func1
+             internal/poll.execIO
+             internal/poll.(*FD).Write
+             os.(*File).write (inline)
+             os.(*File).Write
+             bufio.(*Writer).Flush
+             main.writePGM
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   compress/flate.(*dictDecoder).writeByte (inline)
+             compress/flate.(*decompressor).huffmanBlock
+             compress/flate.(*decompressor).Read
+             compress/zlib.(*reader).Read
+             io.ReadAtLeast
+             io.ReadFull (inline)
+             image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      60ms   main.grayStretchNoBuf
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      30ms   main.grayStretchNoBuf
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   main.grayStretchNoBuf
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   runtime.(*gcBits).bitp (inline)
+             runtime.(*mspan).markBitsForIndex (inline)
+             runtime.greyobject
+             runtime.scanblock
+             runtime.markrootBlock
+             runtime.markroot
+             runtime.gcDrain
+             runtime.gcDrainMarkWorkerDedicated (inline)
+             runtime.gcBgMarkWorker.func2
+             runtime.systemstack
+             runtime.gcBgMarkWorker
+-----------+-------------------------------------------------------
+      10ms   runtime.stdcall1
+             runtime.preemptM
+             runtime.suspendG
+             runtime.markroot.func1
+             runtime.markroot
+             runtime.gcDrain
+             runtime.gcDrainMarkWorkerDedicated (inline)
+             runtime.gcBgMarkWorker.func2
+             runtime.systemstack
+-----------+-------------------------------------------------------
+      20ms   runtime.stdcall1
+             runtime.semawakeup
+             runtime.unlock2Wake
+             runtime.unlock2
+             runtime.unlockWithRank (inline)
+             runtime.unlock (inline)
+             runtime.preemptM
+             runtime.preemptone
+             runtime.(*gcControllerState).enlistWorker
+             runtime.(*gcWork).balance
+             runtime.gcDrain
+             runtime.gcDrainMarkWorkerDedicated (inline)
+             runtime.gcBgMarkWorker.func2
+             runtime.systemstack
+-----------+-------------------------------------------------------
+      10ms   runtime.stdcall2
+             runtime.semasleep
+             runtime.lock2
+             runtime.lockWithRank (inline)
+             runtime.lock (inline)
+             runtime.preemptM
+             runtime.preemptone
+             runtime.(*gcControllerState).enlistWorker
+             runtime.(*gcWork).balance
+             runtime.gcDrain
+             runtime.gcDrainMarkWorkerDedicated (inline)
+             runtime.gcBgMarkWorker.func2
+             runtime.systemstack
+-----------+-------------------------------------------------------
+      10ms   main.upscaleBilinear2x
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      20ms   runtime.stdcall3
+             runtime.sysUnusedOS
+             runtime.sysUnused (inline)
+             runtime.(*pageAlloc).scavengeOne
+             runtime.(*pageAlloc).scavenge.func1
+             runtime.systemstack
+-----------+-------------------------------------------------------
+      10ms   runtime.memmove
+             bufio.(*Writer).Write
+             main.writePGM
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      20ms   image/png.filterPaeth
+             image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   compress/flate.(*decompressor).huffSym
+             compress/flate.(*decompressor).huffmanBlock
+             compress/flate.(*decompressor).Read
+             compress/zlib.(*reader).Read
+             io.ReadAtLeast
+             io.ReadFull (inline)
+             image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   compress/flate.(*decompressor).huffmanBlock
+             compress/flate.(*decompressor).Read
+             compress/zlib.(*reader).Read
+             io.ReadAtLeast
+             io.ReadFull (inline)
+             image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      20ms   main.upscaleBilinear2x.func1 (inline)
+             main.upscaleBilinear2x
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   hash/adler32.update
+             hash/adler32.(*digest).Write
+             compress/zlib.(*reader).Read
+             io.ReadAtLeast
+             io.ReadFull (inline)
+             image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      20ms   image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   main.upscaleBilinear2x
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   image/png.filterPaeth
+             image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      30ms   compress/flate.(*decompressor).huffSym
+             compress/flate.(*decompressor).huffmanBlock
+             compress/flate.(*decompressor).Read
+             compress/zlib.(*reader).Read
+             io.ReadAtLeast
+             io.ReadFull (inline)
+             image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   main.grayStretchNoBuf
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   main.grayStretchNoBuf
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   main.upscaleBilinear2x.func1 (inline)
+             main.upscaleBilinear2x
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   hash/adler32.update
+             hash/adler32.(*digest).Write
+             compress/zlib.(*reader).Read
+             io.ReadAtLeast
+             io.ReadFull (inline)
+             image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      20ms   main.grayStretchNoBuf
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      30ms   main.upscaleBilinear2x.func1 (inline)
+             main.upscaleBilinear2x
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   compress/flate.(*decompressor).huffSym
+             compress/flate.(*decompressor).huffmanBlock
+             compress/flate.(*decompressor).Read
+             compress/zlib.(*reader).Read
+             io.ReadAtLeast
+             io.ReadFull (inline)
+             image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   compress/flate.(*decompressor).huffmanBlock
+             compress/flate.(*decompressor).Read
+             compress/zlib.(*reader).Read
+             io.ReadAtLeast
+             io.ReadFull (inline)
+             image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      20ms   main.grayStretchNoBuf
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   main.grayStretchNoBuf
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   main.upscaleBilinear2x
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      20ms   compress/flate.(*dictDecoder).writeByte (inline)
+             compress/flate.(*decompressor).huffmanBlock
+             compress/flate.(*decompressor).Read
+             compress/zlib.(*reader).Read
+             io.ReadAtLeast
+             io.ReadFull (inline)
+             image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      20ms   image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   main.grayStretchNoBuf
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   main.upscaleBilinear2x
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      20ms   main.upscaleBilinear2x.func1 (inline)
+             main.upscaleBilinear2x
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   runtime.stdcall1
+             runtime.semawakeup
+             runtime.notewakeup
+             runtime.startm
+             runtime.injectglist.func1
+             runtime.injectglist
+             runtime.(*scavengerState).wake
+             runtime.(*scavengerState).init.func1
+             runtime.(*timer).unlockAndRun
+             runtime.(*timers).run
+             runtime.(*timers).check
+             runtime.findRunnable
+             runtime.schedule
+             runtime.park_m
+             runtime.mcall
+-----------+-------------------------------------------------------
+      10ms   image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   image/png.filterPaeth
+             image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   main.upscaleBilinear2x
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   compress/flate.(*decompressor).huffmanBlock
+             compress/flate.(*decompressor).Read
+             compress/zlib.(*reader).Read
+             io.ReadAtLeast
+             io.ReadFull (inline)
+             image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   compress/flate.(*decompressor).huffmanBlock
+             compress/flate.(*decompressor).Read
+             compress/zlib.(*reader).Read
+             io.ReadAtLeast
+             io.ReadFull (inline)
+             image/png.(*decoder).readImagePass
+             image/png.(*decoder).decode
+             image/png.(*decoder).parseIDAT
+             image/png.(*decoder).parseChunk
+             image/png.Decode
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   runtime.stdcall1
+             runtime.semawakeup
+             runtime.notewakeup
+             runtime.startm
+             runtime.wakep
+             runtime.goschedImpl
+             runtime.gopreempt_m (inline)
+             runtime.newstack
+             runtime.morestack
+-----------+-------------------------------------------------------
+      10ms   main.grayStretchNoBuf
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   main.upscaleBilinear2x
+             main.preprocessK
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------
+      10ms   runtime.cgocall
+             runtime.syscall_syscalln
+             syscall.Syscall
+             syscall.CloseHandle
+             internal/poll.(*FD).destroy
+             internal/poll.(*FD).decref
+             internal/poll.(*FD).Close
+             os.(*file).close
+             os.(*File).Close (inline)
+             main.writePGM
+             main.main
+             runtime.main
+-----------+-------------------------------------------------------

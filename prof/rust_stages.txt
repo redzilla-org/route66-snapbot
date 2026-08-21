@@ -1,0 +1,22 @@
+Manual stage instrumentation of the recommended Rust variant (DB), -C target-cpu=native.
+NO SAMPLING PROFILER WAS AVAILABLE: wpr/ETW refused without elevation, no blondie/dtrace
+for cargo-flamegraph, no Superluminal, no VTune. These are per-stage Instant timings,
+median of 15 iterations, not a sampled profile.
+
+stage attribution (median of 15 iters), fixtures/typical.png
+  decode              13.76 ms   20.0%
+  stretch:minmax      16.33 ms   23.7%
+  stretch:apply        8.49 ms   12.3%
+  scale:tables         0.14 ms    0.2%
+  scale:horiz         21.79 ms   31.6%
+  scale:vert           8.37 ms   12.1%
+  SUM(no write)       68.88 ms
+
+stage attribution (median of 15 iters), fixtures/big.png
+  decode              47.91 ms   49.7%
+  stretch:minmax      32.13 ms   33.3%
+  stretch:apply       16.44 ms   17.0%
+  scale:tables         0.00 ms    0.0%
+  scale:horiz          0.00 ms    0.0%
+  scale:vert           0.00 ms    0.0%
+  SUM(no write)       96.48 ms

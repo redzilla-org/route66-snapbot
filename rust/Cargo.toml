@@ -9,3 +9,8 @@ png = "0.17"
 [profile.release]
 opt-level = 3
 codegen-units = 1
+# Whole-program LTO across the png crate boundary and abort-on-panic, so no
+# unwind landing pads are emitted around the hot loops. Measured as a separate
+# build step from -C target-cpu=native so each is attributable; see RESULTS.
+lto = "fat"
+panic = "abort"
