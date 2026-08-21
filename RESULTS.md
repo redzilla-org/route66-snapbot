@@ -11,8 +11,9 @@
 > corrected, paired, single-session head-to-head is **[Part 3](#part-3-the-retraction-and-the-corrected-head-to-head)**,
 > which supersedes them on every cross-language number.
 
-Measured 2026-08-20 on Windows 11 (x86-64), Go 1.27.0, cargo 1.93.1 (rustc release
-profile, `opt-level = 3`, `codegen-units = 1`). Every variant is single-threaded.
+Measured 2026-08-20 on Windows 11 (x86-64), Go 1.25.1, rustc 1.93.1 (release profile,
+`opt-level = 3`, `codegen-units = 1`), CPython 3.14.7 with Pillow 12.3.0 and numpy
+2.5.2. Every variant is single-threaded.
 15 timed iterations after 3 warmup iterations; each iteration re-decodes the PNG
 from an in-memory byte slice, transforms, and writes the output file.
 
@@ -1065,8 +1066,10 @@ pixels loses to Pillow's fused C loops.
 
 ## Part 4 verdict
 
-1. **Stop decoding PNG at the producer.** Worth ~95% of decode, which is larger than
-   every other finding in this document combined.
+1. **Stop decoding PNG at the producer.** Worth **87-92% of decode** as measured in the
+   handoff-format ladder below (not the ~95% estimated in Part 2, which omitted the
+   file-read syscall), which is still larger than every other finding in this document
+   combined.
 2. **If the format is fixed, Go's decoder is the problem.** Rust and Pillow both solve
    it today; no amount of transform work in Go can reach it.
 3. **Ship variant K regardless of language.** A free 1.4-1.5x on the transform in both
@@ -1110,5 +1113,41 @@ largest remaining item in the profile at 25.9% flat. This is the same move alrea
 on the output side, where PNG -> PGM saved 131 ms of encode; on the input side it is
 worth more.
 
-Caveat: the producer is outside this repo and was not inspected. This is an argument
-about the handoff, not a claim about any specific upstream step.
+### The producer, identified -- and why the top recommendation does NOT apply to it
+
+The producer was named as unknown above. It has since been identified, by read-only
+inspection of the consuming repository (no files written there, no git run):
+
+- **Producer: Chromium, driven by Playwright.** `captureScreenshot` in
+  `tests/webapp/regression/goregression/browser.go:3498` calls
+  `page.Screenshot(PageScreenshotOptions{Path: ..., FullPage: true})`, which writes a
+  full-page PNG to disk.
+- **Consumer: the goregression visual/OCR gate.** `runTesseract`
+  (`image_heuristics.go:1446`) takes the already-decoded image, calls
+  `preprocessForOCR(img, ocrUpscaleFactorFor(img.Bounds()))`, writes a PGM, and hands
+  that path to tesseract. This is a CI test gate, not a production request path.
+
+**This kills recommendation 1 for this caller.** "Hand over raw pixels instead of PNG"
+assumes the producer is code we control. It is not -- it is a browser, and the Chrome
+DevTools Protocol's `Page.captureScreenshot` returns **PNG or JPEG only**. There is no
+raw-pixel option to switch to, so the 87-92% decode saving measured above is
+**unreachable here**, however real it is in the abstract. The ladder stands as a
+general result about handoff formats; it does not stand as advice to this consumer.
+
+What *is* available to this caller, in descending order of safety:
+
+1. **A faster PNG decoder.** The gap is measured and large: the Rust `png` crate is
+   2.8-3.3x faster than `image/png` and libpng 1.5-1.8x, on identical bytes. This is
+   the one lever that needs no change to the producer and no change to the pixels.
+2. **Variant K**, which is free and byte-identical -- though note the real path runs at
+   factor 3 for small captures, where K falls back to the general scaler; the factor-2
+   collapse only fires when the pixel budget forces factor 2.
+3. **JPEG capture** (`Type: "jpeg"`) would decode far faster, but it is lossy: it
+   changes the pixels tesseract sees, and this gate has determinism tests. Not
+   recommended without re-baselining, and probably not at all.
+
+Two independent confirmations that this benchmark models the real path faithfully:
+the consumer already writes a **PGM** rather than a PNG for the tesseract handoff,
+which is exactly the encode-side finding of Part 1; and it already fixed a
+decode-twice bug (a pprof run there attributed 73.3 s to four `png.Decode` call sites),
+which is the same decode-dominance this document measures from the other end.
