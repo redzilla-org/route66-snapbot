@@ -146,17 +146,46 @@ func grayStretchNoBuf(img image.Image) *image.Gray {
 	w, h := b.Dx(), b.Dy()
 	out := image.NewGray(image.Rect(0, 0, w, h))
 
-	src, ok := img.(*image.RGBA)
-	if !ok {
+	// TWO fast paths, not one. A screenshot WITHOUT an alpha channel decodes to
+	// *image.RGBA; one WITH alpha decodes to *image.NRGBA. Handling only the
+	// former means an alpha-carrying capture silently takes the generic At()
+	// fallback and loses most of the win with no error anywhere -- verified on
+	// fixtures/alpha.png, which reports *image.NRGBA.
+	//
+	// NRGBA's Pix is NOT alpha-premultiplied while At().RGBA() premultiplies, so
+	// the NRGBA arm premultiplies with the SAME integer division the reference
+	// path performs, keeping both arms bit-identical to variant A.
+	var pix []byte
+	var stride, base int
+	premul := false
+	switch src := img.(type) {
+	case *image.RGBA:
+		pix, stride = src.Pix, src.Stride
+		base = (b.Min.Y-src.Rect.Min.Y)*src.Stride + (b.Min.X-src.Rect.Min.X)*4
+	case *image.NRGBA:
+		pix, stride, premul = src.Pix, src.Stride, true
+		base = (b.Min.Y-src.Rect.Min.Y)*src.Stride + (b.Min.X-src.Rect.Min.X)*4
+	default:
 		return grayStretchFast(img)
 	}
 
+	// lumaOf is the one place the two arms differ; it is a tiny leaf and inlines.
+	lumaOf := func(p []byte) float64 {
+		r8, g8, b8 := p[0], p[1], p[2]
+		if premul {
+			a := uint32(p[3])
+			r8 = uint8(uint32(p[0]) * a / 255)
+			g8 = uint8(uint32(p[1]) * a / 255)
+			b8 = uint8(uint32(p[2]) * a / 255)
+		}
+		return 0.299*float64(r8) + 0.587*float64(g8) + 0.114*float64(b8)
+	}
+
 	minL, maxL := math.MaxFloat64, -math.MaxFloat64
-	base := (b.Min.Y-src.Rect.Min.Y)*src.Stride + (b.Min.X-src.Rect.Min.X)*4
 	for y := 0; y < h; y++ {
-		row := src.Pix[base+y*src.Stride : base+y*src.Stride+w*4]
+		row := pix[base+y*stride : base+y*stride+w*4]
 		for x := 0; x+4 <= len(row); x += 4 {
-			l := 0.299*float64(row[x]) + 0.587*float64(row[x+1]) + 0.114*float64(row[x+2])
+			l := lumaOf(row[x : x+4 : x+4])
 			if l < minL {
 				minL = l
 			}
@@ -170,11 +199,10 @@ func grayStretchNoBuf(img image.Image) *image.Gray {
 		span = 1
 	}
 	for y := 0; y < h; y++ {
-		row := src.Pix[base+y*src.Stride : base+y*src.Stride+w*4]
+		row := pix[base+y*stride : base+y*stride+w*4]
 		orow := out.Pix[y*out.Stride : y*out.Stride+w]
 		for x := range orow {
-			p := row[x*4 : x*4+3 : x*4+3]
-			l := 0.299*float64(p[0]) + 0.587*float64(p[1]) + 0.114*float64(p[2])
+			l := lumaOf(row[x*4 : x*4+4 : x*4+4])
 			// Kept as A's exact `(l-minL)/span*255`: folding span into a
 			// reciprocal multiply is a different float64 rounding and would
 			// break the bit-identity this function exists to preserve.

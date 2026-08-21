@@ -1,0 +1,509 @@
+<title>OCR Preprocessor Handoff</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+
+<style>
+  /* ---------------------------------------------------------------
+     Palette: the subject is grayscale image processing, so the page is
+     near-monochrome with a slight cool bias, and exactly one chromatic
+     accent (steel) used the way a measurement highlight is used.
+     Semantic red/green are separate from the accent and only mark
+     prohibition and byte-exactness.
+     --------------------------------------------------------------- */
+  :root {
+    --ground:      #f6f7f8;
+    --surface:     #ffffff;
+    --surface-2:   #eef0f2;
+    --ink:         #15181c;
+    --ink-2:       #454c55;
+    --ink-3:       #6f777f;
+    --rule:        #d9dde1;
+    --rule-strong: #b9c0c7;
+    --accent:      #235f7d;
+    --accent-soft: #dbe8ef;
+    --stop:        #8f3520;
+    --stop-soft:   #f2e2de;
+    --go:          #2c6247;
+    --go-soft:     #dde9e2;
+    --shadow:      0 1px 2px rgba(21, 24, 28, .06), 0 8px 24px -16px rgba(21, 24, 28, .28);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+    --ground:      #0f1216;
+    --surface:     #161a1f;
+    --surface-2:   #1e242b;
+    --ink:         #e8ebee;
+    --ink-2:       #b2bac2;
+    --ink-3:       #838d97;
+    --rule:        #2a313a;
+    --rule-strong: #3d4650;
+    --accent:      #7fb8d4;
+    --accent-soft: #17303d;
+    --stop:        #e0917c;
+    --stop-soft:   #34211c;
+    --go:          #8fc7a9;
+    --go-soft:     #1a2c23;
+    --shadow:      0 1px 2px rgba(0,0,0,.4), 0 8px 24px -16px rgba(0,0,0,.7);
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground:      #0f1216;
+    --surface:     #161a1f;
+    --surface-2:   #1e242b;
+    --ink:         #e8ebee;
+    --ink-2:       #b2bac2;
+    --ink-3:       #838d97;
+    --rule:        #2a313a;
+    --rule-strong: #3d4650;
+    --accent:      #7fb8d4;
+    --accent-soft: #17303d;
+    --stop:        #e0917c;
+    --stop-soft:   #34211c;
+    --go:          #8fc7a9;
+    --go-soft:     #1a2c23;
+    --shadow:      0 1px 2px rgba(0,0,0,.4), 0 8px 24px -16px rgba(0,0,0,.7);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+    font-size: 16px;
+    line-height: 1.62;
+    margin: 0;
+    padding: 0 24px 96px;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap { max-width: 940px; margin: 0 auto; }
+  .prose { max-width: 68ch; }
+
+  /* ---- masthead ---- */
+  header {
+    padding: 56px 0 28px;
+    border-bottom: 2px solid var(--ink);
+    margin-bottom: 36px;
+  }
+  .eyebrow {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 11.5px;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    margin: 0 0 18px;
+  }
+  h1 {
+    font-family: Newsreader, ui-serif, Georgia, serif;
+    font-weight: 500;
+    font-size: clamp(34px, 5.2vw, 52px);
+    line-height: 1.08;
+    letter-spacing: -.015em;
+    text-wrap: balance;
+    margin: 0 0 18px;
+  }
+  .standfirst {
+    font-family: Newsreader, ui-serif, Georgia, serif;
+    font-size: clamp(18px, 2.3vw, 21px);
+    line-height: 1.5;
+    color: var(--ink-2);
+    max-width: 60ch;
+    margin: 0;
+  }
+  .standfirst strong { color: var(--ink); font-weight: 600; }
+
+  /* ---- headline metrics ---- */
+  .metrics {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 1px;
+    background: var(--rule);
+    border: 1px solid var(--rule);
+    margin: 36px 0 48px;
+  }
+  .metric { background: var(--surface); padding: 20px 22px; }
+  .metric .n {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 30px;
+    font-weight: 600;
+    letter-spacing: -.02em;
+    color: var(--accent);
+    font-variant-numeric: tabular-nums;
+    display: block;
+    line-height: 1.1;
+  }
+  .metric .l {
+    font-size: 13px;
+    color: var(--ink-3);
+    margin-top: 6px;
+    display: block;
+  }
+
+  h2 {
+    font-family: Newsreader, ui-serif, Georgia, serif;
+    font-weight: 600;
+    font-size: 27px;
+    letter-spacing: -.01em;
+    margin: 52px 0 4px;
+    text-wrap: balance;
+  }
+  h2 + .sub {
+    color: var(--ink-3);
+    font-size: 14.5px;
+    margin: 0 0 22px;
+  }
+  p { margin: 0 0 16px; }
+  strong { font-weight: 600; }
+
+  /* ---- steps: numbered because they ARE a sequence ---- */
+  .steps { display: flex; flex-direction: column; gap: 2px; margin: 26px 0 0; }
+  .step {
+    display: grid;
+    grid-template-columns: 62px 1fr;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    box-shadow: var(--shadow);
+  }
+  .step-n {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--surface);
+    background: var(--ink);
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding: 20px 0;
+  }
+  .step-body { padding: 20px 24px; min-width: 0; }
+  .step-body h3 {
+    font-family: "IBM Plex Sans", sans-serif;
+    font-size: 16.5px;
+    font-weight: 600;
+    margin: 0 0 8px;
+  }
+  .step-body p:last-child, .step-body ol:last-child, .step-body ul:last-child { margin-bottom: 0; }
+  .step-body ol, .step-body ul { margin: 0 0 14px; padding-left: 20px; }
+  .step-body li { margin-bottom: 5px; }
+
+  /* ---- data ---- */
+  .scroll { overflow-x: auto; margin: 0 0 20px; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 14.5px;
+    min-width: 480px;
+  }
+  th, td {
+    text-align: left;
+    padding: 9px 14px 9px 0;
+    border-bottom: 1px solid var(--rule);
+    vertical-align: top;
+  }
+  th {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 11px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    font-weight: 500;
+    border-bottom-color: var(--rule-strong);
+    white-space: nowrap;
+  }
+  td.num, th.num {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+    padding-right: 18px;
+    white-space: nowrap;
+  }
+  tbody tr:last-child td { border-bottom: none; }
+  .win { color: var(--go); font-weight: 600; }
+  .exact {
+    background: var(--go-soft);
+    color: var(--go);
+    font-weight: 600;
+    padding: 1px 7px;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 12.5px;
+    white-space: nowrap;
+  }
+
+  code, .path {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: .885em;
+    background: var(--surface-2);
+    padding: 1.5px 5px;
+    word-break: break-word;
+  }
+  pre {
+    background: var(--surface-2);
+    border-left: 3px solid var(--accent);
+    padding: 14px 18px;
+    overflow-x: auto;
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 13px;
+    line-height: 1.6;
+    margin: 0 0 16px;
+  }
+  pre code { background: none; padding: 0; font-size: inherit; }
+  .comment { color: var(--ink-3); }
+
+  /* ---- prohibitions ---- */
+  .stop-list { display: flex; flex-direction: column; gap: 2px; margin-top: 24px; }
+  .stop-item {
+    border-left: 3px solid var(--stop);
+    background: var(--surface);
+    padding: 15px 20px;
+  }
+  .stop-item h3 {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--stop);
+    margin: 0 0 5px;
+  }
+  .stop-item p { margin: 0; font-size: 14.5px; color: var(--ink-2); }
+
+  .note {
+    border: 1px solid var(--rule-strong);
+    background: var(--accent-soft);
+    padding: 18px 22px;
+    margin: 26px 0;
+  }
+  .note p { margin: 0; }
+  .note p + p { margin-top: 10px; }
+
+  footer {
+    margin-top: 64px;
+    padding-top: 24px;
+    border-top: 1px solid var(--rule);
+    font-size: 13.5px;
+    color: var(--ink-3);
+  }
+  footer dl { display: grid; grid-template-columns: minmax(150px, auto) 1fr; gap: 8px 22px; margin: 0 0 20px; }
+  footer dt { color: var(--ink-2); }
+  footer dd { margin: 0; }
+  footer .path { background: none; padding: 0; color: var(--ink); font-size: 12.5px; }
+
+  @media (max-width: 620px) {
+    .step { grid-template-columns: 1fr; }
+    .step-n { justify-content: flex-start; padding: 12px 20px 0; background: var(--surface); color: var(--accent); }
+    footer dl { grid-template-columns: 1fr; gap: 3px 0; }
+    footer dd { margin-bottom: 12px; }
+  }
+</style>
+
+<div class="wrap">
+
+  <header>
+    <p class="eyebrow">Engineering handoff &nbsp;·&nbsp; goregression OCR path</p>
+    <h1>Replace <code style="font-size:.82em; background:none; padding:0;">preprocessForOCR</code> with the optimized version</h1>
+    <p class="standfirst">
+      The function is still the original naive implementation. A drop-in replacement runs the
+      same pipeline <strong>6&ndash;7&times; faster</strong>, saving roughly <strong>300&nbsp;ms per OCR&rsquo;d
+      screenshot</strong>. The replacement file is written, compiled, and pixel-verified &mdash; the work
+      is to paste it in and run the gates.
+    </p>
+  </header>
+
+  <div class="metrics">
+    <div class="metric">
+      <span class="n">6.3&times;</span>
+      <span class="l">Faster transform at factor 2</span>
+    </div>
+    <div class="metric">
+      <span class="n">~300 ms</span>
+      <span class="l">Saved per screenshot</span>
+    </div>
+    <div class="metric">
+      <span class="n">&le; 1</span>
+      <span class="l">Max gray-level change, anywhere</span>
+    </div>
+    <div class="metric">
+      <span class="n">0</span>
+      <span class="l">Pixels changed at factor 1</span>
+    </div>
+  </div>
+
+  <h2>What it buys</h2>
+  <p class="sub">Transform phase only. Median of 15 iterations after 3 warmups, <code>GOAMD64=v1</code>, real captured screenshots. Encode is excluded because the caller already writes PGM.</p>
+
+  <div class="scroll">
+    <table>
+      <thead>
+        <tr>
+          <th>Capture</th>
+          <th class="num">Factor</th>
+          <th class="num">Today</th>
+          <th class="num">After</th>
+          <th class="num">Saved</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>1366 &times; 1400</td><td class="num">3</td><td class="num">354.90 ms</td><td class="num win">50.26 ms</td><td class="num">&minus;304.6 ms &nbsp;(7.1&times;)</td></tr>
+        <tr><td>1366 &times; 2915</td><td class="num">2</td><td class="num">384.30 ms</td><td class="num win">61.09 ms</td><td class="num">&minus;323.2 ms &nbsp;(6.3&times;)</td></tr>
+        <tr><td>1366 &times; 5477</td><td class="num">1</td><td class="num">368.89 ms</td><td class="num win">62.19 ms</td><td class="num">&minus;306.7 ms &nbsp;(5.9&times;)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Do these five things</h2>
+  <p class="sub">In order. No call sites change &mdash; the signature is identical.</p>
+
+  <div class="steps">
+
+    <div class="step">
+      <div class="step-n">01</div>
+      <div class="step-body">
+        <h3>Copy the file</h3>
+        <p>Copy <span class="path">D:\git\img-scaling-benchmark\port\ocr_preprocess.go</span> into
+        <span class="path">tests\webapp\regression\goregression\</span>.</p>
+        <p>It is self-contained: stdlib <code>image</code> + <code>math</code>, no new dependencies,
+        no references to anything else in the package.</p>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="step-n">02</div>
+      <div class="step-body">
+        <h3>Fit it to the package</h3>
+        <ol>
+          <li>Change <code>package ocrpre</code> to the package name used in that directory.</li>
+          <li>Unexport <code>PreprocessForOCR</code> &rarr; <code>preprocessForOCR</code>.</li>
+          <li>Delete the <em>body</em> of the existing <code>preprocessForOCR</code> in
+              <code>image_heuristics.go</code>. Keep its doc comment &mdash; everything it describes
+              is still true.</li>
+          <li>Rename any helper that collides with an existing name. Nothing outside the file calls them.</li>
+        </ol>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="step-n">03</div>
+      <div class="step-body">
+        <h3>Expect a &plusmn;1 gray-level change &mdash; and verify it</h3>
+        <p>The original stretches <em>after</em> interpolation; the fast path stretches <em>before</em>.
+        Same affine map, rounded at a different point. Nothing moves by more than one level, and
+        factor 1 does not move at all.</p>
+        <div class="scroll">
+          <table>
+            <thead><tr><th>Capture</th><th class="num">Factor</th><th class="num">Differing px</th><th class="num">Max &Delta;</th></tr></thead>
+            <tbody>
+              <tr><td>1366 &times; 5477</td><td class="num">1</td><td class="num"><span class="exact">0 / 7,481,582</span></td><td class="num">0</td></tr>
+              <tr><td>1366 &times; 2915</td><td class="num">2</td><td class="num">94,985 / 15,927,560 &nbsp;(0.596%)</td><td class="num">1</td></tr>
+              <tr><td>1366 &times; 1400</td><td class="num">3</td><td class="num">55,882 / 17,211,600 &nbsp;(0.325%)</td><td class="num">1</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <pre><code><span class="comment"># reproduce on your own capture</span>
+cd D:\git\img-scaling-benchmark\go
+go build -o ../bin/compare.exe ./compare
+..\bin\compare.exe before.pgm after.pgm   <span class="comment"># expect maxAbsDelta &lt;= 1</span></code></pre>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="step-n">04</div>
+      <div class="step-body">
+        <h3>Run the gates</h3>
+        <pre><code>go test ./tests/webapp/regression/goregression \
+  -run TestPreprocessForOCRUpscalesDeterministically</code></pre>
+        <p>That test already exists and already asserts byte-identical pixel buffers across two runs.
+        Then run the OCR gate itself.</p>
+        <div class="note">
+          <p><strong>The pixels are the easy part.</strong> The gate scores extracted keywords, not
+          images &mdash; so the thing to actually verify is that the OCR <em>text</em> is unchanged.
+          A one-level gray shift is very unlikely to change tesseract&rsquo;s output, but
+          &ldquo;unlikely&rdquo; is not &ldquo;verified&rdquo;.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="step-n">05</div>
+      <div class="step-body">
+        <h3>Confirm the fast path is actually live</h3>
+        <p>The optimization fires on <code>*image.RGBA</code> and <code>*image.NRGBA</code>. Anything
+        else falls back to a correct-but-slow generic path <strong>with no error anywhere</strong>,
+        and you get none of the win.</p>
+        <p>Screenshots without alpha decode to <code>*image.RGBA</code>; with alpha they decode to
+        <code>*image.NRGBA</code>. Both are handled and both are verified. Log <code>%T</code> once,
+        or assert it in a test, so a future change to the capture format fails loudly instead of
+        quietly costing 300&nbsp;ms.</p>
+      </div>
+    </div>
+
+  </div>
+
+  <h2>Do not do these</h2>
+  <p class="sub">Each was measured and rejected. None is a matter of taste.</p>
+
+  <div class="stop-list">
+    <div class="stop-item">
+      <h3>GOAMD64=v3</h3>
+      <p>Worth ~4%, but the compiler contracts the luma expression into <code>VFMADD231SD</code>,
+      moving 80 of 7,481,582 pixels and destroying the factor-1 byte-exactness. Not worth it on a
+      gate with determinism tests.</p>
+    </div>
+    <div class="stop-item">
+      <h3>PGO</h3>
+      <p>Its entire measured effect on this program is two devirtualizations inside
+      <code>compress/flate</code>. Zero decisions in pipeline code; the measured effect flips sign
+      between fixtures.</p>
+    </div>
+    <div class="stop-item">
+      <h3>Parallelizing the transform</h3>
+      <p><code>ocrqueue.go</code> already runs many images concurrently. Intra-image parallelism
+      would oversubscribe the box and cost aggregate throughput.</p>
+    </div>
+    <div class="stop-item">
+      <h3>Hand-written SIMD</h3>
+      <p>Measured dead from both sides: the factor-2 kernel already sits at the arithmetic-free
+      memory floor, and an AVX2 vertical pass written in Rust was 38% <em>slower</em> than the
+      scalar kernel.</p>
+    </div>
+    <div class="stop-item">
+      <h3>The LUT stretch</h3>
+      <p>Fastest stretch measured, but it cannot reproduce the original&rsquo;s per-triple float
+      rounding (77 pixels at factor 1). It would break the byte-exactness factor 1 currently has.</p>
+    </div>
+  </div>
+
+  <h2>What this does not fix</h2>
+  <div class="prose">
+    <p>After the port, the remaining cost at factor 1 is <strong>PNG decode: 149&nbsp;ms of a
+    213&nbsp;ms total &mdash; 70%</strong>. That is <code>image/png</code>, which is 2.8&ndash;3.3&times;
+    slower than Rust&rsquo;s <code>png</code> crate and 1.5&ndash;1.8&times; slower than libpng on
+    identical bytes. No transform work can reach it.</p>
+    <p>The usual fix &mdash; have the producer hand over raw pixels instead of PNG, measured at
+    87&ndash;92% of decode &mdash; is <strong>not available here</strong>. The producer is Chromium
+    via Playwright, and the DevTools protocol emits only PNG or JPEG. JPEG decodes far faster but is
+    lossy, changing what tesseract sees on a gate with determinism tests.</p>
+    <p>So: take the transform win now, and treat the decoder as a separate, larger, harder piece of
+    work.</p>
+  </div>
+
+  <footer>
+    <dl>
+      <dt>Replacement source</dt>
+      <dd><span class="path">D:\git\img-scaling-benchmark\port\ocr_preprocess.go</span></dd>
+      <dt>Verifier</dt>
+      <dd><span class="path">D:\git\img-scaling-benchmark\port\cmd\portcheck\main.go</span></dd>
+      <dt>This document</dt>
+      <dd><span class="path">D:\git\img-scaling-benchmark\PORTING.md</span></dd>
+      <dt>Full measurement record</dt>
+      <dd><span class="path">D:\git\img-scaling-benchmark\RESULTS.md</span></dd>
+      <dt>Benchmark harness</dt>
+      <dd><span class="path">D:\git\img-scaling-benchmark\go\</span></dd>
+      <dt>Target function</dt>
+      <dd><span class="path">D:\git\route66\tests\webapp\regression\goregression\image_heuristics.go</span></dd>
+    </dl>
+    <p>The paste-ready file was compiled standalone and run over all four fixtures; its output is
+    byte-identical &mdash; 0 differing pixels &mdash; to the variant these timings were measured on,
+    including the alpha/NRGBA case.</p>
+  </footer>
+
+</div>
