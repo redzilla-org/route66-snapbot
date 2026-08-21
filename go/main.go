@@ -367,6 +367,12 @@ func main() {
 			g = preprocessD3(img, scale)
 		case "D4":
 			g = preprocessD4(img, scale)
+		case "N":
+			g = preprocessN(img, scale)
+		case "M":
+			g = preprocessM(img, scale)
+		case "L":
+			g = preprocessL(img, scale)
 		case "K":
 			g = preprocessK(img, scale)
 		case "J":

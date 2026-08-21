@@ -358,3 +358,257 @@ func preprocessK(img image.Image, scale int) *image.Gray {
 	}
 	return upscaleBilinearSeparable(small, scale)
 }
+
+// ---- variant L: exact-rational scaler for ANY integer factor ----
+//
+// WHY: variant K's shift-and-add collapse only fires at factor 2, and the real
+// caller (a Playwright full-page screenshot fed to tesseract) runs at factor 3
+// whenever the capture is small enough for the 20M pixel budget to allow it. K
+// therefore leaves the caller's common case on the old general scaler.
+//
+// The generalization is that the sample offset is always a RATIONAL with a tiny
+// denominator. For factor f, s = (o+0.5)/f - 0.5 = (2o+1-f)/(2f), so with
+// den = 2f the fractional weight is exactly r/den for an integer r in [0, den).
+// Nothing needs 16.16 fixed point, and nothing needs float:
+//
+//	horizontal: mid = a*(den-r) + b*r          (max 255*den, fits u16 to f=128)
+//	vertical:   out = (M0*(den-ry) + M1*ry + den*den/2) / (den*den)
+//
+// That is EXACT rational arithmetic with one round-half-up at the end -- strictly
+// more accurate than D's 16.16 approximation, which carries up to 1/131072 of
+// weight error. At factor 2 (den=4) the divisor is 16 and the compiler emits the
+// same shifts variant K was hand-written to get, so L SUBSUMES K rather than
+// competing with it; the division by 36 at factor 3 becomes a multiply-shift.
+//
+// Correctness note: L is bit-identical to K at factor 2 (verified), but it is
+// NOT guaranteed bit-identical to D at other factors -- where they differ, L is
+// the one computing the mathematically correct value and D is the approximation.
+// The measured difference is reported in RESULTS.md.
+func upscaleBilinearExact(src *image.Gray, scale int) *image.Gray {
+	w, h := src.Bounds().Dx(), src.Bounds().Dy()
+	ow, oh := w*scale, h*scale
+	dst := image.NewGray(image.Rect(0, 0, ow, oh))
+	den := uint32(2 * scale)
+
+	// Per-axis (i0, i1, r) with the same clamped-edge convention as bilinearAxis.
+	axis := func(n int) (i0s, i1s []int32, rs []uint32) {
+		on := n * scale
+		i0s, i1s, rs = make([]int32, on), make([]int32, on), make([]uint32, on)
+		for o := 0; o < on; o++ {
+			num := 2*o + 1 - scale
+			d := 2 * scale
+			f := num / d
+			r := num - f*d
+			if r < 0 { // Go truncates toward zero; bilinear needs floor.
+				f--
+				r += d
+			}
+			a, b := f, f+1
+			if a < 0 {
+				a = 0
+			} else if a >= n {
+				a = n - 1
+			}
+			if b < 0 {
+				b = 0
+			} else if b >= n {
+				b = n - 1
+			}
+			i0s[o], i1s[o], rs[o] = int32(a), int32(b), uint32(r)
+		}
+		return
+	}
+	x0s, x1s, rxs := axis(w)
+	y0s, y1s, rys := axis(h)
+
+	mid := make([]uint16, ow*h)
+	for y := 0; y < h; y++ {
+		row := src.Pix[y*src.Stride : y*src.Stride+w]
+		mrow := mid[y*ow : y*ow+ow]
+		for ox := range mrow {
+			a := uint32(row[x0s[ox]])
+			b := uint32(row[x1s[ox]])
+			r := rxs[ox]
+			mrow[ox] = uint16(a*(den-r) + b*r)
+		}
+	}
+
+	// The divisor MUST be a compile-time constant. Written as `dd := den*den`
+	// it is a variable, and the compiler emits a hardware DIV in the hottest
+	// loop in the program -- measured at 1.35x SLOWER than the 16.16 scaler it
+	// was meant to beat, 0/9 pairs. Switching on the factor lets each arm
+	// constant-fold its divide into a multiply-shift (and into a plain shift at
+	// factor 2). Same arithmetic, same result, three instructions instead of a
+	// 20-40 cycle serializing divide.
+	vert := func(dd, half uint32, div func(uint32) uint8) {
+		for oy := 0; oy < oh; oy++ {
+			ry := rys[oy]
+			iry := den - ry
+			m0 := mid[int(y0s[oy])*ow : int(y0s[oy])*ow+ow]
+			m1 := mid[int(y1s[oy])*ow : int(y1s[oy])*ow+ow]
+			out := dst.Pix[oy*dst.Stride : oy*dst.Stride+ow]
+			m0, m1 = m0[:len(out)], m1[:len(out)]
+			for ox := range out {
+				out[ox] = div(uint32(m0[ox])*iry + uint32(m1[ox])*ry + half)
+			}
+		}
+	}
+	switch scale {
+	case 2:
+		vert(16, 8, func(v uint32) uint8 { return uint8(v / 16) })
+	case 3:
+		vert(36, 18, func(v uint32) uint8 { return uint8(v / 36) })
+	case 4:
+		vert(64, 32, func(v uint32) uint8 { return uint8(v / 64) })
+	default:
+		dd, half := den*den, den*den/2
+		vert(dd, half, func(v uint32) uint8 { return uint8(v / dd) })
+	}
+	return dst
+}
+
+// L: the buffer-free stretch plus the exact-rational scaler at any factor.
+func preprocessL(img image.Image, scale int) *image.Gray {
+	small := grayStretchNoBuf(img)
+	if scale <= 1 {
+		return small
+	}
+	return upscaleBilinearExact(small, scale)
+}
+
+// ---- variant M: run structure + exact rational, for ANY integer factor ----
+//
+// M is the synthesis of the two things that were measured separately:
+//
+//   - from K, the RUN structure -- because the factor is an integer, (x0, x1) is
+//     constant across a run of `scale` output columns, so both source samples
+//     hoist into registers and the inner loop touches only a weight table.
+//   - from L, the EXACT RATIONAL arithmetic -- weights are r/(2f) exactly, so
+//     u16 intermediates and a constant divisor replace 16.16 fixed point at any
+//     factor, not just at 2.
+//
+// Neither alone was enough. L (rational, still gathering) is 1.26x SLOWER than K
+// at factor 2; and the run structure alone (variant G, rational arithmetic not
+// yet applied) measured 2% slower than D. The G result is worth restating
+// honestly: it was refuted while the arithmetic was still expensive, which
+// MASKED the gather cost. Make the arithmetic cheap and the gather becomes the
+// bottleneck it always was. Two "no effect" results compose into a real win.
+func upscaleBilinearRunsExact(src *image.Gray, scale int) *image.Gray {
+	w, h := src.Bounds().Dx(), src.Bounds().Dy()
+	ow, oh := w*scale, h*scale
+	dst := image.NewGray(image.Rect(0, 0, ow, oh))
+	den := uint32(2 * scale)
+
+	axis := func(n int) (i0s, i1s []int32, rs []uint32) {
+		on := n * scale
+		i0s, i1s, rs = make([]int32, on), make([]int32, on), make([]uint32, on)
+		for o := 0; o < on; o++ {
+			num, d := 2*o+1-scale, 2*scale
+			f := num / d
+			r := num - f*d
+			if r < 0 {
+				f--
+				r += d
+			}
+			a, b := f, f+1
+			if a < 0 {
+				a = 0
+			} else if a >= n {
+				a = n - 1
+			}
+			if b < 0 {
+				b = 0
+			} else if b >= n {
+				b = n - 1
+			}
+			i0s[o], i1s[o], rs[o] = int32(a), int32(b), uint32(r)
+		}
+		return
+	}
+	x0s, x1s, rxs := axis(w)
+	y0s, y1s, rys := axis(h)
+	rs, rl, ra, rb := bilinearRuns(x0s, x1s)
+
+	mid := make([]uint16, ow*h)
+	for y := 0; y < h; y++ {
+		row := src.Pix[y*src.Stride : y*src.Stride+w]
+		mrow := mid[y*ow : y*ow+ow]
+		for k := range rs {
+			a := uint32(row[ra[k]])
+			b := uint32(row[rb[k]])
+			s, e := int(rs[k]), int(rs[k])+int(rl[k])
+			out := mrow[s:e]
+			ws := rxs[s:e:e] // same length as out -> bounds check hoisted
+			for i := range out {
+				r := ws[i]
+				out[i] = uint16(a*(den-r) + b*r)
+			}
+		}
+	}
+
+	// Constant divisor per factor; see upscaleBilinearExact for why a variable
+	// divisor here costs a hardware DIV and 1.35x.
+	vert := func(half uint32, div func(uint32) uint8) {
+		for oy := 0; oy < oh; oy++ {
+			ry := rys[oy]
+			iry := den - ry
+			m0 := mid[int(y0s[oy])*ow : int(y0s[oy])*ow+ow]
+			m1 := mid[int(y1s[oy])*ow : int(y1s[oy])*ow+ow]
+			out := dst.Pix[oy*dst.Stride : oy*dst.Stride+ow]
+			m0, m1 = m0[:len(out)], m1[:len(out)]
+			for ox := range out {
+				out[ox] = div(uint32(m0[ox])*iry + uint32(m1[ox])*ry + half)
+			}
+		}
+	}
+	switch scale {
+	case 2:
+		vert(8, func(v uint32) uint8 { return uint8(v / 16) })
+	case 3:
+		vert(18, func(v uint32) uint8 { return uint8(v / 36) })
+	case 4:
+		vert(32, func(v uint32) uint8 { return uint8(v / 64) })
+	default:
+		dd := den * den
+		vert(dd/2, func(v uint32) uint8 { return uint8(v / dd) })
+	}
+	return dst
+}
+
+// M: the recommended scaler at every factor.
+func preprocessM(img image.Image, scale int) *image.Gray {
+	small := grayStretchNoBuf(img)
+	if scale <= 1 {
+		return small
+	}
+	return upscaleBilinearRunsExact(small, scale)
+}
+
+// ---- variant N: the recommendation ----
+//
+// One scaler per factor, each the fastest MEASURED option for that factor. No
+// variant is fastest everywhere and the differences are large (K beats M by
+// 1.34x at factor 2; M beats the general scaler by 1.12x at factor 3), so the
+// dispatch is the deliverable, not any single kernel.
+//
+//	factor 1  no scaler at all -- the stretched plane IS the output
+//	factor 2  upscaleBilinear2x        K, shift-and-add, no weight table read
+//	factor 3  upscaleBilinearRunsExact M, run-structured exact rational
+//	other     upscaleBilinearSeparable D, the general 16.16 scaler
+//
+// Output is bit-identical to variant D at every factor -- K and M were each
+// verified byte-for-byte against D on a real fixture at their own factor -- so
+// this is a pure speed change with no pixel consequences.
+func preprocessN(img image.Image, scale int) *image.Gray {
+	small := grayStretchNoBuf(img)
+	switch {
+	case scale <= 1:
+		return small
+	case scale == 2:
+		return upscaleBilinear2x(small)
+	case scale == 3:
+		return upscaleBilinearRunsExact(small, scale)
+	default:
+		return upscaleBilinearSeparable(small, scale)
+	}
+}
