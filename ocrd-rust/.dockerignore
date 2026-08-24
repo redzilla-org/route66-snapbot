@@ -1,0 +1,8 @@
+# Build products are host-local and must never enter the Docker build context.
+# They are large, platform-specific, and can contain paths that Docker's tar
+# writer cannot represent cleanly from Windows.
+target/
+target-*/
+
+# Release extraction output is produced outside this context by the Makefile.
+bin/

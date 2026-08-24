@@ -2,3 +2,4 @@
 # binary (see README "Build and distribution"), so no build artifact belongs in
 # the repo.
 /target
+/target-*

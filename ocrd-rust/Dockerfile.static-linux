@@ -1,0 +1,109 @@
+# linux/amd64 fully static build of the Rust OCR daemon.
+#
+# WHY THIS IS NOT ocrd-rust/Dockerfile.build WITH ONE MORE FLAG: the Alpine
+# packages provide libtesseract.so and libleptonica.so, but not libtesseract.a
+# or libleptonica.a. A real static executable therefore has to build those two
+# native libraries from source before Cargo links the Rust daemon.
+FROM public.ecr.aws/docker/library/golang:1.27-alpine@sha256:4c9fe60190a2a3350ddc51de80d0224b8a6698d12bdfc999fee45ea9d6c46dbc
+
+ARG LEPTONICA_VERSION=1.87.0
+ARG TESSERACT_VERSION=5.5.2
+
+# rust/cargo: the Rust toolchain. build-base/linux-headers: the C/C++ static
+# toolchain. autoconf/automake/libtool: both upstream projects are built through
+# their release-source autotools path. clang/llvm-dev: bindgen needs libclang
+# when the Rust -sys crates parse the Tesseract and Leptonica headers.
+#
+# Static image libraries are kept deliberately small: ocrd accepts PNG input,
+# and the scale-1 passthrough asks Leptonica to read the original PNG. TIFF,
+# WebP and JPEG2000 are intentionally not pulled into the static closure.
+RUN apk add --no-cache \
+        rust \
+        cargo \
+        build-base \
+        linux-headers \
+        musl-dev \
+        pkgconf \
+        clang \
+        clang-dev \
+        llvm-dev \
+        ca-certificates \
+        curl \
+        autoconf \
+        automake \
+        libtool \
+        zlib-dev \
+        zlib-static \
+        libpng-dev \
+        libpng-static \
+        libjpeg-turbo-dev \
+        libjpeg-turbo-static \
+        giflib-dev \
+        giflib-static \
+        libstdc++-dev
+
+WORKDIR /tmp/build
+
+# WHY source builds: Alpine has no static Leptonica package. Build only the
+# library, with shared objects disabled, into a private prefix that Cargo can
+# discover through PKG_CONFIG_PATH.
+RUN curl -fsSL "https://github.com/DanBloomberg/leptonica/archive/refs/tags/${LEPTONICA_VERSION}.tar.gz" \
+        | tar -xz \
+        && cd "leptonica-${LEPTONICA_VERSION}" \
+        && ./autogen.sh \
+        && ./configure \
+            --prefix=/opt/ocrd-static \
+            --disable-shared \
+            --enable-static \
+            --without-libtiff \
+            --without-libwebp \
+            --without-libopenjpeg \
+        && make -j"$(nproc)" \
+        && make install
+
+# WHY source builds: Alpine has no static Tesseract package either. Disable
+# graphics, OpenMP and training tools so the daemon does not inherit the broad
+# desktop/runtime dependency graph used by the distro CLI package.
+RUN curl -fsSL "https://github.com/tesseract-ocr/tesseract/archive/refs/tags/${TESSERACT_VERSION}.tar.gz" \
+        | tar -xz \
+        && cd "tesseract-${TESSERACT_VERSION}" \
+        && ./autogen.sh \
+        && PKG_CONFIG_PATH=/opt/ocrd-static/lib/pkgconfig ./configure \
+            --prefix=/opt/ocrd-static \
+            --disable-shared \
+            --enable-static \
+            --disable-openmp \
+            --disable-graphics \
+            --disable-training-tools \
+        && make -j"$(nproc)" \
+        && make install
+
+COPY . /src
+WORKDIR /src
+
+# WHY: Cargo's native-link line for the Tesseract -sys crates contains a late
+# `-Wl,-Bdynamic` before the C++ driver appends its implicit runtime libraries.
+# The wrapper starts g++ in static mode and leaves the linker in Bstatic mode
+# again at the end, so libstdc++/libgcc/libc are resolved from archives.
+RUN printf '%s\n' \
+        '#!/bin/sh' \
+        'exec g++ -static -static-libstdc++ -static-libgcc "$@" -Wl,-Bstatic' \
+        > /usr/local/bin/ocrd-static-cxx-link \
+        && chmod +x /usr/local/bin/ocrd-static-cxx-link
+
+# PKG_CONFIG_ALL_STATIC makes pkg-config emit the full transitive static link
+# set. -static makes the final linker reject any accidental .so fallback. The
+# dedicated target-dir prevents build-script outputs from the dynamic Linux
+# build from being reused under a different link contract.
+RUN PKG_CONFIG_PATH=/opt/ocrd-static/lib/pkgconfig \
+        PKG_CONFIG_ALL_STATIC=1 \
+        cargo rustc --release --locked --target-dir target-static-linux --bin ocrd -- \
+            -C linker=/usr/local/bin/ocrd-static-cxx-link \
+            -C target-feature=+crt-static \
+            -C relocation-model=static \
+            -C link-arg=-no-pie \
+        && mkdir -p /out \
+        && cp target-static-linux/release/ocrd /out/ocrd \
+        && file /out/ocrd \
+        && ! ldd /out/ocrd \
+        && /out/ocrd --version

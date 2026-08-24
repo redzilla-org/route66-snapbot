@@ -16,8 +16,18 @@
 VERSION ?= v0.1.0
 REPO    ?= redzilla-org/ocr-daemon
 BIN     := bin
+ENG_TRAINEDDATA ?= $(BIN)/rust/eng.traineddata
+ENG_TRAINEDDATA_SOURCE ?=
 
-.PHONY: all rust go windows-rust linux-rust windows-go linux-go publish clean
+# The staging directory the release is uploaded FROM.
+#
+# WHY IT EXISTS: `gh release upload` names each asset by its file BASENAME, so
+# the filenames in this directory ARE the public download URLs. Build outputs
+# live under bin/rust/ with names that describe how they were built
+# (`-static`); consumers must never see that. See the publish target.
+PUBLISH := $(BIN)/publish
+
+.PHONY: all rust go windows-rust windows-rust-static rust-tessdata linux-rust linux-rust-static windows-go linux-go publish clean
 
 all: rust go
 rust: windows-rust linux-rust
@@ -36,6 +46,20 @@ windows-rust: $(BIN)/rust
 	cd ocrd-rust && VCPKGRS_DYNAMIC=1 cargo build --release --locked
 	cp ocrd-rust/target/release/ocrd.exe $(BIN)/rust/ocrd-windows-amd64.exe
 
+# Fully static native Windows build. This is intentionally separate from the
+# dynamic target above because it needs a different vcpkg triplet and Rust CRT
+# mode; mixing those outputs in one Cargo target directory makes it too easy to
+# ship whichever link mode happened to build last.
+windows-rust-static: $(BIN)/rust
+	powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows-rust-static.ps1
+
+# Tesseract language data is runtime data, not something the linker can fold
+# into a static executable. Stage the default English model beside the release
+# assets so Windows installs can set TESSDATA_PREFIX to that directory without
+# requiring a separate Tesseract install.
+rust-tessdata: $(BIN)/rust
+	powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stage-eng-traineddata.ps1 -SourcePath "$(ENG_TRAINEDDATA_SOURCE)" -OutPath "$(ENG_TRAINEDDATA)"
+
 # Built IN a container and copied back out rather than bind-mounted, for two
 # reasons: it works against a remote Docker daemon that cannot see this checkout,
 # and the musl userland that produces the binary is byte-identical to the one
@@ -52,6 +76,16 @@ linux-rust: $(BIN)/rust
 	docker create --name ocrd-rust-extract ocrd-rust-build true
 	docker cp ocrd-rust-extract:/out/ocrd $(BIN)/rust/ocrd-linux-amd64
 	docker rm ocrd-rust-extract
+
+# Fully static linux/amd64 build. Alpine's binary packages provide dynamic
+# libtesseract/libleptonica only, so this target builds those two native
+# libraries as static archives inside the container before Cargo links ocrd.
+linux-rust-static: $(BIN)/rust
+	docker build -f ocrd-rust/Dockerfile.static-linux -t ocrd-rust-static-build ocrd-rust
+	docker rm -f ocrd-rust-static-extract 2>/dev/null || true
+	docker create --name ocrd-rust-static-extract ocrd-rust-static-build true
+	docker cp ocrd-rust-static-extract:/out/ocrd $(BIN)/rust/ocrd-linux-amd64-static
+	docker rm ocrd-rust-static-extract
 
 # --- Go: built, never published ---------------------------------------------
 #
@@ -82,12 +116,40 @@ $(BIN)/go:
 #
 # Depends on the rust targets directly rather than on `all`, so a publish never
 # blocks on a Go build and can never ship its output by accident.
-publish: rust
+#
+# THE PUBLISHED NAMES ARE THE CONSUMER'S CONTRACT, AND THEY ARE BUILD-DETAIL
+# FREE. What is uploaded is `ocrd-<os>-<arch>` — no language in the name (see
+# the preamble at the top of this file) and, for exactly the same reason, no
+# LINKAGE in it either. A consumer asks for "the ocrd for linux/amd64"; whether
+# that binary was linked statically or dynamically is this repo's business, the
+# same as which language it was written in. Baking `-static` into the download
+# URL would re-encode a build detail the artifact name deliberately keeps out,
+# and would have to be un-baked the next time the linkage changes — a breaking
+# rename for every consumer, to describe something no consumer can act on.
+#
+# `gh release upload` names each asset by its file BASENAME and its `#label`
+# syntax sets only the DISPLAY label, so the rename has to happen on disk. The
+# artifacts are therefore COPIED into a staging directory under their public
+# names. bin/rust/ keeps the `-static` names, because there the distinction is
+# real: bin/rust/ holds both linkages at once and the build must not confuse
+# them. Copy, not move: a publish must never consume its own inputs.
+#
+# The staging directory is REBUILT FROM SCRATCH each time. bin/rust/ also holds
+# a DYNAMIC ocrd-windows-amd64.exe — a name one character away from the public
+# one — and shipping that by accident is the failure this whole target exists to
+# avoid: it loads only where vcpkg's DLLs are on PATH, so it would fail at
+# rc=127 on every consumer machine and nowhere on the build host.
+publish: windows-rust-static linux-rust-static rust-tessdata
+	rm -rf $(PUBLISH)
+	mkdir -p $(PUBLISH)
+	cp $(BIN)/rust/ocrd-windows-amd64-static.exe $(PUBLISH)/ocrd-windows-amd64.exe
+	cp $(BIN)/rust/ocrd-linux-amd64-static $(PUBLISH)/ocrd-linux-amd64
+	cp $(ENG_TRAINEDDATA) $(PUBLISH)/eng.traineddata
 	gh release view $(VERSION) --repo $(REPO) >/dev/null 2>&1 || \
 		gh release create $(VERSION) --repo $(REPO) --title "ocrd $(VERSION)" \
-			--notes "OCR daemon, windows/amd64 + linux/amd64. Protocol and CLI: see README.md."
+			--notes "OCR daemon, windows/amd64 + linux/amd64, plus English Tesseract language data. Protocol and CLI: see README.md."
 	gh release upload $(VERSION) --repo $(REPO) --clobber \
-		$(BIN)/rust/ocrd-windows-amd64.exe $(BIN)/rust/ocrd-linux-amd64
+		$(PUBLISH)/ocrd-windows-amd64.exe $(PUBLISH)/ocrd-linux-amd64 $(PUBLISH)/eng.traineddata
 
 clean:
-	rm -rf $(BIN)/rust $(BIN)/go
+	rm -rf $(BIN)/rust $(BIN)/go $(PUBLISH)
