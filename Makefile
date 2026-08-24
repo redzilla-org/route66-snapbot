@@ -10,7 +10,7 @@
 # golang:alpine image so no cross-toolchain is installed on the host.
 
 VERSION ?= v0.1.0
-REPO    ?= refacktor/ocr-daemon
+REPO    ?= redzilla-org/ocr-daemon
 BIN     := bin
 
 .PHONY: all windows linux publish clean
