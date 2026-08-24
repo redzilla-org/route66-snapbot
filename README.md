@@ -55,12 +55,19 @@ number of concurrent reads.
 
 ### Concurrency belongs to the client
 
-The daemon runs a shared-queue worker pool that grows while every worker is busy
-and imposes no ceiling of its own. The number of images read concurrently is
-therefore exactly the number of requests its clients keep in flight. That is
-deliberate: a daemon shared by several client processes cannot see the machine's
-total load, so the only place a sane budget can live is in the clients. Do not
-fire unbounded requests at it and expect it to throttle for you.
+**The daemon does not throttle for you.** A daemon shared by several client
+processes cannot see the machine's total load, so the only place a sane budget
+can live is in the clients. Send it a thousand requests at once and it will try
+to serve a thousand requests.
+
+The two implementations differ here in a way a client can observe, so do not
+depend on either shape: `ocrd-rust` runs a shared-queue pool that grows while
+every worker is busy and imposes no ceiling at all, while `ocrd-go` caps
+concurrent recognitions at `NumCPU` and parks the excess. Both drain the socket
+unconditionally — a request is never left unread because the engines are busy.
+That last property is load-bearing rather than incidental: a daemon that stops
+reading its socket while a client is still writing to it deadlocks the pair,
+since the client cannot get to the replies that would free the daemon's queue.
 
 ### The scale-1 passthrough
 
@@ -78,6 +85,21 @@ stretched grayscale 40.2 s — so the gray plane itself is the trigger, not any
 particular resampling kernel. Planning the scale from the PNG header alone lets
 the daemon skip decoding entirely on that path.
 
+## Command line
+
+Identical across both implementations:
+
+```
+ocrd [--listen host:port]     # default 127.0.0.1:40066
+ocrd --version                # prints and exits before bind or model load
+```
+
+Anything else is a usage error. `ocrd-go` additionally accepts `--tessdata` and
+`--lang`, which it needs because its cgo binding requires an explicit datapath
+on Windows, where vcpkg installs no language data and sets no environment;
+`ocrd-rust` resolves that through `TESSDATA_PREFIX` and its own compiled-in
+default.
+
 ## The two implementations
 
 Both bind the same port and answer the same protocol. Either can be dropped in
@@ -88,14 +110,38 @@ for the other; nothing in the protocol reveals which one is running.
 | Tesseract binding | `tesseract-sys`-style direct linkage | cgo against `tesseract/capi.h` |
 | PNG decode | `png` + `fdeflate` | hand-written decoder with amd64 assembly |
 | Release profile | fat LTO, 1 codegen unit, `panic=abort` | default |
-| Binary | ~403 KB, dynamically linked | ~5.5 MB, dynamically linked |
+| Binary | 425 KB, dynamically linked | 5.5 MB, dynamically linked |
 | Cold build | ~40 s | ~41 s |
 | Incremental build | ~10-14 s | ~2 s |
 
-Neither is obviously the winner, which is why both are here. See
-[`BUILD_TIMES.md`](BUILD_TIMES.md) for the measured build-cost comparison and
-[`BENCHMARK.md`](BENCHMARK.md) for the image-pipeline benchmark across several
-languages that informed the decode/resample choices.
+**`ocrd-rust` is the shipped implementation.** The honest reasoning, because
+the numbers do not all point one way:
+
+- **No cgo.** This is the decisive one. The Go implementation links Tesseract
+  through cgo, and a cgo package may not contain Go assembly — so its PNG
+  pipeline had to be split into a separate package behind an exported seam
+  purely to satisfy the toolchain. `CGO_ENABLED=1` also rules out the pure-Go
+  cross-compile that makes a single build host produce every platform.
+- **Size:** 425 KB against 5.5 MB, about 13x.
+- **Runtime is a near-tie, and it stopped mattering.** The pipeline benchmark
+  actually favors the Go decoder slightly (27.59 ms against 28.43 ms on the
+  typical case, on the strength of a 0.52 ms transform phase against 7.62 ms).
+  But the scale-1 passthrough above means the expensive cases skip the
+  preprocessing pipeline entirely, so that margin now governs milliseconds on
+  small images rather than anything that shows up in a real workload.
+- **Build cost is a wash**, and the one number that looks decisive is not: see
+  [`BUILD_TIMES.md`](BUILD_TIMES.md). Cold builds are within ~1.5 s of each
+  other. Rust's slower incremental build (~10-14 s against ~2 s) is a
+  consequence of `lto = "fat"` and `codegen-units = 1` in the release profile,
+  not of the language — iterate with a dev profile.
+
+The Go implementation stays in the tree. It is the reason the pipeline choices
+are known to be sound rather than assumed, and it is a working second
+implementation of the protocol, which is the cheapest available check that the
+protocol is actually implementable from its description.
+
+See [`BENCHMARK.md`](BENCHMARK.md) for the image-pipeline benchmark across
+several languages that informed the decode/resample choices.
 
 The Go implementation carries one structural quirk worth knowing before you edit
 it: **a cgo package may not contain Go assembly files.** The PNG pipeline's
@@ -104,18 +150,66 @@ exported seam, and `tess.go` is the only file in the tree that touches cgo.
 
 ## Building
 
-The `Makefile` builds only the Go implementation, for two platforms:
+The `Makefile` builds both implementations for both platforms. `ocrd-rust` is
+the one consumers are expected to install; the Go targets are kept so the second
+implementation cannot quietly rot.
 
 ```sh
-make windows   # native build -> bin/ocrd-go-windows-amd64.exe
-make linux     # built inside a pinned golang:alpine -> bin/ocrd-go-linux-amd64
-make all       # both
-make publish   # attach both to a GitHub release (VERSION=..., REPO=...)
+make windows-rust   # native      -> bin/ocrd-rust-windows-amd64.exe
+make linux-rust     # in a container -> bin/ocrd-rust-linux-amd64
+make windows        # native      -> bin/ocrd-go-windows-amd64.exe
+make linux          # in a container -> bin/ocrd-go-linux-amd64
+make all            # all four
+make publish        # attach all four to a GitHub release (VERSION=..., REPO=...)
 ```
 
-`make linux` deliberately builds in a container and copies the artifact back out
-rather than bind-mounting, so it works against a remote Docker daemon where the
-source tree is not visible to the server.
+The two `linux*` targets deliberately build in a container and copy the artifact
+back out rather than bind-mounting, so they work against a remote Docker daemon
+that cannot see the source tree — and, for the Rust target, so the musl userland
+that produces the binary is byte-identical to the one that runs it.
+
+### The Rust build is slow — budget for it
+
+This is the one thing to know before you start editing `ocrd-rust`, because it
+is easy to mistake for a hang.
+
+| Build | Measured |
+|---|---|
+| `make linux-rust` (container, cold) | **2 m 49 s** |
+| `ocrd-rust` native release, cold | ~35-40 s |
+| `ocrd-rust` native release, incremental | **10-14 s** |
+| `ocrd-go` native, incremental | ~2 s |
+
+Three costs stack up, and none of them is the language:
+
+1. **bindgen + libclang.** `leptess` generates its bindings by parsing the
+   Tesseract and Leptonica headers through libclang at build time. In the
+   container that also means installing `clang-dev`/`llvm-dev` first.
+2. **`lto = "fat"` with `codegen-units = 1`.** The release profile links the
+   whole program, across the `png` crate boundary, as a single unit. This is
+   deliberate — the kernels in `src/kstream.rs` were *measured* under exactly
+   these settings — but it means every edit pays a whole-program link.
+3. **`panic = "abort"`**, so no unwind landing pads are emitted around the hot
+   loops. Cheap, but it is part of the same measured configuration.
+
+**Do not iterate on the release profile.** Build with `cargo build` (dev) or add
+a profile that drops `lto` and raises `codegen-units` while you are working, and
+keep the release profile for the artifact you actually publish and benchmark.
+Changing the release profile invalidates the benchmark this implementation was
+chosen on, so change it only with fresh measurements.
+
+For the same reason `make linux-rust` has no incremental mode worth using: the
+container starts from a clean `/src` every time, so it is always a cold build
+plus a fat-LTO link. Publish from it; do not develop against it.
+
+See [`BUILD_TIMES.md`](BUILD_TIMES.md) for the full cross-language comparison,
+including why the ~52-minute one-time Windows Tesseract toolchain bootstrap is a
+toolchain cost that both implementations pay identically and neither should be
+credited or blamed for.
+
+Every binary answers `--version`, which prints and exits before binding a port
+or loading a model — so an image build can prove the binary it just downloaded
+actually executes on that userland, with no tessdata present and no port free.
 
 Both implementations link against a system Tesseract and Leptonica, so those
 libraries and their headers must be present:
@@ -134,7 +228,11 @@ implementations pay it identically.
 
 ## Client notes
 
-- Set the address with the daemon's `-addr` / `--listen` flag. A client that
+- Set the address with `--listen host:port`. Both implementations accept
+  `--listen` and `--version` in exactly that double-dash spelling and nothing
+  else, deliberately: a client cannot tell which implementation it is starting,
+  so the argv has to be identical across both. A second accepted spelling is how
+  two CLIs drift apart. A client that
   spawns its own daemon should treat the spawn as fire-and-forget: the daemon is
   *meant* to outlive the client, so start it detached, never wait on it, and let
   the port bind resolve the race.

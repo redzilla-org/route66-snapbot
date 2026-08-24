@@ -85,6 +85,10 @@ use serde::{Deserialize, Serialize};
 // singleton. See the AddrInUse probe in main().
 const DEFAULT_ADDR: &str = "127.0.0.1:40066";
 
+/// Build identity, reported by --version. Kept in lockstep with the crate
+/// version in Cargo.toml -- read from it directly so the two can never drift.
+const VERSION: &str = concat!("ocrd-rust ", env!("CARGO_PKG_VERSION"));
+
 /// One page to read.
 ///
 /// Every knob has a default, so the minimal request is just an id and a path —
@@ -398,8 +402,19 @@ fn main() {
     match args.as_slice() {
         [] => {}
         [flag, value] if flag == "--listen" => addr = value.clone(),
+        // --version prints and exits BEFORE the bind and before any engine
+        // work, which is what makes it usable as an image-build self-check:
+        // a layer that has just downloaded this binary can prove it actually
+        // executes on that userland without a tessdata directory present or a
+        // port to bind. The protocol deliberately does not reveal which
+        // implementation is answering, so this flag is the only way an operator
+        // can tell what is installed.
+        [flag] if flag == "--version" => {
+            println!("{VERSION}");
+            return;
+        }
         _ => {
-            eprintln!("usage: ocrd [--listen host:port]   (default {DEFAULT_ADDR})");
+            eprintln!("usage: ocrd [--listen host:port | --version]   (default {DEFAULT_ADDR})");
             std::process::exit(2);
         }
     }

@@ -146,9 +146,17 @@ func serveConn(conn net.Conn, slots chan struct{}) {
 			continue
 		}
 		wg.Add(1)
-		slots <- struct{}{}
+		// THE SLOT IS ACQUIRED INSIDE THE GOROUTINE, DELIBERATELY. Taking it
+		// here, in the read loop, would stop this connection being READ once
+		// the slots ran out -- head-of-line blocking that turns a full engine
+		// pool into an unread socket. That is also a deadlock: a client that
+		// pipelines more than len(slots) requests fills `out`, whose encoder
+		// cannot drain faster than the client reads, while the client is still
+		// blocked writing into a socket nobody is reading. Requests are cheap
+		// to hold as parked goroutines; the socket must always drain.
 		go func(r ocrRequest) {
 			defer wg.Done()
+			slots <- struct{}{}
 			defer func() { <-slots }()
 			handleRequest(r, out)
 		}(req)
@@ -166,15 +174,20 @@ func serveConn(conn net.Conn, slots chan struct{}) {
 const version = "ocrd-go 0.1.0"
 
 func main() {
-	// TWO NAMES FOR ONE FLAG, and the alias is the load-bearing one.
-	// Clients spawn the daemon as `--listen <addr>`; that is the established
-	// CLI contract, set by the Rust implementation, and this implementation
-	// has to be a drop-in for it. Go's flag package treats an unrecognized
-	// flag as a usage error and exits, so a daemon that offered only -addr
-	// would not mis-parse the address -- it would refuse to start at all, and
-	// the client would see nothing but a connect timeout with no clue why.
+	// ONE SPELLING PER FLAG, SHARED WITH THE OTHER IMPLEMENTATION.
+	// Clients spawn the daemon as `--listen <addr>`, and both implementations
+	// of this protocol must be drop-in replacements for each other down to the
+	// argv -- a client cannot know which one it is starting. Go's flag package
+	// accepts `--listen` and `-listen` interchangeably, and the Rust build
+	// accepts only the double-dash form, so `--listen` and `--version` are the
+	// spellings that work everywhere and are therefore the only ones documented.
+	//
+	// An earlier revision of this file offered `-addr` instead, which is how
+	// the mismatch was found: Go treats an unrecognized flag as a usage error
+	// and exits, so this daemon did not mis-parse the address -- it refused to
+	// start at all, and the client saw nothing but a connect timeout. No alias
+	// is kept for it; a second accepted name is how the two CLIs drift apart.
 	addr := flag.String("listen", "127.0.0.1:40066", "listen address")
-	flag.StringVar(addr, "addr", *addr, "listen address (alias for -listen)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.StringVar(&tessData, "tessdata", os.Getenv("TESSDATA_PREFIX"), "tessdata directory")
 	flag.StringVar(&tessLang, "lang", "eng", "tesseract language")
