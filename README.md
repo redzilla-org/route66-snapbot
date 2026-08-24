@@ -46,10 +46,25 @@ Response, one JSON object per line:
 {"id":"1","text":"...recognized text...","error":""}
 ```
 
-**Replies arrive out of order.** Every request is served on its own worker and
-they finish at different speeds, so a client pipelines requests onto one
-connection and demultiplexes replies by `id`. One TCP stream is enough for any
-number of concurrent reads.
+**Match replies to requests by `id`, never by position.** The daemon sends each
+reply as soon as that image finishes, and images finish in whatever order they
+finish — a small one overtakes a large one queued ahead of it. So the third
+reply you read is not necessarily the answer to your third request:
+
+```
+you send:      A (huge page)    B (small)    C (small)
+you read back: B                C            A
+```
+
+Nothing is wrong with the stream when this happens. It is TCP, so the bytes
+arrive exactly as the daemon wrote them and nothing is shuffled in transit; the
+daemon simply chose to write B's reply first because B was done first. That is
+the entire reason `id` exists in the protocol.
+
+If you only ever have one request outstanding, replies come back in the order
+you sent them and this never comes up. It only shows up once you pipeline —
+which you should, since one connection handles any number of concurrent
+requests and a connection per image would waste the daemon's whole point.
 
 `error` non-empty means that request failed; the daemon stays up.
 
@@ -135,10 +150,14 @@ the numbers do not all point one way:
   consequence of `lto = "fat"` and `codegen-units = 1` in the release profile,
   not of the language — iterate with a dev profile.
 
-The Go implementation stays in the tree. It is the reason the pipeline choices
-are known to be sound rather than assumed, and it is a working second
-implementation of the protocol, which is the cheapest available check that the
-protocol is actually implementable from its description.
+The Go implementation stays in the tree and is still built by `make all`, but it
+is **not published**: releases carry `ocrd-rust` binaries only. That way there
+is no artifact to install by mistake and no question about which implementation
+a given machine ended up running. It is kept because it is the reason the
+pipeline choices are known to be sound rather than assumed, and because a
+working second implementation is the cheapest available check that this protocol
+is implementable from its description rather than only from the Rust source.
+Build it from the tree if you want to run it.
 
 See [`BENCHMARK.md`](BENCHMARK.md) for the image-pipeline benchmark across
 several languages that informed the decode/resample choices.
@@ -159,8 +178,8 @@ make windows-rust   # native      -> bin/ocrd-rust-windows-amd64.exe
 make linux-rust     # in a container -> bin/ocrd-rust-linux-amd64
 make windows        # native      -> bin/ocrd-go-windows-amd64.exe
 make linux          # in a container -> bin/ocrd-go-linux-amd64
-make all            # all four
-make publish        # attach all four to a GitHub release (VERSION=..., REPO=...)
+make all            # all four, locally
+make publish        # release ONLY the two ocrd-rust binaries (VERSION=..., REPO=...)
 ```
 
 The two `linux*` targets deliberately build in a container and copy the artifact

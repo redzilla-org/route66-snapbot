@@ -9,4 +9,4 @@ RUN apk add --no-cache gcc musl-dev pkgconf tesseract-ocr-dev leptonica-dev
 COPY . /src
 WORKDIR /src
 ENV CGO_ENABLED=1
-RUN go build -o /out/ocrd-go-linux-amd64 .
+RUN go build -o /out/ocrd .

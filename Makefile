@@ -1,70 +1,93 @@
-# Builds the Go OCR daemon (ocrd-go) for both platforms and publishes the
-# binaries to GitHub releases. The Rust daemon (ocrd-rust) is kept in-repo as
-# the reference implementation but is NOT built here -- the Go build is the
-# one consumers download (see BUILD_TIMES.md for why).
+# ocr-daemon build + publish.
 #
-# Windows build needs (already true on the reference workstation):
-#   - mingw-w64 gcc on PATH (cgo)
-#   - vcpkg tesseract:x64-windows at C:/Users/alexr/vcpkg (paths in tess.go)
-# Linux build needs only a reachable docker daemon: the compile runs inside a
-# golang:alpine image so no cross-toolchain is installed on the host.
-
+# THE ARTIFACT NAME IS LANGUAGE-FREE, DELIBERATELY (owner 2026-08-24: "don't put
+# the language name in the binary, keep it polymorphic"). What consumers install
+# is `ocrd-<os>-<arch>`, and nothing in that name -- or in the protocol, or in
+# the CLI -- reveals which implementation they got. That is the whole point of
+# having two: either can be swapped in without a consumer noticing, so encoding
+# the language in the filename would leak an implementation detail into every
+# download URL, Dockerfile and install script, and make the swap a breaking
+# change instead of a drop-in.
+#
+# The IMPLEMENTATION is named by the DIRECTORY instead: bin/rust/ and bin/go/
+# hold identically-named binaries. That keeps both on disk at once without a
+# name collision, and keeps the distinction where it belongs -- in the build
+# tree, not in the shipped artifact.
 VERSION ?= v0.1.0
 REPO    ?= redzilla-org/ocr-daemon
 BIN     := bin
 
-.PHONY: all windows windows-rust linux linux-rust publish clean
+.PHONY: all rust go windows-rust linux-rust windows-go linux-go publish clean
 
-all: windows windows-rust linux linux-rust
+all: rust go
+rust: windows-rust linux-rust
+go: windows-go linux-go
 
-windows: $(BIN)
-	cd ocrd-go && CGO_ENABLED=1 GOOS=windows GOARCH=amd64 GOWORK=off \
-		go build -o ../$(BIN)/ocrd-go-windows-amd64.exe .
+# --- Rust: the shipped implementation ---------------------------------------
 
-# The Rust daemon, windows/amd64. Native build -- no container, because the
-# tesseract/leptonica import libraries come from vcpkg on this host.
+# Native build. The tesseract/leptonica import libraries come from vcpkg on this
+# host, so there is nothing to containerize.
 #
-# VCPKGRS_DYNAMIC=1 selects the DLL (not static) vcpkg triplet, which is what
-# is actually installed; without it the vcpkg crate looks for static libs that
-# are not there and fails at link. The produced binary is DYNAMIC: running it
-# needs vcpkg's installed/x64-windows/bin on PATH for the DLLs.
-windows-rust: $(BIN)
+# VCPKGRS_DYNAMIC=1 selects the DLL (not static) vcpkg triplet, which is what is
+# actually installed; without it the vcpkg crate hunts for static libs that are
+# not there and fails at link. The result is DYNAMIC -- running it needs vcpkg's
+# installed/x64-windows/bin on PATH.
+windows-rust: $(BIN)/rust
 	cd ocrd-rust && VCPKGRS_DYNAMIC=1 cargo build --release --locked
-	cp ocrd-rust/target/release/ocrd.exe $(BIN)/ocrd-rust-windows-amd64.exe
+	cp ocrd-rust/target/release/ocrd.exe $(BIN)/rust/ocrd-windows-amd64.exe
 
-# Remote-daemon-safe: build context is uploaded, binary comes back via cp.
-linux: $(BIN)
-	docker build -f ocrd-go/Dockerfile.build -t ocrd-go-build ocrd-go
-	docker rm -f ocrd-go-extract 2>/dev/null || true
-	docker create --name ocrd-go-extract ocrd-go-build true
-	docker cp ocrd-go-extract:/out/ocrd-go-linux-amd64 $(BIN)/ocrd-go-linux-amd64
-	docker rm ocrd-go-extract
-
-$(BIN):
-	mkdir -p $(BIN)
-
-# Creates the release if absent, then uploads/replaces both binaries.
-# The Rust daemon, linux/amd64. Same remote-daemon-safe shape as the Go linux
-# target: the context is uploaded and the artifact comes back via cp, because a
-# bind mount cannot reach a Windows checkout from a remote Linux dockerd.
+# Built IN a container and copied back out rather than bind-mounted, for two
+# reasons: it works against a remote Docker daemon that cannot see this checkout,
+# and the musl userland that produces the binary is byte-identical to the one
+# that runs it -- leptess links system tesseract, so a libc or libtesseract skew
+# between build and run host would surface as a load failure at first use.
 #
-# Slower than every other target here by a wide margin -- bindgen parses the
-# tesseract/leptonica headers through libclang, then the release profile's
-# fat LTO with a single codegen unit links the whole program at once. That cost
-# is per-build, not per-edit; iterate with a dev profile.
-linux-rust: $(BIN)
+# Slowest target here by a wide margin (measured 2m49s): bindgen parses the
+# tesseract/leptonica headers through libclang, then the release profile's fat
+# LTO links the whole program as one codegen unit. Publish from it; never
+# develop against it.
+linux-rust: $(BIN)/rust
 	docker build -f ocrd-rust/Dockerfile.build -t ocrd-rust-build ocrd-rust
 	docker rm -f ocrd-rust-extract 2>/dev/null || true
 	docker create --name ocrd-rust-extract ocrd-rust-build true
-	docker cp ocrd-rust-extract:/out/ocrd-rust-linux-amd64 $(BIN)/ocrd-rust-linux-amd64
+	docker cp ocrd-rust-extract:/out/ocrd $(BIN)/rust/ocrd-linux-amd64
 	docker rm ocrd-rust-extract
 
-publish: all
+# --- Go: built, never published ---------------------------------------------
+#
+# Kept building on purpose. An unbuilt second implementation rots, and this one
+# is the cheapest check we have that the protocol is implementable from its
+# written description rather than only from the Rust source. It is NOT an
+# artifact anyone should install -- see the publish target.
+windows-go: $(BIN)/go
+	cd ocrd-go && CGO_ENABLED=1 GOOS=windows GOARCH=amd64 GOWORK=off \
+		go build -o ../$(BIN)/go/ocrd-windows-amd64.exe .
+
+linux-go: $(BIN)/go
+	docker build -f ocrd-go/Dockerfile.build -t ocrd-go-build ocrd-go
+	docker rm -f ocrd-go-extract 2>/dev/null || true
+	docker create --name ocrd-go-extract ocrd-go-build true
+	docker cp ocrd-go-extract:/out/ocrd $(BIN)/go/ocrd-linux-amd64
+	docker rm ocrd-go-extract
+
+$(BIN)/rust:
+	mkdir -p $(BIN)/rust
+
+$(BIN)/go:
+	mkdir -p $(BIN)/go
+
+# ONLY THE RUST BINARIES ARE PUBLISHED (owner 2026-08-24: "do not publish the Go
+# version"). Consumers get one binary per platform: no choice to make, and no
+# question later about which implementation a given machine ended up running.
+#
+# Depends on the rust targets directly rather than on `all`, so a publish never
+# blocks on a Go build and can never ship its output by accident.
+publish: rust
 	gh release view $(VERSION) --repo $(REPO) >/dev/null 2>&1 || \
 		gh release create $(VERSION) --repo $(REPO) --title "ocrd $(VERSION)" \
-			--notes "Go OCR daemon binaries (windows/amd64, linux/amd64). Protocol: see ocrd-rust/README.md."
+			--notes "OCR daemon, windows/amd64 + linux/amd64. Protocol and CLI: see README.md."
 	gh release upload $(VERSION) --repo $(REPO) --clobber \
-		$(BIN)/ocrd-go-windows-amd64.exe $(BIN)/ocrd-go-linux-amd64 		$(BIN)/ocrd-rust-linux-amd64 $(BIN)/ocrd-rust-windows-amd64.exe
+		$(BIN)/rust/ocrd-windows-amd64.exe $(BIN)/rust/ocrd-linux-amd64
 
 clean:
-	rm -rf $(BIN)
+	rm -rf $(BIN)/rust $(BIN)/go

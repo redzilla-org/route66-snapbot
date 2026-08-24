@@ -38,5 +38,5 @@ WORKDIR /src
 # implementation was chosen on.
 RUN cargo build --release --locked \
         && mkdir -p /out \
-        && cp target/release/ocrd /out/ocrd-rust-linux-amd64 \
-        && /out/ocrd-rust-linux-amd64 --version
+        && cp target/release/ocrd /out/ocrd \
+        && /out/ocrd --version

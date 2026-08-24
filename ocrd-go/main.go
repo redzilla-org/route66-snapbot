@@ -23,6 +23,7 @@ import (
 	"runtime"
 	"sync"
 	"syscall"
+	"time"
 )
 
 type ocrRequest struct {
@@ -217,15 +218,29 @@ func main() {
 
 	ln, err := net.Listen("tcp", *addr)
 	if err != nil {
-		// THE PORT BIND IS THE SINGLETON LOCK, so losing it is a NORMAL
-		// outcome, not a failure. Several clients may race to spawn a daemon;
-		// exactly one wins the bind and the losers must exit 0 so the client
-		// that spawned them treats the spawn as successful and connects to the
-		// winner. Exiting non-zero here would turn a won race into a reported
-		// error on every machine with more than one client process.
+		// THE PORT BIND IS THE SINGLETON LOCK, so losing it is normally a
+		// NORMAL outcome: several clients may race to spawn a daemon, exactly
+		// one wins, and the losers must exit 0 so the client that spawned them
+		// treats the spawn as successful and connects to the winner.
+		//
+		// BUT AddrInUse ALONE DOES NOT PROVE A DAEMON IS SERVING, so PROBE
+		// before claiming it. On this platform a port can be reserved with no
+		// visible owner -- WSL mirrored networking held a range where bind
+		// failed while netstat showed nothing and nothing answered. Exiting 0
+		// on that masks the outage completely: the client sees a healthy
+		// singleton, then hangs connecting to a port that will never reply.
+		// Only a port that actually ANSWERS is a real singleton. (The Rust
+		// implementation learned this the hard way; the two must agree, since
+		// a client cannot tell which one it spawned.)
 		if errors.Is(err, syscall.EADDRINUSE) {
-			log.Printf("%s already served by another daemon; exiting", *addr)
-			return
+			probe, perr := net.DialTimeout("tcp", *addr, 2*time.Second)
+			if perr == nil {
+				probe.Close()
+				log.Printf("%s already served by another daemon; exiting", *addr)
+				return
+			}
+			log.Fatalf("%s is reserved but nothing answers -- poisoned port "+
+				"(e.g. a WSL mirrored-networking reservation); pick another with --listen", *addr)
 		}
 		log.Fatalf("bind %s: %v", *addr, err)
 	}
