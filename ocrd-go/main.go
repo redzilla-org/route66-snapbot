@@ -12,6 +12,7 @@ import (
 	"bufio"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"image"
@@ -21,6 +22,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"syscall"
 )
 
 type ocrRequest struct {
@@ -156,22 +158,62 @@ func serveConn(conn net.Conn, slots chan struct{}) {
 	<-done
 }
 
+// version is the daemon build identity. Clients have no way to ask the
+// protocol which implementation is answering -- that is deliberate, the two
+// implementations are meant to be interchangeable -- so this flag is the only
+// way an operator (or an image build asserting the binary it just downloaded
+// actually runs) can tell what is installed.
+const version = "ocrd-go 0.1.0"
+
 func main() {
-	addr := flag.String("addr", "127.0.0.1:40066", "listen address")
+	// TWO NAMES FOR ONE FLAG, and the alias is the load-bearing one.
+	// Clients spawn the daemon as `--listen <addr>`; that is the established
+	// CLI contract, set by the Rust implementation, and this implementation
+	// has to be a drop-in for it. Go's flag package treats an unrecognized
+	// flag as a usage error and exits, so a daemon that offered only -addr
+	// would not mis-parse the address -- it would refuse to start at all, and
+	// the client would see nothing but a connect timeout with no clue why.
+	addr := flag.String("listen", "127.0.0.1:40066", "listen address")
+	flag.StringVar(addr, "addr", *addr, "listen address (alias for -listen)")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.StringVar(&tessData, "tessdata", os.Getenv("TESSDATA_PREFIX"), "tessdata directory")
 	flag.StringVar(&tessLang, "lang", "eng", "tesseract language")
 	flag.Parse()
-	if tessData == "" {
+
+	if *showVersion {
+		fmt.Println(version)
+		return
+	}
+
+	// Only Windows gets a hardcoded fallback, and only because vcpkg installs
+	// no tessdata and sets no environment. On Linux an EMPTY datapath is the
+	// correct answer, not a guess: tesseract resolves its own compiled-in
+	// prefix (the distro package puts the traineddata there), so guessing a
+	// path here could only ever be wrong. A Windows path baked into a Linux
+	// build fails engine init outright.
+	if tessData == "" && runtime.GOOS == "windows" {
 		tessData = "C:/Program Files/Tesseract-OCR/tessdata"
 	}
+
 	// Fail fast if the engine cannot come up at all.
 	probe, err := newTessEngine(tessData, tessLang)
 	if err != nil {
 		log.Fatalf("tesseract init: %v", err)
 	}
 	enginePool.Put(probe)
+
 	ln, err := net.Listen("tcp", *addr)
 	if err != nil {
+		// THE PORT BIND IS THE SINGLETON LOCK, so losing it is a NORMAL
+		// outcome, not a failure. Several clients may race to spawn a daemon;
+		// exactly one wins the bind and the losers must exit 0 so the client
+		// that spawned them treats the spawn as successful and connects to the
+		// winner. Exiting non-zero here would turn a won race into a reported
+		// error on every machine with more than one client process.
+		if errors.Is(err, syscall.EADDRINUSE) {
+			log.Printf("%s already served by another daemon; exiting", *addr)
+			return
+		}
 		log.Fatalf("bind %s: %v", *addr, err)
 	}
 	log.Printf("ocrd-go listening on %s (workers<=%d)", *addr, runtime.NumCPU())
