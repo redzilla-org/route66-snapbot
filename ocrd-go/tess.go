@@ -53,17 +53,24 @@ func (e *tessEngine) recognize(g *image.Gray, psm, dpi int) (string, error) {
 	return out, nil
 }
 
-// recognizeFile hands tesseract the ORIGINAL image via leptonica, using its
-// fast RGB binarization path. Used when scale==1: preprocessing then does no
-// upscaling, and an 8-bit gray plane triggers a pathological tesseract
+// recognizeMem hands tesseract the ORIGINAL ENCODED image via leptonica, using
+// its fast RGB binarization path. Used when scale==1: preprocessing then does
+// no upscaling, and an 8-bit gray plane triggers a pathological tesseract
 // binarization on ultra-wide pages (measured 177s vs 3.2s on a 19599x1002
 // screenshot; even a plain grayscale of the same page costs 39s via the CLI).
-func (e *tessEngine) recognizeFile(path string, psm, dpi int) (string, error) {
-	cp := C.CString(path)
-	defer C.free(unsafe.Pointer(cp))
-	pix := C.pixRead(cp)
+//
+// pixReadMem, not pixRead: requests carry the image bytes inline over NATS, so
+// there is no file to point leptonica at — and deliberately so, since a path
+// only works when daemon and caller share a filesystem, which is exactly the
+// assumption the NATS transport exists to delete. leptonica sniffs the format,
+// so this is also what makes JPEG input work without a second code path.
+func (e *tessEngine) recognizeMem(raw []byte, psm, dpi int) (string, error) {
+	if len(raw) == 0 {
+		return "", fmt.Errorf("empty image")
+	}
+	pix := C.pixReadMem((*C.l_uint8)(unsafe.Pointer(&raw[0])), C.size_t(len(raw)))
 	if pix == nil {
-		return "", fmt.Errorf("pixRead failed: %s", path)
+		return "", fmt.Errorf("pixReadMem failed (%d bytes, unrecognized image)", len(raw))
 	}
 	defer C.pixDestroy(&pix)
 	C.TessBaseAPISetPageSegMode(e.h, C.TessPageSegMode(psm))

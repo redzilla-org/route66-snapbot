@@ -3,32 +3,43 @@
 // benchmark's GOFAST (custom PNG decoder + amd64 asm) and the tesseract
 // binding is a thin cgo wrapper over capi.h?
 //
-// Protocol is byte-compatible with the Rust daemon: NDJSON over loopback TCP,
-// request {id,path,psm,lang,dpi,upscale,pixel_budget}, response
-// {id,text,error}, responses may arrive out of order.
+// IT IS KEPT IN STEP WITH THE RUST DAEMON ON PURPOSE. It is never published
+// (see the Makefile), so its only value is as the cheapest available check
+// that this protocol is implementable from its written description rather than
+// only from the Rust source — and a second implementation that has drifted off
+// the current protocol proves nothing at all.
+//
+// Protocol is byte-compatible with the Rust daemon: NATS request/reply on
+// <prefix>.ocr.read (queue group "ocrd") and <prefix>.ocr.version. See
+// ../ocrd-rust/src/main.rs for the full rationale; the short version is that a
+// loopback TCP port plus a filesystem path assumed the daemon and its caller
+// share a machine, and on the reference workstation (Linux daemon in a WSL2
+// container, Windows caller) they do not.
 package main
 
 import (
-	"bufio"
+	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"image"
 	"log"
-	"net"
 	"ocrdgo/pipeline"
 	"os"
 	"runtime"
-	"sync"
-	"syscall"
-	"time"
+
+	"github.com/nats-io/nats.go"
 )
 
+// ocrRequest is one page to read. The image travels INLINE as base64 — there
+// is no path field and no path fallback, because a path is exactly the
+// assumption this transport removes. Every other field is an OCR knob the
+// caller owns; the daemon is generic and knows nothing about the caller's
+// domain.
 type ocrRequest struct {
-	ID          string `json:"id"`
-	Path        string `json:"path"`
+	Image       string `json:"image"`
 	PSM         int    `json:"psm"`
 	Lang        string `json:"lang"`
 	DPI         int    `json:"dpi"`
@@ -36,10 +47,21 @@ type ocrRequest struct {
 	PixelBudget int64  `json:"pixel_budget"`
 }
 
+// ocrResponse always carries both fields, even when empty: a decoder that must
+// tell "absent" from "empty" has one more state to get wrong for no gain. A
+// non-empty Error means that read failed and THE REPLY IS STILL SENT — a
+// silently dropped request is indistinguishable from a pass at the caller.
 type ocrResponse struct {
-	ID    string `json:"id"`
 	Text  string `json:"text"`
 	Error string `json:"error"`
+}
+
+// versionResponse is the identity proof. Answering on a per-run-unique subject
+// is what a TCP port could never do: it proves WHICH daemon replied, not merely
+// that something is listening.
+type versionResponse struct {
+	Version string `json:"version"`
+	Impl    string `json:"impl"`
 }
 
 // scaleFor mirrors the Rust daemon's budget clamp: requested factor, halved
@@ -55,23 +77,30 @@ func scaleFor(w, h, want int, budget int64) int {
 	return s
 }
 
-var enginePool sync.Pool
 var tessData, tessLang string
 
-func getEngine() (*tessEngine, error) {
-	if e, ok := enginePool.Get().(*tessEngine); ok && e != nil {
-		return e, nil
+// handleRead turns one request payload into one reply payload. Every failure
+// path lands in an Error reply rather than a dropped message, because the
+// caller is blocked on a reply only this function can produce.
+func handleRead(eng *tessEngine, payload []byte) ocrResponse {
+	fail := func(format string, a ...any) ocrResponse {
+		return ocrResponse{Error: fmt.Sprintf(format, a...)}
 	}
-	return newTessEngine(tessData, tessLang)
-}
-
-func handleRequest(req ocrRequest, out chan<- ocrResponse) {
-	fail := func(err error) { out <- ocrResponse{ID: req.ID, Error: err.Error()} }
-	raw, err := os.ReadFile(req.Path)
+	var req ocrRequest
+	if err := json.Unmarshal(payload, &req); err != nil {
+		return fail("malformed request: %v", err)
+	}
+	raw, err := base64.StdEncoding.DecodeString(req.Image)
 	if err != nil {
-		fail(err)
-		return
+		return fail("decode base64 image: %v", err)
 	}
+	if len(raw) == 0 {
+		return fail("empty image")
+	}
+
+	// Absent OR zero means default: a caller serialising from a struct sends
+	// the zero value rather than omitting the field, and a psm of 0 is an unset
+	// field, not a request for segmentation mode 0.
 	upscale, budget := req.Upscale, req.PixelBudget
 	if upscale <= 0 {
 		upscale = 1
@@ -79,15 +108,6 @@ func handleRequest(req ocrRequest, out chan<- ocrResponse) {
 	if budget <= 0 {
 		budget = 20_000_000
 	}
-	// Plan the scale from the PNG header alone (IHDR at fixed offset 16):
-	// when it comes out 1, the frame is never decoded here at all.
-	if len(raw) < 24 {
-		fail(fmt.Errorf("truncated PNG %s", req.Path))
-		return
-	}
-	w0 := int(binary.BigEndian.Uint32(raw[16:20]))
-	h0 := int(binary.BigEndian.Uint32(raw[20:24]))
-	scale := scaleFor(w0, h0, upscale, budget)
 	psm, dpi := req.PSM, req.DPI
 	if psm <= 0 {
 		psm = 3
@@ -95,108 +115,93 @@ func handleRequest(req ocrRequest, out chan<- ocrResponse) {
 	if dpi <= 0 {
 		dpi = 300
 	}
-	eng, err := getEngine()
-	if err != nil {
-		fail(err)
-		return
+
+	// Plan the scale from the PNG header alone (IHDR at fixed offset 16): when
+	// it comes out 1, the frame is never decoded here at all. A payload with no
+	// readable IHDR — a JPEG, which the contract also admits — plans as scale 1
+	// and goes to leptonica, which sniffs the format itself. Refusing it here
+	// would turn a supported format into a read failure.
+	scale := 1
+	if len(raw) >= 24 && string(raw[1:4]) == "PNG" {
+		w0 := int(binary.BigEndian.Uint32(raw[16:20]))
+		h0 := int(binary.BigEndian.Uint32(raw[20:24]))
+		scale = scaleFor(w0, h0, upscale, budget)
 	}
+
 	var text string
 	if scale <= 1 {
 		// No upscaling would happen: skip preprocessing entirely and let
-		// tesseract's fast RGB path binarize the original file. The gray
+		// tesseract's fast RGB path binarize the original image. The gray
 		// plane is pathological on ultra-wide pages: 177s vs 3.2s measured
-		// on a 19599x1002 screenshot (see tess.go recognizeFile).
-		text, err = eng.recognizeFile(req.Path, psm, dpi)
+		// on a 19599x1002 screenshot (see tess.go recognizeMem).
+		text, err = eng.recognizeMem(raw, psm, dpi)
 	} else {
 		decoded, derr := pipeline.Decode(raw)
 		if derr != nil {
-			enginePool.Put(eng)
-			fail(fmt.Errorf("decode %s: %w", req.Path, derr))
-			return
+			return fail("decode: %v", derr)
 		}
 		g := pipeline.Preprocess(decoded, scale)
 		text, err = eng.recognize(g, psm, dpi)
 	}
-	enginePool.Put(eng)
 	if err != nil {
-		fail(err)
-		return
+		return fail("%v", err)
 	}
-	out <- ocrResponse{ID: req.ID, Text: text}
+	return ocrResponse{Text: text}
 }
 
-func serveConn(conn net.Conn, slots chan struct{}) {
-	defer conn.Close()
-	out := make(chan ocrResponse, 64)
-	done := make(chan struct{})
-	go func() {
-		enc := json.NewEncoder(conn)
-		for r := range out {
-			if err := enc.Encode(r); err != nil {
-				break
-			}
-		}
-		close(done)
-	}()
-	var wg sync.WaitGroup
-	sc := bufio.NewScanner(conn)
-	sc.Buffer(make([]byte, 0, 1<<20), 1<<20)
-	for sc.Scan() {
-		var req ocrRequest
-		if err := json.Unmarshal(sc.Bytes(), &req); err != nil {
-			continue
-		}
-		wg.Add(1)
-		// THE SLOT IS ACQUIRED INSIDE THE GOROUTINE, DELIBERATELY. Taking it
-		// here, in the read loop, would stop this connection being READ once
-		// the slots ran out -- head-of-line blocking that turns a full engine
-		// pool into an unread socket. That is also a deadlock: a client that
-		// pipelines more than len(slots) requests fills `out`, whose encoder
-		// cannot drain faster than the client reads, while the client is still
-		// blocked writing into a socket nobody is reading. Requests are cheap
-		// to hold as parked goroutines; the socket must always drain.
-		go func(r ocrRequest) {
-			defer wg.Done()
-			slots <- struct{}{}
-			defer func() { <-slots }()
-			handleRequest(r, out)
-		}(req)
-	}
-	wg.Wait()
-	close(out)
-	<-done
-}
+// versionNumber tracks ocrd-rust/Cargo.toml's `version`, and is the ONLY place
+// in this tree that spells it.
+//
+// Go has no compile-time equivalent of Rust's CARGO_PKG_VERSION for a main
+// package — debug.ReadBuildInfo reports "(devel)" for the main module on an
+// ordinary build — so this cannot be derived the way the Rust daemon derives
+// it, and a human has to move it. It is still worth stating once: the two
+// implementations are meant to be indistinguishable, so a Go daemon reporting a
+// stale version while the Rust one is correct is a trap for whoever debugs the
+// pair next.
+const versionNumber = "0.2.0"
 
-// version is the daemon build identity. Clients have no way to ask the
-// protocol which implementation is answering -- that is deliberate, the two
-// implementations are meant to be interchangeable -- so this flag is the only
-// way an operator (or an image build asserting the binary it just downloaded
-// actually runs) can tell what is installed.
-const version = "ocrd-go 0.1.0"
+// version is the daemon build identity, reported by --version and on the
+// .ocr.version subject.
+const version = "ocrd-go " + versionNumber
+
+// readQueueGroup is fixed, not configurable: the group name is the mechanism
+// that makes N subscribers share one request stream instead of each receiving a
+// copy, and a caller that could set it could only ever set it wrong.
+const readQueueGroup = "ocrd"
 
 func main() {
-	// ONE SPELLING PER FLAG, SHARED WITH THE OTHER IMPLEMENTATION.
-	// Clients spawn the daemon as `--listen <addr>`, and both implementations
-	// of this protocol must be drop-in replacements for each other down to the
-	// argv -- a client cannot know which one it is starting. Go's flag package
-	// accepts `--listen` and `-listen` interchangeably, and the Rust build
-	// accepts only the double-dash form, so `--listen` and `--version` are the
-	// spellings that work everywhere and are therefore the only ones documented.
-	//
-	// An earlier revision of this file offered `-addr` instead, which is how
-	// the mismatch was found: Go treats an unrecognized flag as a usage error
-	// and exits, so this daemon did not mis-parse the address -- it refused to
-	// start at all, and the client saw nothing but a connect timeout. No alias
-	// is kept for it; a second accepted name is how the two CLIs drift apart.
-	addr := flag.String("listen", "127.0.0.1:40066", "listen address")
+	// ONE SPELLING PER FLAG, SHARED WITH THE OTHER IMPLEMENTATION. A client
+	// spawns "the daemon" and cannot know which implementation it started, so
+	// the argv must be identical across both. Go's flag package accepts
+	// --nats and -nats interchangeably; the Rust build accepts only the
+	// double-dash form, so the double-dash spelling is the only one documented.
+	natsURL := flag.String("nats", "", "NATS server URL, e.g. nats://127.0.0.1:41234")
+	subjectPrefix := flag.String("subject-prefix", "", "per-run-unique subject prefix")
+	workers := flag.Int("workers", 0, "concurrent readers (default: NumCPU)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.StringVar(&tessData, "tessdata", os.Getenv("TESSDATA_PREFIX"), "tessdata directory")
 	flag.StringVar(&tessLang, "lang", "eng", "tesseract language")
 	flag.Parse()
 
+	// --version prints and exits before any connection or model load, so an
+	// image build can prove the binary it just downloaded executes on that
+	// userland with no tessdata present and no NATS server running.
 	if *showVersion {
 		fmt.Println(version)
 		return
+	}
+
+	// REQUIRED, with no defaults on purpose. A default URL invites the daemon
+	// to attach to whatever server happens to be listening, and a default
+	// prefix throws away the identity guarantee the per-run-unique prefix
+	// exists to provide. Both would fail as a silently wrong answer instead of
+	// a loud refusal.
+	if *natsURL == "" || *subjectPrefix == "" {
+		log.Fatalf("usage: ocrd --nats <url> --subject-prefix <prefix> [--workers <n>]")
+	}
+	if *workers <= 0 {
+		*workers = runtime.NumCPU()
 	}
 
 	// Only Windows gets a hardcoded fallback, and only because vcpkg installs
@@ -209,50 +214,104 @@ func main() {
 		tessData = "C:/Program Files/Tesseract-OCR/tessdata"
 	}
 
-	// Fail fast if the engine cannot come up at all.
-	probe, err := newTessEngine(tessData, tessLang)
+	// FAIL LOUD, FAIL NOW. There is no fallback transport and no degraded mode:
+	// a daemon that cannot reach its server can never answer a request, and the
+	// one thing worse than not starting is appearing to have started. RetryOnFailedConnect
+	// stays OFF for the same reason — the caller is waiting on a version reply
+	// that would never come.
+	nc, err := nats.Connect(*natsURL, nats.Name("ocrd-go"))
 	if err != nil {
-		log.Fatalf("tesseract init: %v", err)
+		log.Fatalf("FATAL: cannot connect to NATS at %s: %v; no fallback transport exists", *natsURL, err)
 	}
-	enginePool.Put(probe)
+	log.Printf("connected to %s (server max_payload %d bytes)", *natsURL, nc.MaxPayload())
 
-	ln, err := net.Listen("tcp", *addr)
+	readSubject := *subjectPrefix + ".ocr.read"
+	versionSubject := *subjectPrefix + ".ocr.version"
+
+	// THE IDENTITY SUBJECT, and the reason a plain Subscribe is right here: the
+	// caller asks a prefix only this run knows, so exactly one daemon can
+	// possibly answer. There is no group to share and nothing to balance.
+	verBody, err := json.Marshal(versionResponse{Version: version, Impl: "go"})
 	if err != nil {
-		// THE PORT BIND IS THE SINGLETON LOCK, so losing it is normally a
-		// NORMAL outcome: several clients may race to spawn a daemon, exactly
-		// one wins, and the losers must exit 0 so the client that spawned them
-		// treats the spawn as successful and connects to the winner.
-		//
-		// BUT AddrInUse ALONE DOES NOT PROVE A DAEMON IS SERVING, so PROBE
-		// before claiming it. On this platform a port can be reserved with no
-		// visible owner -- WSL mirrored networking held a range where bind
-		// failed while netstat showed nothing and nothing answered. Exiting 0
-		// on that masks the outage completely: the client sees a healthy
-		// singleton, then hangs connecting to a port that will never reply.
-		// Only a port that actually ANSWERS is a real singleton. (The Rust
-		// implementation learned this the hard way; the two must agree, since
-		// a client cannot tell which one it spawned.)
-		if errors.Is(err, syscall.EADDRINUSE) {
-			probe, perr := net.DialTimeout("tcp", *addr, 2*time.Second)
-			if perr == nil {
-				probe.Close()
-				log.Printf("%s already served by another daemon; exiting", *addr)
-				return
-			}
-			log.Fatalf("%s is reserved but nothing answers -- poisoned port "+
-				"(e.g. a WSL mirrored-networking reservation); pick another with --listen", *addr)
-		}
-		log.Fatalf("bind %s: %v", *addr, err)
+		log.Fatalf("FATAL: encode version reply: %v", err)
 	}
-	log.Printf("ocrd-go listening on %s (workers<=%d)", *addr, runtime.NumCPU())
-	slots := make(chan struct{}, runtime.NumCPU())
-	for {
-		conn, err := ln.Accept()
+	if _, err := nc.Subscribe(versionSubject, func(m *nats.Msg) {
+		if err := m.Respond(verBody); err != nil {
+			log.Printf("respond version: %v", err)
+		}
+	}); err != nil {
+		log.Fatalf("FATAL: subscribe %s: %v", versionSubject, err)
+	}
+
+	// EXACTLY N SUBSCRIBERS, EXACTLY N CONCURRENT READS. Each goroutine owns
+	// its own subscription to the queue group and its own resident engine, and
+	// handles one message at a time to completion. The server hands each
+	// request to one group member, so the in-flight count cannot exceed the
+	// member count — that IS the bound. There is deliberately no semaphore and
+	// no worker-slot channel here (the TCP version had one): that is a second
+	// scheduler on top of the queue group's own, with two places to get the
+	// bound wrong, and it parks requests inside this process where the server
+	// can no longer redeliver them to another daemon.
+	for i := 0; i < *workers; i++ {
+		sub, err := nc.QueueSubscribeSync(readSubject, readQueueGroup)
 		if err != nil {
-			log.Fatalf("accept: %v", err)
+			// A worker that cannot subscribe silently shrinks the pool, which
+			// shows up later as unexplained slowness. Refuse to run in a shape
+			// nobody asked for.
+			log.Fatalf("FATAL: worker %d subscribe %s: %v", i, readSubject, err)
 		}
-		go serveConn(conn, slots)
+		// UNLIMITED PENDING. nats.go defaults a subscription to 64 MB of
+		// pending bytes and drops messages past it as a slow consumer — with
+		// page images up to the server's 32 MB limit that is two messages, and
+		// a dropped request is a caller blocked forever on a reply that will
+		// never be sent. Queued requests are cheap to hold; losing one is not.
+		if err := sub.SetPendingLimits(-1, -1); err != nil {
+			log.Fatalf("FATAL: worker %d pending limits: %v", i, err)
+		}
+		go func(id int, sub *nats.Subscription) {
+			// The engine is created LAZILY, on the first message, so a worker
+			// that never receives one never pays for a model load.
+			var eng *tessEngine
+			for {
+				// No deadline: the daemon waits for work for as long as it
+				// runs, and a timeout here would only mean re-entering the
+				// same wait one loop later.
+				msg, err := sub.NextMsgWithContext(context.Background())
+				if err != nil {
+					log.Fatalf("FATAL: worker %d receive: %v", id, err)
+				}
+				if eng == nil {
+					if eng, err = newTessEngine(tessData, tessLang); err != nil {
+						// The engine is per-worker and permanent; failing to
+						// build it is not a per-request condition.
+						log.Fatalf("FATAL: worker %d tesseract init: %v", id, err)
+					}
+				}
+				resp := handleRead(eng, msg.Data)
+				body, err := json.Marshal(resp)
+				if err != nil {
+					body = []byte(`{"text":"","error":"encode reply failed"}`)
+				}
+				if msg.Reply == "" {
+					log.Printf("request on %s carried no reply subject; dropping", readSubject)
+					continue
+				}
+				if err := msg.Respond(body); err != nil {
+					// The answer is lost and the caller is still waiting. Loud,
+					// but not fatal: killing the daemon would strand every
+					// other in-flight read too.
+					log.Printf("respond: %v", err)
+				}
+			}
+		}(i, sub)
 	}
+
+	log.Printf("%d workers on %s (queue group %s); identity on %s",
+		*workers, readSubject, readQueueGroup, versionSubject)
+
+	// Park forever. The daemon's warm engines are the asset; it runs until the
+	// machine or an operator stops it.
+	select {}
 }
 
 // referenced by fastpng.go's factor selection; kept for parity with the bench.

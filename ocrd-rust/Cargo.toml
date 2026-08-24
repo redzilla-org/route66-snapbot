@@ -6,12 +6,34 @@
 # PARAMETER, so the same binary serves any caller that speaks the protocol.
 [package]
 name = "ocrd"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Long-lived OCR service: resident Tesseract engines behind a JSON-lines protocol"
 license = "MIT"
 
 [dependencies]
+# THE TRANSPORT. A NATS queue-group subscriber replaced the loopback TCP
+# listener because a TCP port cannot cross a machine boundary that the caller
+# and the daemon do not share: a Linux ocrd in a WSL2 container answering a
+# Windows harness on loopback could never see a Windows filesystem path, and
+# could never prove WHICH daemon answered. A per-run-unique subject prefix
+# solves both -- the image travels in the message, and answering on a subject
+# only this run knows IS the identity proof.
+#
+# default-features stay on: the default set is what carries TLS and the
+# standard connection handling, and trimming it buys nothing here.
+async-nats = "0.50"
+
+# async-nats is a tokio library, so the runtime is not a choice. Only the
+# pieces this daemon actually uses are enabled: a multi-thread runtime (the
+# OCR calls are blocking C code and are run under block_in_place, which
+# REQUIRES the multi-thread flavour) and the #[tokio::main] macro.
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+# The request carries the image INLINE as base64, so the daemon never needs to
+# share a filesystem with its caller. This is the decoder for that field.
+base64 = "0.22"
+
 # The Tesseract binding. The model is loaded ONCE and stays resident for the
 # life of the process -- the entire reason this service exists.
 leptess = "0.14"
@@ -23,6 +45,10 @@ png = "0.18"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Solely for StreamExt::next: an async-nats Subscriber is a Stream and exposes
+# no inherent next(). default-features off keeps the executor/compat halves of
+# the crate out of the build; only the Stream traits are wanted.
+futures = { version = "0.3", default-features = false, features = ["std"] }
 
 # Copied from the benchmark's winning build, because the kernels in src/kstream.rs
 # were measured under exactly these settings (non-PGO; PGO measured as a wash).
