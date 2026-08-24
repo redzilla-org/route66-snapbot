@@ -1,21 +1,24 @@
 # ocrd
 
-A shared, box-wide OCR daemon. Resident Tesseract engines behind a
-newline-delimited JSON protocol on loopback TCP (default `127.0.0.1:40066`,
-`--listen` to override).
+A shared OCR daemon. Resident Tesseract engines behind NATS request/reply:
 
-The daemon **outlives its clients**: it binds one fixed loopback port and runs
-until the machine or an operator stops it, so its warm engine pool is shared
-by every OCR consumer on the box — across concurrent client processes and
-across runs. The port bind is the singleton lock: on AddrInUse a second
-instance PROBES the port and exits 0 only if something answers — a real
-singleton — which makes client-side ensure-running race-free: any client that
-finds the port closed may spawn a daemon, exactly one wins the bind, the
-losers exit quietly, and everyone connects to the winner. If the port is
-reserved but nothing answers (seen on Windows: WSL mirrored networking held
-46620-46622 with no visible owner), the daemon exits 1 with a poisoned-port
-diagnosis instead of masquerading as a healthy singleton. No pid file, no lock
-file, no shutdown handshake.
+```
+ocrd --nats <url> --subject-prefix <prefix> [--workers <n>]
+```
+
+The daemon **outlives its clients** and runs until the machine or an operator
+stops it, so its warm engine pool is shared by every OCR consumer that can reach
+the same server — across concurrent client processes and across runs.
+
+It answers on `<prefix>.ocr.read` (queue group `ocrd`) and
+`<prefix>.ocr.version`. The prefix is **per run and unique**, which is what
+replaced the old loopback port: a port could be held by a stale daemon, or by a
+reservation with no visible owner (WSL mirrored networking held 46620-46622 on
+the reference Windows box), and nothing about a successful connect could tell
+those apart from the daemon you meant to start. An answer on a subject only this
+run knows can only have come from this run's daemon. If the server cannot be
+reached the daemon exits non-zero — there is no fallback transport and no
+degraded mode.
 
 It is **generic**: it knows nothing about whatever is depicted in the images it
 reads. Language, page segmentation mode, DPI, upscale factor and pixel budget
@@ -29,20 +32,20 @@ multi-megabyte preprocessed temp image through the filesystem.
 
 ## Protocol
 
-One JSON request per line in, one JSON response per line out, over the TCP
-connection. Replies are routed to the connection that sent the request —
-concurrent clients never see each other's traffic.
+Request/reply. `<prefix>.ocr.read` carries the image INLINE, base64 — there is
+no `path` field, because a path only works when the daemon and its caller share
+a filesystem, which is exactly the assumption this transport removes.
 
 ```json
-{"id":"a1","path":"/tmp/page.png","psm":3,"lang":"eng","dpi":300,"upscale":3,"pixel_budget":20000000}
+{"image":"<base64 PNG or JPEG>","psm":6,"lang":"eng","dpi":300,"upscale":2,"pixel_budget":1230000}
 ```
 
 ```json
-{"id":"a1","text":"..."}
-{"id":"a2","error":"decode /tmp/broken.png: ..."}
+{"text":"...","error":""}
 ```
 
-Only `id` and `path` are required; everything else defaults.
+Only `image` is required; everything else defaults, and a zero value counts as
+absent (a caller serialising from a struct sends `0`, not an omitted key).
 
 | field | default | meaning |
 |---|---|---|
@@ -52,29 +55,29 @@ Only `id` and `path` are required; everything else defaults.
 | `upscale` | 1 | max integer upscale; helps small anti-aliased text |
 | `pixel_budget` | 20000000 | ceiling on upscaled size, in pixels |
 
-**Standard thread pool, sized by demand**: requests go onto one shared queue; a
-new worker thread is spawned only when every existing worker is busy, and
-workers are never torn down. Replies come back **out of order** — each carries
-the request's `id`, which is how the caller matches them up. Each worker holds
-its own lazily-created Tesseract engine (rebuilt only if `lang` changes), so the
-live engine count settles at the caller's peak concurrency and the model-load
-cost is paid once per worker, not per request.
+`<prefix>.ocr.version` takes an empty request and answers
+`{"version":"ocrd-rust 0.2.0","impl":"rust"}`. That round trip is the readiness
+check and the identity proof in one.
 
-The pool imposes NO admission control of its own — no maximum thread count, no
-knob for how much of the machine it may take. That is deliberate: a caller
-driving OCR at scale already owns a CPU budget for the box, and a service with
-its own ceiling would be a second, uncoordinated claim on the same cores.
-**Concurrency is bounded entirely by how many requests the caller keeps in
-flight**, which leaves the caller's scheduler the only one in play.
+**The server's `max_payload` must be raised**: NATS defaults to 1 MB, a page
+screenshot exceeds that on its own, and base64 adds ~33%. The reference caller
+configures 32 MB. This client sets no cap of its own and logs the server's limit
+at startup.
 
-Failures are reported as responses, never as service faults: one unreadable
-image must not take down a service other pages are queued behind. A malformed
-request line is logged and skipped for the same reason.
+**Concurrency is the subscriber count.** `--workers N` spawns N tasks, each of
+which independently joins the queue group and handles one message at a time to
+completion; NATS gives each request to exactly one member, so at most N reads are
+in flight. There is no semaphore and no bounded pool — a second scheduler on top
+of the queue group's own would only add a second place to get the bound wrong,
+and it would park requests inside this process where the server can no longer
+redeliver them. Each worker holds its own lazily-created Tesseract engine
+(rebuilt only if `lang` changes), so the model-load cost is paid once per worker,
+not per request. Work the daemon cannot take yet stays queued at the SERVER.
 
-A client disconnect ends only that client's connection: its in-flight reads
-complete and their replies fall on the closed socket, harmlessly. The daemon
-itself never exits on client activity — its warm engines are the asset, and
-tearing them down with every client would forfeit it.
+Failures are reported as replies, never as service faults: one unreadable image
+must not take down a service other pages are queued behind, and a request that
+goes unanswered looks exactly like a pass at the caller. Every received message
+gets a reply, including one whose JSON will not parse.
 
 ## Image pipeline
 

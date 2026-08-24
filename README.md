@@ -14,75 +14,115 @@ cost is *half the work*. A job with hundreds of images spends minutes of CPU on
 nothing, and that CPU is taken from whatever else is running on the box.
 
 `ocrd` pays the model-load cost once per machine lifetime instead of once per
-image. It binds a loopback TCP port and outlives its clients, so a second
-client's first request is as warm as the first client's hundredth. The port bind
-doubles as the singleton lock: several clients may race to spawn a daemon,
-exactly one wins the bind, the losers exit 0 and connect to the winner.
+image. It attaches to a NATS server as a queue-group subscriber and outlives its
+clients, so a second client's first request is as warm as the first client's
+hundredth.
 
 ## Protocol
 
-Newline-delimited JSON over TCP, default `127.0.0.1:40066`. Loopback only — the
-daemon has no authentication and must never be reachable off-box.
+Request/reply over NATS. The daemon takes the server URL and a **subject
+prefix** on the command line and answers on two subjects derived from it.
 
-Request, one JSON object per line:
+```
+<prefix>.ocr.read      queue group "ocrd"
+<prefix>.ocr.version   identity
+```
+
+### Why NATS and not a loopback port
+
+The previous protocol bound `127.0.0.1:40066` and took a **filesystem path** per
+request. Both assumptions break the moment the daemon and its caller are not the
+same machine — which on the reference workstation they are not: a Linux ocrd in
+a host-networked WSL2 container answers a Windows caller on loopback perfectly
+well, and then cannot open a single one of the Windows paths it is handed.
+
+A port also cannot identify itself. Anything listening on 40066 looks like a
+healthy daemon: a stale build from an earlier run, or a WSL networking
+reservation with no visible owner. Both problems are transport problems and both
+are gone here:
+
+- The image travels **inside the message**, base64 in the request. There is no
+  `path` field and no path fallback.
+- The caller invents a **per-run-unique subject prefix**. Getting an answer on
+  `<prefix>.ocr.version` proves the daemon that answered is the one this run
+  started — which a port number can never prove.
+
+### `<prefix>.ocr.read`
+
+Request payload:
 
 ```json
-{"id":"1","path":"/abs/path/page.png","psm":3,"lang":"eng","dpi":300,"upscale":1,"pixel_budget":20000000}
+{"image":"<base64 PNG or JPEG>","psm":6,"lang":"eng","dpi":300,"upscale":2,"pixel_budget":1230000}
 ```
 
 | Field | Default | Meaning |
 |---|---|---|
-| `id` | required | Opaque correlation token, echoed back |
-| `path` | required | Absolute path to a PNG the daemon can read |
+| `image` | required | The image itself, base64, PNG or JPEG |
 | `psm` | `3` | Tesseract page-segmentation mode |
 | `lang` | `eng` | Tesseract language / traineddata name |
 | `dpi` | `300` | Source resolution hint passed to the engine |
 | `upscale` | `1` | Maximum integer upscale factor |
 | `pixel_budget` | `20000000` | Ceiling on post-upscale pixels |
 
-Response, one JSON object per line:
+Absent **or zero-valued** optional fields take the defaults above: a caller
+serialising from a struct sends `0`, not an omitted key, and a `psm` of 0 is an
+unset field rather than a request for segmentation mode 0.
+
+Reply payload:
 
 ```json
-{"id":"1","text":"...recognized text...","error":""}
+{"text":"...recognized text...","error":""}
 ```
 
-**Match replies to requests by `id`, never by position.** The daemon sends each
-reply as soon as that image finishes, and images finish in whatever order they
-finish — a small one overtakes a large one queued ahead of it. So the third
-reply you read is not necessarily the answer to your third request:
+Both fields are always present. `error` non-empty means that read failed — and
+**the reply is still sent**, for every request the daemon receives, including
+one whose JSON will not parse. A silently absent OCR result is indistinguishable
+from a pass at the caller, which is the failure mode this daemon exists to make
+impossible. There is no `id`: NATS correlates a reply with its request through
+the inbox subject, so a hand-rolled correlation token is redundant machinery.
+
+### `<prefix>.ocr.version`
+
+Empty request. Reply:
+
+```json
+{"version":"ocrd-rust 0.2.0","impl":"rust"}
+```
+
+This is the identity handshake, and it is the ONLY place the wire format reveals
+which implementation is answering.
+
+### Server `max_payload` must be raised
+
+NATS defaults to a **1 MB** maximum payload. A page screenshot exceeds that on
+its own, and base64 inflates it a further ~33%, so a default-configured server
+rejects real requests **at the publisher** with a max-payload error. Configure
+the server accordingly — the reference caller runs it at 32 MB:
 
 ```
-you send:      A (huge page)    B (small)    C (small)
-you read back: B                C            A
+max_payload: 32MB
 ```
 
-Nothing is wrong with the stream when this happens. It is TCP, so the bytes
-arrive exactly as the daemon wrote them and nothing is shuffled in transit; the
-daemon simply chose to write B's reply first because B was done first. That is
-the entire reason `id` exists in the protocol.
+Note that `max_payload` is a **configuration-file setting**; `nats-server` has
+no command-line flag for it. Neither implementation imposes a cap of its own;
+both accept whatever the server advertises, and both log it at startup so a
+1 MB server is one line away from being diagnosed.
 
-If you only ever have one request outstanding, replies come back in the order
-you sent them and this never comes up. It only shows up once you pipeline —
-which you should, since one connection handles any number of concurrent
-requests and a connection per image would waste the daemon's whole point.
+### Concurrency is the subscriber count
 
-`error` non-empty means that request failed; the daemon stays up.
+`--workers N` spawns N readers, each of which **independently** joins the queue
+group on `<prefix>.ocr.read` and then handles one message at a time to
+completion. NATS delivers each request to exactly one member of the group, so at
+most N reads are ever in flight. That is the whole bound.
 
-### Concurrency belongs to the client
+There is deliberately no semaphore, no worker-slot channel and no bounded task
+pool inside either daemon. Those are a second scheduler layered on the queue
+group's own, with two places to get the bound wrong instead of one — and they
+park requests inside one process, where the server can no longer redeliver them
+to another daemon that is free.
 
-**The daemon does not throttle for you.** A daemon shared by several client
-processes cannot see the machine's total load, so the only place a sane budget
-can live is in the clients. Send it a thousand requests at once and it will try
-to serve a thousand requests.
-
-The two implementations differ here in a way a client can observe, so do not
-depend on either shape: `ocrd-rust` runs a shared-queue pool that grows while
-every worker is busy and imposes no ceiling at all, while `ocrd-go` caps
-concurrent recognitions at `NumCPU` and parks the excess. Both drain the socket
-unconditionally — a request is never left unread because the engines are busy.
-That last property is load-bearing rather than incidental: a daemon that stops
-reading its socket while a client is still writing to it deadlocks the pair,
-since the client cannot get to the replies that would free the daemon's queue.
+N defaults to the box's available parallelism. Anything the daemon cannot take
+yet stays queued at the SERVER, which is the correct place for it.
 
 ### The scale-1 passthrough
 
@@ -105,9 +145,19 @@ the daemon skip decoding entirely on that path.
 Identical across both implementations:
 
 ```
-ocrd [--listen host:port]     # default 127.0.0.1:40066
-ocrd --version                # prints and exits before bind or model load
+ocrd --nats <url> --subject-prefix <prefix> [--workers <n>]
+ocrd --version    # prints and exits before connecting or loading a model
 ```
+
+`--nats` and `--subject-prefix` are **required, with no defaults**. A default URL
+invites the daemon to attach to whatever server happens to be listening, and a
+default prefix throws away the identity guarantee the per-run-unique prefix
+exists to provide; both would fail as a silently wrong answer instead of a loud
+refusal. `--workers` defaults to the box's available parallelism.
+
+If the NATS connection cannot be established the daemon prints the reason to
+stderr and **exits non-zero**. There is no fallback transport and no degraded
+mode: the one thing worse than not starting is appearing to have started.
 
 Anything else is a usage error. `ocrd-go` additionally accepts `--tessdata` and
 `--lang`, which it needs because its cgo binding requires an explicit datapath
@@ -117,8 +167,10 @@ default.
 
 ## The two implementations
 
-Both bind the same port and answer the same protocol. Either can be dropped in
-for the other; nothing in the protocol reveals which one is running.
+Both join the same queue group and answer the same protocol. Either can be
+dropped in for the other; the only thing on the wire that reveals which one is
+running is the `impl` field of the `.ocr.version` reply, which exists precisely
+so an operator can find out on purpose.
 
 | | `ocrd-rust/` | `ocrd-go/` |
 |---|---|---|
@@ -173,13 +225,21 @@ The `Makefile` builds both implementations for both platforms. `ocrd-rust` is
 the one consumers are expected to install; the Go targets are kept so the second
 implementation cannot quietly rot.
 
+See [`BUILD.md`](BUILD.md) for the exact static Windows build contract,
+language-data staging rules, and publish payload.
+
 ```sh
-make windows-rust   # native      -> bin/ocrd-rust-windows-amd64.exe
-make linux-rust     # in a container -> bin/ocrd-rust-linux-amd64
-make windows        # native      -> bin/ocrd-go-windows-amd64.exe
-make linux          # in a container -> bin/ocrd-go-linux-amd64
+make windows-rust   # native      -> bin/rust/ocrd-windows-amd64.exe
+make windows-rust-static
+                    # native      -> bin/rust/ocrd-windows-amd64-static.exe
+make rust-tessdata  # native      -> bin/rust/eng.traineddata
+make linux-rust     # in a container -> bin/rust/ocrd-linux-amd64
+make linux-rust-static
+                    # in a container -> bin/rust/ocrd-linux-amd64-static
+make windows        # native      -> bin/go/ocrd-windows-amd64.exe
+make linux          # in a container -> bin/go/ocrd-linux-amd64
 make all            # all four, locally
-make publish        # release ONLY the two ocrd-rust binaries (VERSION=..., REPO=...)
+make publish        # release static Windows ocrd, Linux ocrd, and eng.traineddata
 ```
 
 The two `linux*` targets deliberately build in a container and copy the artifact
@@ -226,20 +286,32 @@ including why the ~52-minute one-time Windows Tesseract toolchain bootstrap is a
 toolchain cost that both implementations pay identically and neither should be
 credited or blamed for.
 
-Every binary answers `--version`, which prints and exits before binding a port
-or loading a model — so an image build can prove the binary it just downloaded
-actually executes on that userland, with no tessdata present and no port free.
+Every binary answers `--version`, which prints and exits before connecting to
+anything or loading a model — so an image build can prove the binary it just
+downloaded actually executes on that userland, with no tessdata present and no
+NATS server running. It is a LOADER check only: the identity of a *running*
+daemon comes from the `.ocr.version` subject, which proves which process
+answered rather than merely that some binary on disk runs.
 
 Both implementations link against a system Tesseract and Leptonica, so those
 libraries and their headers must be present:
 
 - **Linux (Alpine):** `apk add gcc musl-dev pkgconf tesseract-ocr-dev leptonica-dev`
-- **Windows:** vcpkg with `tesseract` installed, `VCPKG_ROOT` set, and the vcpkg
-  `installed/x64-windows/bin` directory on `PATH` so the DLLs resolve at run
-  time. The Rust build additionally wants `VCPKGRS_DYNAMIC=1`; the Go build wants
-  a mingw-w64 `gcc` for cgo.
+- **Windows, dynamic:** vcpkg with `tesseract:x64-windows` installed,
+  `VCPKG_ROOT` set, and the vcpkg `installed/x64-windows/bin` directory on
+  `PATH` so the DLLs resolve at run time. The Rust build additionally wants
+  `VCPKGRS_DYNAMIC=1`; the Go build wants a mingw-w64 `gcc` for cgo.
+- **Windows, static:** run `make windows-rust-static`, or run
+  `scripts/build-windows-rust-static.ps1` directly. The script installs
+  `tesseract:x64-windows-static` if missing, sets `VCPKGRS_TRIPLET` to
+  `x64-windows-static`, adds Rust's `+crt-static` target feature, and writes
+  `bin/rust/ocrd-windows-amd64-static.exe`.
 - **Language data:** set `TESSDATA_PREFIX` to the directory holding
-  `eng.traineddata` (or whichever `lang` you request).
+  `eng.traineddata` (or whichever `lang` you request). `make rust-tessdata`
+  stages the English model from an explicit `-SourcePath`, from
+  `TESSDATA_PREFIX`, or from a standard Windows Tesseract install path, and
+  `make publish` uploads that staged `eng.traineddata` beside the static
+  Windows executable.
 
 The one-time Windows Tesseract toolchain bootstrap through vcpkg took **~52
 minutes** here. That cost is the toolchain's, not either language's — both
@@ -247,16 +319,33 @@ implementations pay it identically.
 
 ## Client notes
 
-- Set the address with `--listen host:port`. Both implementations accept
-  `--listen` and `--version` in exactly that double-dash spelling and nothing
-  else, deliberately: a client cannot tell which implementation it is starting,
-  so the argv has to be identical across both. A second accepted spelling is how
-  two CLIs drift apart. A client that
-  spawns its own daemon should treat the spawn as fire-and-forget: the daemon is
-  *meant* to outlive the client, so start it detached, never wait on it, and let
-  the port bind resolve the race.
+- Both implementations accept `--nats`, `--subject-prefix`, `--workers` and
+  `--version` in exactly that double-dash spelling and nothing else,
+  deliberately: a client cannot tell which implementation it is starting, so the
+  argv has to be identical across both. A second accepted spelling is how two
+  CLIs drift apart.
+- **Generate a fresh subject prefix per run**, and do not reuse one. It is the
+  only thing that distinguishes the daemon you just started from a stale one
+  still attached to the same server — the failure a fixed port could never
+  detect.
+- **Wait for `<prefix>.ocr.version` to answer before sending work.** That
+  round trip is the readiness check and the identity proof in one; there is
+  nothing else to poll.
+- Raise the server's `max_payload` (see above) before sending page images. A
+  1 MB default rejects them at the publisher, not at the daemon.
+- A client that spawns its own daemon should treat the spawn as
+  fire-and-forget: the daemon is *meant* to outlive the client, so start it
+  detached and never wait on it. If it cannot reach the server it exits
+  non-zero, and the version request simply never answers.
+- **`.ocr.version` answering does NOT mean the language model is loadable.**
+  Engines are built lazily, on a worker's first read, so a daemon started with
+  no usable `TESSDATA_PREFIX` connects, logs normally and answers the version
+  request — then fails every read with
+  `error: "init tesseract (eng): TessInitError{-1}"`. The failure is per-reply
+  and the daemon stays up. If your readiness gate must also prove the model
+  loads, send one real `.ocr.read` (any tiny image) and require `error` empty;
+  the version request proves identity and reachability only.
 - Send the daemon's own stderr to a file rather than a pipe. A pipe to a dead
   parent turns every subsequent diagnostic write inside the daemon into an
-  error.
-- Recognized page text routinely exceeds the 64 KB line limit that many default
-  line readers impose. Raise it, or you will silently truncate results.
+  error. Tesseract's own model-load diagnostics ("Error opening data file
+  ./eng.traineddata") appear only there, never in a reply.
