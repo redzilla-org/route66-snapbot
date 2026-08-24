@@ -359,6 +359,20 @@ func preprocessK(img image.Image, scale int) *image.Gray {
 	return upscaleBilinearSeparable(small, scale)
 }
 
+// KLUT combines the accepted integer/LUT stretch with K's exact factor-2
+// specialization. The product gate permits the measured delta-1 half-way ties,
+// so there is no reason to retain K's slower float stretch in this candidate.
+func preprocessKLUT(img image.Image, scale int) *image.Gray {
+	small := grayStretchLUT(img)
+	if scale <= 1 {
+		return small
+	}
+	if scale == 2 {
+		return upscaleBilinear2x(small)
+	}
+	return upscaleBilinearSeparable(small, scale)
+}
+
 // ---- variant L: exact-rational scaler for ANY integer factor ----
 //
 // WHY: variant K's shift-and-add collapse only fires at factor 2, and the real

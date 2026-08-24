@@ -1,0 +1,35 @@
+# ocrd — a generic, long-lived OCR service.
+#
+# GENERIC BY CONSTRUCTION: nothing here knows what a "market", a "brand" or a
+# "screenshot" is. Every project-specific choice -- which image, which
+# segmentation mode, how much to upscale, which language -- arrives as a request
+# PARAMETER, so the same binary serves any caller that speaks the protocol.
+[package]
+name = "ocrd"
+version = "0.1.0"
+edition = "2021"
+description = "Long-lived OCR service: resident Tesseract engines behind a JSON-lines protocol"
+license = "MIT"
+
+[dependencies]
+# The Tesseract binding. The model is loaded ONCE and stays resident for the
+# life of the process -- the entire reason this service exists.
+leptess = "0.14"
+
+# The DECODER, not a general image library: png 0.18.1 + fdeflate is the
+# decoder of ../img-scaling-benchmark's overall winner ("Pure Rust KSTREAM,
+# non-PGO": 28.98/54.77/34.14 ms). src/kstream.rs carries the port.
+png = "0.18"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Copied from the benchmark's winning build, because the kernels in src/kstream.rs
+# were measured under exactly these settings (non-PGO; PGO measured as a wash).
+[profile.release]
+opt-level = 3
+codegen-units = 1
+# Whole-program LTO across the png crate boundary, and abort-on-panic so no
+# unwind landing pads are emitted around the hot loops.
+lto = "fat"
+panic = "abort"

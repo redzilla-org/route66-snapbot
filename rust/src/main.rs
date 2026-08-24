@@ -2,30 +2,80 @@
 //
 // Pipeline, identical in every variant: PNG decode -> luma grayscale -> global
 // min/max contrast stretch -> integer bilinear upscale -> binary PGM out.
-// Single-threaded, phase-timed, 3 warmups + 15 timed iterations, median reported.
+// Single-threaded, phase-timed, 3 warmups + a 250 ms timed window.
 //
-// WHY MORE THAN ONE VARIANT: the first round of this benchmark compared an
-// unoptimized Rust scaler ("C", a faithful port of Go's naive variant) against a
-// four-times-optimized Go scaler ("D") and reported the difference as a language
-// result. It was not one. The variants below port each of Go D's four
-// optimizations into Rust so the comparison is like-for-like, and keep C in the
-// binary so every optimized variant can be diffed against it pixel by pixel.
-//
-//   C     naive: f64 luma side-buffer, fused 4-tap f64 bilinear      (reference)
-//   D     no luma buffer + separable two-pass 16.16 fixed-point scaler
-//   DB    D but KEEPING the f64 luma buffer -- the fastest measured, because in
-//         Rust the "kill the buffer" optimization is a LOSS (see below)
-//   DS    D with an explicit AVX2 vertical pass                      (hypothesis: SIMD)
-//   D1    no luma buffer + C's naive scaler        (isolates opt 4: kill the buffer)
-//   D2    C's buffered stretch + single-pass fixed (isolates opt 1: axis tables)
-//   D3    no luma buffer + single-pass fixed       (D minus separability)
-//   F64   D with the separable scaler carrying f64 (isolates opt 3: not-f64)
-//   F32   D with the separable scaler carrying f32
-//
-// Every optimized variant is validated against C's output with `rsbench cmp`.
+// KSTREAM is the live end-to-end candidate. Older transform variants remain
+// callable for direct comparison, but the competition ranks the complete pipeline.
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Cursor, Write};
 use std::time::Instant;
+
+extern "C" {
+    fn r66_transform_klut(
+        source: *const u8,
+        source_length: usize,
+        width: usize,
+        height: usize,
+        channels: u32,
+        scale: u32,
+        destination: *mut u8,
+        destination_length: usize,
+    ) -> i32;
+
+    #[cfg(feature = "zig")]
+    fn r66_transform_zig(
+        source: *const u8,
+        source_length: usize,
+        width: usize,
+        height: usize,
+        channels: u32,
+        scale: u32,
+        destination: *mut u8,
+        destination_length: usize,
+        gray: *mut u8,
+        gray_length: usize,
+        middle: *mut u16,
+        middle_length: usize,
+        lut: *mut u8,
+        lut_length: usize,
+    ) -> i32;
+
+    #[cfg(feature = "nim")]
+    fn r66_transform_nim(
+        source: *const u8,
+        source_length: usize,
+        width: usize,
+        height: usize,
+        channels: u32,
+        scale: u32,
+        destination: *mut u8,
+        destination_length: usize,
+        gray: *mut u8,
+        gray_length: usize,
+        middle: *mut u16,
+        middle_length: usize,
+        lut: *mut u8,
+        lut_length: usize,
+    ) -> i32;
+}
+
+#[cfg(any(feature = "zig", feature = "nim"))]
+type ExternalTransform = unsafe extern "C" fn(
+    *const u8,
+    usize,
+    usize,
+    usize,
+    u32,
+    u32,
+    *mut u8,
+    usize,
+    *mut u8,
+    usize,
+    *mut u16,
+    usize,
+    *mut u8,
+    usize,
+) -> i32;
 
 const OCR_UPSCALE_FACTOR: usize = 3;
 const OCR_UPSCALE_PIXEL_BUDGET: usize = 20_000_000;
@@ -53,9 +103,15 @@ fn luma(r: u8, g: u8, b: u8) -> f64 {
 
 // Decode a PNG into (pixel bytes, width, height, color type, bit depth).
 fn decode(raw: &[u8]) -> (Vec<u8>, usize, usize, png::ColorType, png::BitDepth) {
-    let dec = png::Decoder::new(raw);
+    // Playwright owns this local payload, so checksums and unused metadata are
+    // deliberate overhead. Structural decode failures still abort immediately.
+    let mut options = png::DecodeOptions::default();
+    options.set_ignore_checksums(true);
+    options.set_ignore_text_chunk(true);
+    options.set_ignore_iccp_chunk(true);
+    let dec = png::Decoder::new_with_options(Cursor::new(raw), options);
     let mut reader = dec.read_info().expect("png read_info");
-    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let mut buf = vec![0u8; reader.output_buffer_size().expect("PNG output size")];
     let info = reader.next_frame(&mut buf).expect("png next_frame");
     buf.truncate(info.buffer_size());
     (
@@ -103,10 +159,197 @@ fn luma_at(p: &[u8], ch: usize) -> f64 {
     }
 }
 
+// Integer luma gives the LUT candidate one stable key for each source color.
+// Alpha-bearing formats retain the reference's premultiplied-channel semantics.
+#[inline(always)]
+fn luma_integer_at(p: &[u8], ch: usize) -> u32 {
+    let (r, g, b) = match ch {
+        4 => {
+            let a = p[3] as u32;
+            (
+                p[0] as u32 * a / 255,
+                p[1] as u32 * a / 255,
+                p[2] as u32 * a / 255,
+            )
+        }
+        3 => (p[0] as u32, p[1] as u32, p[2] as u32),
+        2 => {
+            let g = p[0] as u32 * p[1] as u32 / 255;
+            (g, g, g)
+        }
+        _ => {
+            let g = p[0] as u32;
+            (g, g, g)
+        }
+    };
+    (299 * r) + (587 * g) + (114 * b)
+}
+
+// Both benchmark fixtures decode to RGB8. The caller validates that format and
+// pixel count before this kernel; raw pointers let LLVM see one fixed-stride
+// loop without repeated slice-bound checks obscuring its vectorization.
+unsafe fn gray_stretch_lut_rgb(buf: &[u8], n: usize) -> Vec<u8> {
+    let source = buf.as_ptr();
+    let mut min_l = u32::MAX;
+    let mut max_l = 0u32;
+    for i in 0..n {
+        let pixel = source.add(i * 3);
+        let value = (299 * u32::from(*pixel))
+            + (587 * u32::from(*pixel.add(1)))
+            + (114 * u32::from(*pixel.add(2)));
+        min_l = min_l.min(value);
+        max_l = max_l.max(value);
+    }
+
+    let range = max_l - min_l;
+    let span = u64::from(range.max(1));
+    let mut lut = vec![0u8; range as usize + 1];
+    for (offset, output) in lut.iter_mut().enumerate() {
+        let value = ((2 * offset as u64 * 255) + span) / (2 * span);
+        *output = value.min(255) as u8;
+    }
+
+    // A fixed-length destination removes Vec::push's capacity branch per pixel.
+    let mut gray = vec![0u8; n];
+    let output = gray.as_mut_ptr();
+    let table = lut.as_ptr();
+    for i in 0..n {
+        let pixel = source.add(i * 3);
+        let value = (299 * u32::from(*pixel))
+            + (587 * u32::from(*pixel.add(1)))
+            + (114 * u32::from(*pixel.add(2)));
+        *output.add(i) = *table.add((value - min_l) as usize);
+    }
+    gray
+}
+
+// The monotone stretch depends only on integer luma, so a bounded byte table
+// replaces per-pixel floating point. The accepted difference is at most one gray
+// level on sparse exact half-way ties.
+fn gray_stretch_lut(
+    buf: &[u8],
+    w: usize,
+    h: usize,
+    ct: png::ColorType,
+    bd: png::BitDepth,
+) -> Vec<u8> {
+    let ch = channels(ct, bd);
+    let n = w * h;
+    if ch == 3 {
+        // PNG decoding and the channel check above establish the pointer
+        // kernel's required three-bytes-per-pixel precondition.
+        return unsafe { gray_stretch_lut_rgb(buf, n) };
+    }
+    let mut min_l = u32::MAX;
+    let mut max_l = 0u32;
+    for pixel in buf.chunks_exact(ch).take(n) {
+        let value = luma_integer_at(pixel, ch);
+        min_l = min_l.min(value);
+        max_l = max_l.max(value);
+    }
+
+    let range = max_l - min_l;
+    let span = u64::from(range.max(1));
+    let mut lut = vec![0u8; range as usize + 1];
+    for (offset, output) in lut.iter_mut().enumerate() {
+        let value = ((2 * offset as u64 * 255) + span) / (2 * span);
+        *output = value.min(255) as u8;
+    }
+
+    let mut gray = Vec::with_capacity(n);
+    for pixel in buf.chunks_exact(ch).take(n) {
+        let value = luma_integer_at(pixel, ch);
+        gray.push(lut[(value - min_l) as usize]);
+    }
+    gray
+}
+
+// HYBRID keeps Rust's PNG decoder and PGM writer while calling the faster native
+// KLUT/K transform through one in-process C ABI boundary.
+fn transform_hybrid(
+    buf: &[u8],
+    w: usize,
+    h: usize,
+    ct: png::ColorType,
+    bd: png::BitDepth,
+    scale: usize,
+) -> Vec<u8> {
+    let ch = channels(ct, bd);
+    let mut output = vec![0u8; w * h * scale * scale];
+    let status = unsafe {
+        r66_transform_klut(
+            buf.as_ptr(),
+            buf.len(),
+            w,
+            h,
+            ch as u32,
+            scale as u32,
+            output.as_mut_ptr(),
+            output.len(),
+        )
+    };
+    assert_eq!(status, 0, "native KLUT transform failed");
+    output
+}
+
+// Zig and Nim use the same decoder, writer, allocations and algorithm as the
+// Rust/C++ contestants. Only the transform kernel behind this function pointer
+// changes, which makes their end-to-end results directly comparable.
+#[cfg(any(feature = "zig", feature = "nim"))]
+fn transform_external(
+    kernel: ExternalTransform,
+    name: &str,
+    buf: &[u8],
+    w: usize,
+    h: usize,
+    ct: png::ColorType,
+    bd: png::BitDepth,
+    scale: usize,
+) -> Vec<u8> {
+    let ch = channels(ct, bd);
+    let pixels = w * h;
+    let mut output = vec![0u8; pixels * scale * scale];
+    let mut gray = vec![0u8; pixels];
+    let mut middle = if scale == 2 {
+        vec![0u16; w * 2 * h]
+    } else {
+        Vec::new()
+    };
+    // Maximum integer RGB luma is 255000, so this fixed scratch table covers
+    // every possible observed min/max range without allocation inside foreign code.
+    let mut lut = vec![0u8; 255001];
+    let status = unsafe {
+        kernel(
+            buf.as_ptr(),
+            buf.len(),
+            w,
+            h,
+            ch as u32,
+            scale as u32,
+            output.as_mut_ptr(),
+            output.len(),
+            gray.as_mut_ptr(),
+            gray.len(),
+            middle.as_mut_ptr(),
+            middle.len(),
+            lut.as_mut_ptr(),
+            lut.len(),
+        )
+    };
+    assert_eq!(status, 0, "{name} transform failed");
+    output
+}
+
 // Variant C's stretch: a full w*h Vec<f64> of luma, written in pass 1 and read
 // back in pass 2. 9.8 MB on big.png, allocated, zeroed by the allocator path,
 // written and re-read purely to avoid recomputing three multiplies.
-fn gray_stretch_buf(buf: &[u8], w: usize, h: usize, ct: png::ColorType, bd: png::BitDepth) -> Vec<u8> {
+fn gray_stretch_buf(
+    buf: &[u8],
+    w: usize,
+    h: usize,
+    ct: png::ColorType,
+    bd: png::BitDepth,
+) -> Vec<u8> {
     let ch = channels(ct, bd);
     let n = w * h;
     let mut lum = vec![0f64; n];
@@ -144,7 +387,13 @@ fn gray_stretch_buf(buf: &[u8], w: usize, h: usize, ct: png::ColorType, bd: png:
 // plane directly. Not one arithmetic operation changes, so the result is
 // bit-for-bit gray_stretch_buf -- this is a pure memory-traffic change:
 // 4 bytes read twice, instead of 4 read + 8 written + 8 read.
-fn gray_stretch_nobuf(buf: &[u8], w: usize, h: usize, ct: png::ColorType, bd: png::BitDepth) -> Vec<u8> {
+fn gray_stretch_nobuf(
+    buf: &[u8],
+    w: usize,
+    h: usize,
+    ct: png::ColorType,
+    bd: png::BitDepth,
+) -> Vec<u8> {
     let ch = channels(ct, bd);
     let n = w * h;
     let mut min_l = f64::MAX;
@@ -297,14 +546,23 @@ fn upscale_fixed(src: &[u8], w: usize, h: usize, scale: usize) -> Vec<u8> {
 // pass over two already-filtered rows. The intermediate is 31.8 MB on
 // typical.png and it still wins, because the vertical pass then reads two
 // contiguous rows instead of gathering four taps per output pixel.
-fn horiz_pass(src: &[u8], w: usize, h: usize, ow: usize, x0s: &[u32], x1s: &[u32], wxs: &[u32]) -> Vec<u32> {
+fn horiz_pass(
+    src: &[u8],
+    w: usize,
+    h: usize,
+    ow: usize,
+    x0s: &[u32],
+    x1s: &[u32],
+    wxs: &[u32],
+) -> Vec<u32> {
     let mut mid = vec![0u32; ow * h];
     for y in 0..h {
         let row = &src[y * w..][..w];
         let mrow = &mut mid[y * ow..][..ow];
         for ox in 0..ow {
             let wx = wxs[ox];
-            mrow[ox] = row[x0s[ox] as usize] as u32 * (FIX_ONE - wx) + row[x1s[ox] as usize] as u32 * wx;
+            mrow[ox] =
+                row[x0s[ox] as usize] as u32 * (FIX_ONE - wx) + row[x1s[ox] as usize] as u32 * wx;
         }
     }
     mid
@@ -353,7 +611,8 @@ fn upscale_sep_f64(src: &[u8], w: usize, h: usize, scale: usize) -> Vec<u8> {
         let mrow = &mut mid[y * ow..][..ow];
         for ox in 0..ow {
             let wx = fwx[ox];
-            mrow[ox] = row[x0s[ox] as usize] as f64 * (1.0 - wx) + row[x1s[ox] as usize] as f64 * wx;
+            mrow[ox] =
+                row[x0s[ox] as usize] as f64 * (1.0 - wx) + row[x1s[ox] as usize] as f64 * wx;
         }
     }
     let mut dst = vec![0u8; ow * oh];
@@ -383,7 +642,8 @@ fn upscale_sep_f32(src: &[u8], w: usize, h: usize, scale: usize) -> Vec<u8> {
         let mrow = &mut mid[y * ow..][..ow];
         for ox in 0..ow {
             let wx = fwx[ox];
-            mrow[ox] = row[x0s[ox] as usize] as f32 * (1.0 - wx) + row[x1s[ox] as usize] as f32 * wx;
+            mrow[ox] =
+                row[x0s[ox] as usize] as f32 * (1.0 - wx) + row[x1s[ox] as usize] as f32 * wx;
         }
     }
     let mut dst = vec![0u8; ow * oh];
@@ -413,15 +673,23 @@ fn upscale_sep_f32(src: &[u8], w: usize, h: usize, scale: usize) -> Vec<u8> {
 // slow enough to lose to the scalar loop.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn vert_pass_avx2(mid: &[u32], ow: usize, oh: usize, y0s: &[u32], y1s: &[u32], wys: &[u32], dst: &mut [u8]) {
+unsafe fn vert_pass_avx2(
+    mid: &[u32],
+    ow: usize,
+    oh: usize,
+    y0s: &[u32],
+    y1s: &[u32],
+    wys: &[u32],
+    dst: &mut [u8],
+) {
     use std::arch::x86_64::*;
     let round = _mm256_set1_epi64x(1i64 << (2 * FIX_SHIFT - 1));
     // Byte selector: take byte 0 of each of the 4 dwords in each 128-bit lane
     // and pack them into the low 4 bytes of that lane. Values are <= 255 so only
     // the low byte of each result dword carries information.
     let sel = _mm256_setr_epi8(
-        0, 4, 8, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 4, 8, 12, -1, -1, -1, -1, -1, -1, -1, -1,
-        -1, -1, -1, -1,
+        0, 4, 8, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 4, 8, 12, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1,
     );
     for oy in 0..oh {
         let wy = wys[oy] as i64;
@@ -504,7 +772,6 @@ fn upscale_separable_simd(src: &[u8], w: usize, h: usize, scale: usize) -> Vec<u
     dst
 }
 
-
 // ---- OPTIMIZATION 6: factor-2 specialization (ported from the Go side) ----
 //
 // WHY: the upscale factor is not merely an integer, it is 1, 2 or 3 --
@@ -527,38 +794,56 @@ fn upscale_separable_simd(src: &[u8], w: usize, h: usize, scale: usize) -> Vec<u
 fn upscale_2x(src: &[u8], w: usize, h: usize) -> Vec<u8> {
     let (ow, oh) = (w * 2, h * 2);
     let mut mid = vec![0u16; ow * h];
-    for y in 0..h {
-        let row = &src[y * w..][..w];
-        let mrow = &mut mid[y * ow..][..ow];
-        // Edge columns are the clamped x0 == x1 case: both taps are the same
-        // pixel, so the weighted sum is 4x that pixel.
-        mrow[0] = row[0] as u16 * 4;
-        mrow[ow - 1] = row[w - 1] as u16 * 4;
-        for x in 0..w - 1 {
-            let a = row[x] as u16;
-            let b = row[x + 1] as u16;
-            mrow[2 * x + 1] = 3 * a + b;
-            mrow[2 * x + 2] = a + 3 * b;
+    // All allocations have exact geometry-derived lengths. Raw row pointers
+    // preserve those invariants while exposing simple, non-aliasing loops to
+    // LLVM; the equivalent safe iterator form measured materially slower.
+    unsafe {
+        let source = src.as_ptr();
+        let middle = mid.as_mut_ptr();
+        for y in 0..h {
+            let row = source.add(y * w);
+            let output = middle.add(y * ow);
+            // Edge columns are the clamped x0 == x1 case: both taps are the
+            // same pixel, so the weighted sum is 4x that pixel.
+            *output = u16::from(*row) * 4;
+            *output.add(ow - 1) = u16::from(*row.add(w - 1)) * 4;
+            for x in 0..w - 1 {
+                let a = u16::from(*row.add(x));
+                let b = u16::from(*row.add(x + 1));
+                *output.add(2 * x + 1) = 3 * a + b;
+                *output.add(2 * x + 2) = a + 3 * b;
+            }
         }
     }
+
     let mut dst = vec![0u8; ow * oh];
-    {
-        let mut row_out = |dsty: usize, m0: &[u16], m1: &[u16], c0: u32, c1: u32| {
-            let out = &mut dst[dsty * ow..][..ow];
-            for ox in 0..ow {
-                out[ox] = ((c0 * m0[ox] as u32 + c1 * m1[ox] as u32 + 8) >> 4) as u8;
+    // Each expansion receives literal coefficients. That gives LLVM four
+    // branch-free row kernels instead of one closure with runtime weights.
+    macro_rules! write_row {
+        ($dst_y:expr, $row0:expr, $row1:expr, $c0:expr, $c1:expr) => {{
+            let destination = dst.as_mut_ptr().add($dst_y * ow);
+            let c0 = $c0 as u32;
+            let c1 = $c1 as u32;
+            for x in 0..ow {
+                *destination.add(x) =
+                    ((c0 * u32::from(*$row0.add(x)) + c1 * u32::from(*$row1.add(x)) + 8) >> 4)
+                        as u8;
             }
-        };
-        let first = mid[0..ow].to_vec();
-        row_out(0, &first, &first, 2, 2);
-        let last = mid[(h - 1) * ow..h * ow].to_vec();
-        row_out(oh - 1, &last, &last, 2, 2);
+        }};
+    }
+
+    // The horizontal pass initialized every middle element, and destination
+    // rows are disjoint. Those facts make each pointer expansion valid.
+    unsafe {
+        let first = mid.as_ptr();
+        let last = first.add((h - 1) * ow);
+        write_row!(0, first, first, 2, 2);
+        write_row!(oh - 1, last, last, 2, 2);
         for y in 0..h - 1 {
-            let (lo, hi) = mid.split_at((y + 1) * ow);
-            let m0 = &lo[y * ow..][..ow];
-            let m1 = &hi[..ow];
-            row_out(2 * y + 1, m0, m1, 3, 1);
-            row_out(2 * y + 2, m0, m1, 1, 3);
+            let row0 = first.add(y * ow);
+            let row1 = first.add((y + 1) * ow);
+            write_row!(2 * y + 1, row0, row1, 3, 1);
+            write_row!(2 * y + 2, row0, row1, 1, 3);
         }
     }
     dst
@@ -573,6 +858,234 @@ fn upscale_k(src: &[u8], w: usize, h: usize, scale: usize) -> Vec<u8> {
         return upscale_2x(src, w, h);
     }
     upscale_separable(src, w, h, scale)
+}
+
+// KSTREAM uses the same accepted 8.8 luma approximation as GOFAST. Keeping the
+// luma plane from the min/max pass removes the second RGB traversal, while the
+// factor-2 path below avoids the old full-image horizontal intermediate.
+unsafe fn luma_plane_8p8_rgb(buf: &[u8], pixels: usize) -> (Vec<u16>, u16, u16) {
+    let source = buf.as_ptr();
+    let mut luma = vec![0u16; pixels];
+    let output = luma.as_mut_ptr();
+    let mut minimum = u16::MAX;
+    let mut maximum = 0u16;
+    for i in 0..pixels {
+        let pixel = source.add(i * 3);
+        let value =
+            77 * u16::from(*pixel) + 150 * u16::from(*pixel.add(1)) + 29 * u16::from(*pixel.add(2));
+        *output.add(i) = value;
+        minimum = minimum.min(value);
+        maximum = maximum.max(value);
+    }
+    (luma, minimum, maximum)
+}
+
+// The lookup table performs contrast normalization over the observed 8.8 luma
+// range. A constant image maps to black, matching the existing KLUT contract.
+fn luma_stretch_table_8p8(minimum: u16, maximum: u16) -> Vec<u8> {
+    let range = usize::from(maximum - minimum);
+    let span = (range as u64).max(1);
+    let mut table = vec![0u8; range + 1];
+    for (offset, output) in table.iter_mut().enumerate() {
+        *output = (((2 * offset as u64 * 255) + span) / (2 * span)).min(255) as u8;
+    }
+    table
+}
+
+// materialize_gray_8p8 is used for scale 1 and for the uncommon general-scale
+// fallback. Full-range screenshots avoid the data-dependent lookup entirely.
+fn materialize_gray_8p8(luma: &[u16], minimum: u16, maximum: u16) -> Vec<u8> {
+    let full_range = minimum == 0 && maximum == 255 * 256;
+    let table = if full_range {
+        Vec::new()
+    } else {
+        luma_stretch_table_8p8(minimum, maximum)
+    };
+    let mut gray = vec![0u8; luma.len()];
+    if full_range {
+        for (output, &value) in gray.iter_mut().zip(luma) {
+            *output = ((value + 128) >> 8) as u8;
+        }
+    } else {
+        for (output, &value) in gray.iter_mut().zip(luma) {
+            *output = table[usize::from(value - minimum)];
+        }
+    }
+    gray
+}
+
+// horizontal_luma_2x converts and interpolates one row in a single traversal.
+// Raw pointers expose fixed non-aliasing streams to LLVM after the caller has
+// established all geometry and allocation bounds.
+unsafe fn horizontal_luma_2x(
+    source: *const u16,
+    width: usize,
+    minimum: u16,
+    table: &[u8],
+    full_range: bool,
+    output: *mut u16,
+) {
+    let gray = |value: u16| -> u16 {
+        if full_range {
+            (value + 128) >> 8
+        } else {
+            u16::from(*table.get_unchecked(usize::from(value - minimum)))
+        }
+    };
+    let first = gray(*source);
+    let last = gray(*source.add(width - 1));
+    *output = first * 4;
+    *output.add(width * 2 - 1) = last * 4;
+    for x in 0..width - 1 {
+        let a = gray(*source.add(x));
+        let b = gray(*source.add(x + 1));
+        *output.add(2 * x + 1) = 3 * a + b;
+        *output.add(2 * x + 2) = a + 3 * b;
+    }
+}
+
+// upscale_luma_2x_streaming holds only two horizontally interpolated rows and
+// writes both vertically interpolated outputs together. For typical.png this
+// replaces a roughly 16 MB intermediate with about 11 KB of row storage.
+fn upscale_luma_2x_streaming(
+    luma: &[u16],
+    width: usize,
+    height: usize,
+    minimum: u16,
+    maximum: u16,
+) -> Vec<u8> {
+    let output_width = width * 2;
+    let output_height = height * 2;
+    let full_range = minimum == 0 && maximum == 255 * 256;
+    let table = if full_range {
+        Vec::new()
+    } else {
+        luma_stretch_table_8p8(minimum, maximum)
+    };
+    let mut destination = vec![0u8; output_width * output_height];
+    let mut current = vec![0u16; output_width];
+    let mut next = vec![0u16; output_width];
+
+    unsafe {
+        horizontal_luma_2x(
+            luma.as_ptr(),
+            width,
+            minimum,
+            &table,
+            full_range,
+            current.as_mut_ptr(),
+        );
+        for x in 0..output_width {
+            *destination.as_mut_ptr().add(x) = ((*current.as_ptr().add(x) + 2) >> 2) as u8;
+        }
+        for y in 0..height - 1 {
+            horizontal_luma_2x(
+                luma.as_ptr().add((y + 1) * width),
+                width,
+                minimum,
+                &table,
+                full_range,
+                next.as_mut_ptr(),
+            );
+            let upper = destination.as_mut_ptr().add((2 * y + 1) * output_width);
+            let lower = destination.as_mut_ptr().add((2 * y + 2) * output_width);
+            for x in 0..output_width {
+                let a = u32::from(*current.as_ptr().add(x));
+                let b = u32::from(*next.as_ptr().add(x));
+                *upper.add(x) = ((3 * a + b + 8) >> 4) as u8;
+                *lower.add(x) = ((a + 3 * b + 8) >> 4) as u8;
+            }
+            std::mem::swap(&mut current, &mut next);
+        }
+        let bottom = destination
+            .as_mut_ptr()
+            .add((output_height - 1) * output_width);
+        for x in 0..output_width {
+            *bottom.add(x) = ((*current.as_ptr().add(x) + 2) >> 2) as u8;
+        }
+    }
+    destination
+}
+
+// transform_kstream keeps a general fallback for valid PNG formats and scale 3;
+// only the measured RGB scale-1/2 paths receive the lower-memory implementation.
+fn transform_kstream(
+    buf: &[u8],
+    w: usize,
+    h: usize,
+    ct: png::ColorType,
+    bd: png::BitDepth,
+    scale: usize,
+) -> Vec<u8> {
+    if channels(ct, bd) != 3 {
+        return upscale_k(&gray_stretch_lut(buf, w, h, ct, bd), w, h, scale);
+    }
+    let pixels = w * h;
+    let (luma, minimum, maximum) = unsafe { luma_plane_8p8_rgb(buf, pixels) };
+    if scale == 2 {
+        return upscale_luma_2x_streaming(&luma, w, h, minimum, maximum);
+    }
+    let gray = materialize_gray_8p8(&luma, minimum, maximum);
+    if scale <= 1 {
+        return gray;
+    }
+    upscale_separable(&gray, w, h, scale)
+}
+
+// transform_kstream_phased mirrors transform_kstream exactly while exposing
+// the optimized RGB luma/minmax scan separately from materialization/scaling.
+// Non-RGB inputs retain KSTREAM's existing KLUT + upscale_k fallback, so phase
+// instrumentation remains useful for every PNG format accepted by the decoder.
+fn transform_kstream_phased(
+    buf: &[u8],
+    w: usize,
+    h: usize,
+    ct: png::ColorType,
+    bd: png::BitDepth,
+    scale: usize,
+) -> (
+    Vec<u8>,
+    std::time::Duration,
+    std::time::Duration,
+    &'static str,
+    &'static str,
+) {
+    let phase_a_start = Instant::now();
+    if channels(ct, bd) != 3 {
+        let gray = gray_stretch_lut(buf, w, h, ct, bd);
+        let phase_b_start = Instant::now();
+        let output = upscale_k(&gray, w, h, scale);
+        let finish = Instant::now();
+        return (
+            output,
+            phase_b_start - phase_a_start,
+            finish - phase_b_start,
+            "stretchFallback",
+            "scaleFallback",
+        );
+    }
+
+    let pixels = w * h;
+    let (luma, minimum, maximum) = unsafe { luma_plane_8p8_rgb(buf, pixels) };
+    let phase_b_start = Instant::now();
+    let output = if scale == 2 {
+        upscale_luma_2x_streaming(&luma, w, h, minimum, maximum)
+    } else {
+        let gray = materialize_gray_8p8(&luma, minimum, maximum);
+        if scale <= 1 {
+            gray
+        } else {
+            upscale_separable(&gray, w, h, scale)
+        }
+    };
+    let finish = Instant::now();
+    (
+        output,
+        phase_b_start - phase_a_start,
+        finish - phase_b_start,
+        "lumaMinmax8p8",
+        "materializeScale",
+    )
 }
 
 // ---- variant dispatch ----
@@ -604,6 +1117,13 @@ fn transform(
         // bytes cost three divides per pixel in pass 2). K vs KB keeps that
         // finding attributable now that the scaler underneath has changed.
         "KB" => upscale_k(&gray_stretch_buf(buf, w, h, ct, bd), w, h, scale),
+        "KLUT" => upscale_k(&gray_stretch_lut(buf, w, h, ct, bd), w, h, scale),
+        "KSTREAM" => transform_kstream(buf, w, h, ct, bd, scale),
+        "HYBRID" => transform_hybrid(buf, w, h, ct, bd, scale),
+        #[cfg(feature = "zig")]
+        "RUST-ZIG" => transform_external(r66_transform_zig, "Zig", buf, w, h, ct, bd, scale),
+        #[cfg(feature = "nim")]
+        "RUST-NIM" => transform_external(r66_transform_nim, "Nim", buf, w, h, ct, bd, scale),
         "DS" => upscale_separable_simd(&gray_stretch_nobuf(buf, w, h, ct, bd), w, h, scale),
         "D1" => upscale_naive(&gray_stretch_nobuf(buf, w, h, ct, bd), w, h, scale),
         "D2" => upscale_fixed(&gray_stretch_buf(buf, w, h, ct, bd), w, h, scale),
@@ -615,11 +1135,13 @@ fn transform(
 }
 
 fn write_pgm(path: &str, pix: &[u8], w: usize, h: usize) {
-    let f = File::create(path).expect("create out");
-    let mut bw = BufWriter::with_capacity(1 << 20, f);
-    write!(bw, "P5\n{} {}\n255\n", w, h).unwrap();
-    bw.write_all(pix).unwrap();
-    bw.flush().unwrap();
+    // A large userspace buffer coalesces the header and image writes. Paired
+    // measurements beat issuing the full image directly to the OS file cache.
+    let file = File::create(path).expect("create out");
+    let mut output = BufWriter::with_capacity(1 << 20, file);
+    write!(output, "P5\n{} {}\n255\n", w, h).unwrap();
+    output.write_all(pix).unwrap();
+    output.flush().unwrap();
 }
 
 fn stats(v: &mut Vec<f64>) -> (f64, f64, f64) {
@@ -680,103 +1202,8 @@ fn cmp_pgm(a: &str, b: &str) {
     );
 }
 
-// Sub-phase instrumentation, used INSTEAD of a sampling profiler.
-//
-// Honest statement of method: no sampling profiler was available on this host.
-// ETW (`wpr -start CPU`) requires elevation and was refused; cargo-flamegraph
-// needs blondie or dtrace, neither installed; no Superluminal or VTune present.
-// So the attribution below is manual coarse instrumentation -- each stage of the
-// recommended variant timed with its own Instant, median over the same 15
-// iterations the benchmark uses. It gives per-stage totals, not per-instruction
-// hot spots, and it is labelled as such rather than dressed up as a profile.
-fn profile(inp: &str, iters: usize) {
-    let raw = std::fs::read(inp).expect("read input");
-    let mut acc: Vec<(&str, Vec<f64>)> = vec![
-        ("decode", vec![]),
-        ("stretch:minmax", vec![]),
-        ("stretch:apply", vec![]),
-        ("scale:tables", vec![]),
-        ("scale:horiz", vec![]),
-        ("scale:vert", vec![]),
-    ];
-    let ms = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1000.0;
-    for _ in 0..iters {
-        let t0 = Instant::now();
-        let (buf, w, h, ct, bd) = decode(&raw);
-        let t1 = Instant::now();
-        let scale = upscale_factor_for(w, h);
-        let ch = channels(ct, bd);
-        let n = w * h;
-
-        // stretch pass 1: luma + min/max only
-        let mut lum = vec![0f64; n];
-        let (mut min_l, mut max_l) = (f64::MAX, f64::MIN);
-        for i in 0..n {
-            let l = luma_at(&buf[i * ch..], ch);
-            lum[i] = l;
-            if l < min_l { min_l = l; }
-            if l > max_l { max_l = l; }
-        }
-        let t2 = Instant::now();
-
-        // stretch pass 2: apply the stretch into the u8 plane
-        let mut span = max_l - min_l;
-        if span < 1e-6 { span = 1.0; }
-        let mut small = vec![0u8; n];
-        for i in 0..n {
-            let mut v = (lum[i] - min_l) / span * 255.0;
-            if v < 0.0 { v = 0.0; } else if v > 255.0 { v = 255.0; }
-            small[i] = (v + 0.5) as u8;
-        }
-        let t3 = Instant::now();
-
-        // scaler, split into table build / horizontal / vertical
-        let (t4, t5, t6);
-        if scale > 1 {
-            let (ow, oh) = (w * scale, h * scale);
-            let (x0s, x1s, wxs) = bilinear_axis(w, scale);
-            let (y0s, y1s, wys) = bilinear_axis(h, scale);
-            t4 = Instant::now();
-            let mid = horiz_pass(&small, w, h, ow, &x0s, &x1s, &wxs);
-            t5 = Instant::now();
-            let mut dst = vec![0u8; ow * oh];
-            for oy in 0..oh {
-                let wy = wys[oy] as u64;
-                let iwy = FIX_ONE as u64 - wy;
-                let m0 = &mid[y0s[oy] as usize * ow..][..ow];
-                let m1 = &mid[y1s[oy] as usize * ow..][..ow];
-                let out = &mut dst[oy * ow..][..ow];
-                for ox in 0..ow {
-                    out[ox] = ((m0[ox] as u64 * iwy + m1[ox] as u64 * wy
-                        + (1 << (2 * FIX_SHIFT - 1))) >> (2 * FIX_SHIFT)) as u8;
-                }
-            }
-            t6 = Instant::now();
-            std::hint::black_box(&dst);
-        } else {
-            t4 = Instant::now(); t5 = t4; t6 = t4;
-        }
-        let vals = [ms(t0, t1), ms(t1, t2), ms(t2, t3), ms(t3, t4), ms(t4, t5), ms(t5, t6)];
-        for (i, v) in vals.iter().enumerate() { acc[i].1.push(*v); }
-    }
-    println!("stage attribution (median of {} iters), {}", iters, inp);
-    let mut tot = 0.0;
-    let meds: Vec<(&str, f64)> = acc
-        .iter_mut()
-        .map(|(k, v)| { let (_, m, _) = stats(v); tot += m; (*k, m) })
-        .collect();
-    for (k, m) in meds {
-        println!("  {:<16} {:8.2} ms  {:5.1}%", k, m, m * 100.0 / tot);
-    }
-    println!("  {:<16} {:8.2} ms", "SUM(no write)", tot);
-}
-
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() > 1 && args[1] == "prof" {
-        profile(&args[2], 15);
-        return;
-    }
     if args.len() > 1 && args[1] == "cmp" {
         cmp_pgm(&args[2], &args[3]);
         return;
@@ -786,25 +1213,47 @@ fn main() {
     let inp = &args[2];
     let outp = &args[3];
     let raw = std::fs::read(inp).expect("read input");
-    // Optional per-phase instrumentation of the transform, for profiling without
-    // a sampling profiler: RSBENCH_PHASES=1 prints stretch/scale medians too.
+    // Optional coarse instrumentation reports minimum, median and mean for the
+    // transform's real sub-phases. It does not alter default benchmark timings.
     let phases = std::env::var("RSBENCH_PHASES").is_ok();
-    let (warm, iters) = (3usize, 15usize);
+    // A 250 ms window caps wall time below the old fixed-count protocol; outer
+    // shuffled pairs provide the larger comparison sample.
+    let warm = 3usize;
+    let timed_for = std::time::Duration::from_millis(250);
     let (mut dec, mut tr, mut enc, mut tot) = (vec![], vec![], vec![], vec![]);
     let (mut st, mut sc) = (vec![], vec![]);
-    let (mut ow, mut oh, mut scale) = (0usize, 0usize, 0usize);
-    for i in 0..(warm + iters) {
+    let (mut phase_a_name, mut phase_b_name) = ("stretch", "scale");
+    let mut i = 0usize;
+    let mut timed_start = None;
+    let (ow, oh, scale) = loop {
         let t0 = Instant::now();
+        if i == warm {
+            timed_start = Some(t0);
+        }
         let (buf, w, h, ct, bd) = decode(&raw);
         let t1 = Instant::now();
-        scale = upscale_factor_for(w, h);
-        let big = if phases {
+        let scale = upscale_factor_for(w, h);
+        let big = if phases && variant == "KSTREAM" {
+            // KSTREAM's RGB path fuses grayscale materialization into its
+            // scaler. Preserve that path and time its two real stages instead
+            // of routing it through the legacy gray-plane instrumentation.
+            let (out, phase_a, phase_b, name_a, name_b) =
+                transform_kstream_phased(&buf, w, h, ct, bd, scale);
+            phase_a_name = name_a;
+            phase_b_name = name_b;
+            if i >= warm {
+                st.push(phase_a.as_secs_f64() * 1000.0);
+                sc.push(phase_b.as_secs_f64() * 1000.0);
+            }
+            out
+        } else if phases {
             // Split path used ONLY under RSBENCH_PHASES; the timed default runs
             // the single fused `transform` call so the harness measures the same
             // thing the Go harness does.
             let a = Instant::now();
             let small = match variant.as_str() {
-                "C" | "D2" | "DB" => gray_stretch_buf(&buf, w, h, ct, bd),
+                "C" | "D2" | "DB" | "KB" => gray_stretch_buf(&buf, w, h, ct, bd),
+                "KLUT" => gray_stretch_lut(&buf, w, h, ct, bd),
                 _ => gray_stretch_nobuf(&buf, w, h, ct, bd),
             };
             let b = Instant::now();
@@ -815,6 +1264,7 @@ fn main() {
                 "D2" | "D3" => upscale_fixed(&small, w, h, scale),
                 "F64" => upscale_sep_f64(&small, w, h, scale),
                 "F32" => upscale_sep_f32(&small, w, h, scale),
+                "K" | "KB" | "KLUT" => upscale_k(&small, w, h, scale),
                 _ => panic!("unknown variant"),
             };
             let c = Instant::now();
@@ -826,9 +1276,9 @@ fn main() {
         } else {
             transform(&variant, &buf, w, h, ct, bd, scale)
         };
-        ow = w * scale;
-        oh = h * scale;
         let t2 = Instant::now();
+        let ow = w * scale;
+        let oh = h * scale;
         write_pgm(outp, &big, ow, oh);
         let t3 = Instant::now();
         if i >= warm {
@@ -837,17 +1287,24 @@ fn main() {
             tr.push(msf(t2 - t1));
             enc.push(msf(t3 - t2));
             tot.push(msf(t3 - t0));
+            if t3.duration_since(timed_start.expect("timed start")) >= timed_for {
+                break (ow, oh, scale);
+            }
         }
-    }
+        i += 1;
+    };
     let sz = std::fs::metadata(outp).unwrap().len();
     let (dn, dm, da) = stats(&mut dec);
     let (tn, tm, ta) = stats(&mut tr);
     let (en, em, ea) = stats(&mut enc);
     let (on, om, oa) = stats(&mut tot);
     let extra = if phases {
-        let (_, sm, _) = stats(&mut st);
-        let (_, cm, _) = stats(&mut sc);
-        format!(",\"stretch\":{{\"med\":{}}},\"scale\":{{\"med\":{}}}", sm, cm)
+        let (sn, sm, sa) = stats(&mut st);
+        let (cn, cm, ca) = stats(&mut sc);
+        format!(
+            ",\"{}\":{{\"min\":{},\"med\":{},\"mean\":{}}},\"{}\":{{\"min\":{},\"med\":{},\"mean\":{}}}",
+            phase_a_name, sn, sm, sa, phase_b_name, cn, cm, ca
+        )
     } else {
         String::new()
     };
@@ -857,6 +1314,6 @@ fn main() {
 \"transform\":{{\"min\":{},\"med\":{},\"mean\":{}}},\
 \"encode\":{{\"min\":{},\"med\":{},\"mean\":{}}},\
 \"total\":{{\"min\":{},\"med\":{},\"mean\":{}}}{}}}",
-        variant, inp, scale, ow, oh, sz, iters, dn, dm, da, tn, tm, ta, en, em, ea, on, om, oa, extra
+		variant, inp, scale, ow, oh, sz, tot.len(), dn, dm, da, tn, tm, ta, en, em, ea, on, om, oa, extra
     );
 }

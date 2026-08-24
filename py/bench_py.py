@@ -3,8 +3,8 @@
 
 Same pipeline as the Go and Rust harnesses -- PNG decode -> luma grayscale ->
 global min/max contrast stretch -> integer-factor bilinear upscale -> binary PGM
-write -- and the same measurement protocol: 3 warmups, then the median of 15
-timed iterations, phase-timed into decode / transform / encode, single-threaded.
+write -- and the same measurement protocol: 3 warmups, then a 250 ms timed
+window, phase-timed into decode / transform / encode, single-threaded.
 
 Three variants, because "how fast is Python" has three genuinely different
 answers and collapsing them into one number would be dishonest:
@@ -179,17 +179,21 @@ def main():
     ap.add_argument("input")
     ap.add_argument("output")
     ap.add_argument("--warm", type=int, default=3)
-    ap.add_argument("--iters", type=int, default=15)
+    ap.add_argument("--seconds", type=float, default=0.25)
     ap.add_argument("--crop", type=int, default=0, help="PURE only: crop to NxN first")
     args = ap.parse_args()
 
     raw = Path(args.input).read_bytes()
     runs = []
     ow = oh = scale = 0
-    for i in range(args.warm + args.iters):
+    i = 0
+    timed_start = None
+    while True:
         import io as _io
 
         t0 = time.perf_counter()
+        if i == args.warm:
+            timed_start = t0
         img = Image.open(_io.BytesIO(raw))
         img.load()  # Pillow is lazy; force the decode inside the decode phase
         t1 = time.perf_counter()
@@ -214,6 +218,9 @@ def main():
 
         if i >= args.warm:
             runs.append((t1 - t0, t2 - t1, t3 - t2, t3 - t0))
+            if t3 - timed_start >= args.seconds:
+                break
+        i += 1
 
     def col(k):
         v = sorted(r[k] * 1000.0 for r in runs)

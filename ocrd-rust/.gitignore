@@ -1,0 +1,4 @@
+# Cargo build output. ocrd is built out-of-band and distributed as a prebuilt
+# binary (see README "Build and distribution"), so no build artifact belongs in
+# the repo.
+/target

@@ -18,9 +18,8 @@
 //
 //     grayStretchLUT (variant E) goes further -- exact integer luma
 //     L = 299r+587g+114b, and a byte LUT indexed by L-minL that replaces the
-//     whole per-pixel stretch with one load -- and is 38% faster again on the
-//     factor-1 fixture, but it cannot reproduce A's per-triple float rounding.
-//     See the comment there.
+//     whole per-pixel stretch with one load. Its only measured pixel differences
+//     are accepted delta-1 half-way ties; see the comment there.
 //
 //  2. bilinearAxis exploits the fact that the upscale factor is always an
 //     integer. The sample position sx = (ox+0.5)/f - 0.5 has only f distinct
@@ -96,16 +95,15 @@ func grayStretchLUT(img image.Image) *image.Gray {
 	// Filled by EXACT integer arithmetic, no float anywhere in the stretch:
 	// floor(i*255/span + 1/2) == (2*i*255 + span) / (2*span).
 	//
-	// This is why the LUT stretch is an ablation and not the shipped path. It
-	// CANNOT be made byte-identical to A at factor 1, and the reason is
-	// instructive: on big.png it differs on 77 of 7,481,582 pixels, and all 77
+	// The LUT cannot be byte-identical to A at factor 1: on big.png it differs on
+	// 77 of 7,481,582 pixels, and all 77
 	// are values whose exact stretched result is a precise x.5 (verified tie
 	// remainder 255000/510000 on every one), where A's float64 luma lands a hair
 	// below the tie and truncates down. Breaking ties downward instead does not
 	// fix it -- that flips a different 180 pixels the other way, for 257 total --
 	// because A's error direction depends on the individual (r,g,b) triple, not
 	// on L. No table indexed by L alone can reproduce per-triple float noise.
-	// grayStretchNoBuf gets the same allocation win while staying bit-exact.
+	// The product gate accepts these sparse delta-1 half-way ties.
 	span := uint64(maxL - minL)
 	if span == 0 {
 		span = 1
@@ -138,9 +136,8 @@ func grayStretchLUT(img image.Image) *image.Gray {
 // multiplies is cheaper than storing and reloading 8 bytes per pixel, and the
 // result is bit-for-bit A.
 //
-// The integer/LUT stretch in grayStretchLUT is faster still, but it cannot
-// reproduce A bit-for-bit -- see the comment there -- so it ships as an
-// ablation (variant D4) rather than as the headline path.
+// The integer/LUT stretch in grayStretchLUT is faster still and has an accepted
+// maximum delta of one gray level -- see the comment there.
 func grayStretchNoBuf(img image.Image) *image.Gray {
 	b := img.Bounds()
 	w, h := b.Dx(), b.Dy()
@@ -400,17 +397,16 @@ func upscaleBilinearSepF32(src *image.Gray, scale int) *image.Gray {
 
 // ---- variant entry points ----
 //
-// D and E are the two headline optimized variants; D1/D2/D3/D4 exist only so
-// that each hypothesis can be attributed independently.
+// D and E are optimized variants; D1/D2/D3/D4 isolate their component changes.
 //
-//   D   bit-exact stretch  + separable fixed-point scaler   (RECOMMENDED)
-//   E   integer/LUT stretch + separable fixed-point scaler  (fastest)
+//   D   bit-exact stretch   + separable fixed-point scaler
+//   E   integer/LUT stretch + separable fixed-point scaler
 //   D1  bit-exact stretch  + B2's float64 scaler            (isolates the stretch)
 //   D2  B2's stretch       + single-pass fixed-point scaler (isolates the scaler)
 //   D3  bit-exact stretch  + single-pass fixed-point scaler (D minus separability)
 //   D4  integer/LUT stretch + single-pass fixed-point scaler
 
-// D is the recommended optimized variant. Byte-identical to A at factor 1.
+// D retains the byte-identical float stretch for comparisons that require it.
 func preprocessD(img image.Image, scale int) *image.Gray {
 	small := grayStretchNoBuf(img)
 	if scale <= 1 {
@@ -421,9 +417,8 @@ func preprocessD(img image.Image, scale int) *image.Gray {
 	return upscaleBilinearSeparable(small, scale)
 }
 
-// E is D with the integer-luma + LUT stretch. Fastest measured, but NOT
-// byte-identical to A at factor 1 (77 of 7,481,582 pixels, all exact half-way
-// ties, delta 1). See grayStretchLUT for why that is unavoidable for a LUT.
+// E is D with the accepted integer-luma + LUT stretch. It differs from A on 77
+// of 7,481,582 factor-1 pixels, all exact half-way ties with delta 1.
 func preprocessE(img image.Image, scale int) *image.Gray {
 	small := grayStretchLUT(img)
 	if scale <= 1 {

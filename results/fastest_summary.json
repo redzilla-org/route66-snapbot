@@ -1,0 +1,64 @@
+{
+    "generated_at":  "2026-08-23",
+    "metric":  "minimum total.min across two retained five-run shuffled sessions",
+    "objective":  "0.8 * typical_ms + 0.2 * big_ms",
+    "source_sessions":  [
+                            "full_typical_session1.json",
+                            "full_typical_session2.json",
+                            "full_big_session1.json",
+                            "full_big_session2.json"
+                        ],
+    "pipelines":  {
+                      "rs:nativefat:KSTREAM":  {
+                                                   "typical_ms":  28.4329,
+                                                   "big_ms":  54.1052,
+                                                   "weighted_80_20_ms":  33.56736
+                                               },
+                      "rs:kstreampgo:KSTREAM":  {
+                                                    "typical_ms":  29.166500000000003,
+                                                    "big_ms":  55.1846,
+                                                    "weighted_80_20_ms":  34.370120000000007
+                                                },
+                      "go:fastest_v3:GOFAST":  {
+                                                   "typical_ms":  27.587,
+                                                   "big_ms":  69.9947,
+                                                   "weighted_80_20_ms":  36.06854
+                                               },
+                      "go127:GO127":  {
+                                          "typical_ms":  38.3208,
+                                          "big_ms":  79.3819,
+                                          "weighted_80_20_ms":  46.53302
+                                      },
+                      "wf:KLUT":  {
+                                      "typical_ms":  50.2377,
+                                      "big_ms":  74.6428,
+                                      "weighted_80_20_ms":  55.118719999999996
+                                  },
+                      "zig:KLUT":  {
+                                       "typical_ms":  84.0779,
+                                       "big_ms":  148.7379,
+                                       "weighted_80_20_ms":  97.0099
+                                   },
+                      "nim:KLUT":  {
+                                       "typical_ms":  90.0786,
+                                       "big_ms":  228.21,
+                                       "weighted_80_20_ms":  117.70488
+                                   },
+                      "py:PIL":  {
+                                     "typical_ms":  154.74839997477829,
+                                     "big_ms":  115.06669997470452,
+                                     "weighted_80_20_ms":  146.81205997476354
+                                 }
+                  },
+    "non_pure":  {
+                     "rs:nativefat:HYBRID":  {
+                                                 "typical_ms":  41.5028,
+                                                 "big_ms":  63.212,
+                                                 "weighted_80_20_ms":  45.84464
+                                             },
+                     "source_sessions":  [
+                                             "hybrid_typical.json",
+                                             "hybrid_big.json"
+                                         ]
+                 }
+}

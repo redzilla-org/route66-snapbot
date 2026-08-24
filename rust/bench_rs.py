@@ -2,7 +2,7 @@
 """Repeat the Rust variant matrix N times, interleaved, and print the
 median-of-medians plus the spread for every variant/fixture/phase.
 
-WHY interleaved repeats: each rsbench invocation is already 15 timed iterations
+WHY interleaved repeats: each rsbench invocation already uses a 250 ms timed window
 after 3 warmups and reports its own median, but this host's run-to-run noise is
 large enough (5-15% on transform) to swamp small differences if a single
 invocation is trusted. Interleaving the variants inside each repeat also stops a

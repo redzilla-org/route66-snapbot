@@ -1,0 +1,9 @@
+[submodule "wuffs-upstream"]
+	path = wuffs/upstream
+	url = https://github.com/google/wuffs.git
+[submodule "zig/zignal"]
+	path = zig/zignal
+	url = https://github.com/arrufat/zignal.git
+[submodule "nim/nimpng"]
+	path = nim/nimpng
+	url = https://github.com/jangko/nimPNG.git

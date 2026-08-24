@@ -2,4 +2,11 @@
 out/
 bin/
 rust/target/
+zig/.zig-cache/
+zig/out/
 __pycache__/
+
+# CPU and PGO profiles are reproducible measurement artifacts; source and
+# summarized results remain tracked while machine-specific samples do not.
+prof/*.pprof
+bin/

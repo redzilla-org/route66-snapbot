@@ -5,7 +5,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -16,6 +15,7 @@ import (
 	"os"
 	"runtime/pprof"
 	"sort"
+	"strconv"
 	"time"
 
 	xdraw "golang.org/x/image/draw"
@@ -279,18 +279,32 @@ func writePGM(img *image.Gray, path string) error {
 	if err != nil {
 		return err
 	}
-	w := bufio.NewWriterSize(f, 1<<20)
+	// The optimized pipelines all return tightly packed Gray images. Writing the
+	// header and complete pixel plane directly avoids thousands of row-level
+	// buffer copies; the fallback preserves correctness for a subimage stride.
 	b := img.Bounds()
-	fmt.Fprintf(w, "P5\n%d %d\n255\n", b.Dx(), b.Dy())
-	for y := 0; y < b.Dy(); y++ {
-		if _, err := w.Write(img.Pix[y*img.Stride : y*img.Stride+b.Dx()]); err != nil {
+	header := make([]byte, 0, 32)
+	header = append(header, "P5\n"...)
+	header = strconv.AppendInt(header, int64(b.Dx()), 10)
+	header = append(header, ' ')
+	header = strconv.AppendInt(header, int64(b.Dy()), 10)
+	header = append(header, "\n255\n"...)
+	if _, err := f.Write(header); err != nil {
+		f.Close()
+		return err
+	}
+	if img.Stride == b.Dx() {
+		if _, err := f.Write(img.Pix[:b.Dx()*b.Dy()]); err != nil {
 			f.Close()
 			return err
 		}
-	}
-	if err := w.Flush(); err != nil {
-		f.Close()
-		return err
+	} else {
+		for y := 0; y < b.Dy(); y++ {
+			if _, err := f.Write(img.Pix[y*img.Stride : y*img.Stride+b.Dx()]); err != nil {
+				f.Close()
+				return err
+			}
+		}
 	}
 	return f.Close()
 }
@@ -317,10 +331,12 @@ func stats(v []float64) (min, med, mean float64) {
 func ms(d time.Duration) float64 { return float64(d.Nanoseconds()) / 1e6 }
 
 func main() {
-	variant := os.Args[1] // "A" or "B"
+	variant := os.Args[1] // GOFAST, GOUNSAFE or a historical transform variant.
 	in := os.Args[2]
 	out := os.Args[3]
-	warm, iters := 3, 15
+	// A 250 ms window deliberately caps wall time below the original fixed-count
+	// protocol; shuffled outer pairs provide the larger comparison sample.
+	warm, timedFor := 3, 250*time.Millisecond
 	// CPU profiling is opt-in via CPUPROFILE=<path>; the profile covers the whole
 	// warm+timed loop so the phase attribution matches the reported medians.
 	if pp := os.Getenv("CPUPROFILE"); pp != "" {
@@ -340,17 +356,40 @@ func main() {
 	var runs []run
 	var ow, oh, scale int
 	var imgType string
-	for i := 0; i < warm+iters; i++ {
+	var timedStart time.Time
+	for i := 0; ; i++ {
 		t0 := time.Now()
-		img, err := png.Decode(bytes.NewReader(raw))
+		if i == warm {
+			timedStart = t0
+		}
+		var img image.Image
+		var decoded *decodedLuma
+		assemblyFast := variant == "GOFAST"
+		if assemblyFast || variant == "GOUNSAFE" {
+			decoded, err = decodePNGLuma(raw, assemblyFast)
+		} else {
+			img, err = png.Decode(bytes.NewReader(raw))
+		}
 		if err != nil {
 			panic(err)
 		}
 		t1 := time.Now()
-		imgType = fmt.Sprintf("%T", img)
-		scale = ocrUpscaleFactorFor(img.Bounds())
+		if decoded != nil {
+			imgType = "fused RGB/RGBA luma (pure unsafe Go)"
+			if assemblyFast {
+				imgType = "fused RGB/RGBA luma (assembly-assisted Go)"
+			}
+			scale = ocrUpscaleFactorFor(image.Rect(0, 0, decoded.width, decoded.height))
+		} else {
+			imgType = fmt.Sprintf("%T", img)
+			scale = ocrUpscaleFactorFor(img.Bounds())
+		}
 		var g *image.Gray
 		switch variant {
+		case "GOFAST":
+			g = preprocessDecodedLuma(decoded, scale, true)
+		case "GOUNSAFE":
+			g = preprocessDecodedLuma(decoded, scale, false)
 		case "A":
 			g = preprocessForOCR(img, scale)
 		case "B":
@@ -375,6 +414,8 @@ func main() {
 			g = preprocessL(img, scale)
 		case "K":
 			g = preprocessK(img, scale)
+		case "KLUT":
+			g = preprocessKLUT(img, scale)
 		case "J":
 			g = preprocessJ(img, scale)
 		case "I":
@@ -405,6 +446,9 @@ func main() {
 		ow, oh = g.Bounds().Dx(), g.Bounds().Dy()
 		if i >= warm {
 			runs = append(runs, run{ms(t1.Sub(t0)), ms(t2.Sub(t1)), ms(t3.Sub(t2)), ms(t3.Sub(t0))})
+			if t3.Sub(timedStart) >= timedFor {
+				break
+			}
 		}
 	}
 	col := func(f func(run) float64) []float64 {

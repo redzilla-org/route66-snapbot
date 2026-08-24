@@ -3,8 +3,17 @@ name = "rsbench"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Polyglot transforms are opt-in because their objects are built by Docker-backed
+# scripts before Cargo links the shared Rust decoder/writer benchmark harness.
+zig = []
+nim = []
+
 [dependencies]
-png = "0.17"
+png = "0.18.1"
+
+[build-dependencies]
+cc = "1"
 
 [profile.release]
 opt-level = 3
