@@ -1,0 +1,128 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+# =============================================================================
+# Command-center evidence attestor.
+#
+# WHAT THIS STACK OWNS: one Lambda that signs statements about S3 objects it
+# fetched itself (bytes hash, version, headers) plus the DEV CI state it read
+# itself, in the existing central report bucket. The bucket stays owned by
+# command-center/report-server/test-results-template.yaml; this stack reads
+# objects from it and writes <key>.attestation.json sidecars beside them.
+#
+# WHY NO KMS: owner directive 2026-08-25 rejected KMS cost for this narrow
+# signer. The private Ed25519 seed is a wrapped blob in a plain SSM String;
+# the unwrap key is a constant in the Lambda source (owner 2026-08-26: "the AWS
+# key should be hard-coded (not Lambda env)"), so this template carries NO key
+# material and NO NoEcho parameter.
+#
+# DEV CI TARGETS: the account/region per dev env arrive as ONE JSON parameter,
+# derived by deploy.py from route66's env table (owner 2026-08-26: "these
+# should be params coming into the lambda") -- no account id is written here.
+# =============================================================================
+
+Parameters:
+  CodeS3Bucket:
+    Type: String
+    Description: DevOps bucket holding the packaged attestor zip (never the public evidence bucket).
+
+  CodeS3Key:
+    Type: String
+    Description: Content-addressed key of the packaged attestor zip.
+
+  TestResultsBucketName:
+    Type: String
+    Description: Existing central report/evidence bucket (versioned).
+
+  PrivateKeyParameterName:
+    Type: String
+    Description: SSM String parameter holding the wrapped Ed25519 private-key blob.
+
+  DevCiTargetsJson:
+    Type: String
+    Description: >-
+      JSON object {"<env>": {"account": "<12 digits>", "region": "<region>"}} of the
+      dev envs whose <env>-ci-orchestrator the attestor may read.
+
+  CiReadRoleName:
+    Type: String
+    Default: route66-evidence-attestor-ci-read
+    Description: Name of the read role deployed in each dev account (dev-ci-read-role-template.yaml).
+
+  OrganizationId:
+    Type: String
+    AllowedPattern: '^o-[a-z0-9]{10,32}$'
+    Description: AWS Organizations id allowed to invoke the signer.
+
+Resources:
+  EvidenceAttestorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: evidence-attestor-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Reads the exact object version it was asked to attest (to hash
+              # the bytes itself); writes screenshots it captured and the
+              # <key>.attestation.json sidecars. It never lists the bucket.
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                Resource: !Sub "arn:aws:s3:::${TestResultsBucketName}/*"
+              # Plain SSM String holding the wrapped seed; WithDecryption=false
+              # in the handler is deliberate (no SecureString/KMS path).
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${PrivateKeyParameterName}"
+              # The read role has one fixed name in every dev account; the
+              # account set is the DevCiTargetsJson parameter, and each dev
+              # account's role trust policy is what admits this stack's role.
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !Sub "arn:aws:iam::*:role/${CiReadRoleName}"
+
+  EvidenceAttestorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-app"
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt EvidenceAttestorRole.Arn
+      Timeout: 60
+      MemorySize: 1536
+      EphemeralStorage:
+        Size: 1024
+      Code:
+        S3Bucket: !Ref CodeS3Bucket
+        S3Key: !Ref CodeS3Key
+      Environment:
+        Variables:
+          EVIDENCE_ATTESTOR_REGION: !Ref AWS::Region
+          EVIDENCE_ATTESTOR_BUCKET: !Ref TestResultsBucketName
+          EVIDENCE_ATTESTOR_SSM_PARAM: !Ref PrivateKeyParameterName
+          EVIDENCE_ATTESTOR_CI_READ_ROLE_NAME: !Ref CiReadRoleName
+          EVIDENCE_ATTESTOR_DEV_CI_JSON: !Ref DevCiTargetsJson
+
+  EvidenceAttestorInvokeFromOrg:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt EvidenceAttestorFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: "*"
+      PrincipalOrgID: !Ref OrganizationId
+
+Outputs:
+  EvidenceAttestorFunctionName:
+    Value: !Ref EvidenceAttestorFunction
+  EvidenceAttestorFunctionArn:
+    Value: !GetAtt EvidenceAttestorFunction.Arn

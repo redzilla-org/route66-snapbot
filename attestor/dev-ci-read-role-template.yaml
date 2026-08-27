@@ -1,0 +1,66 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+# =============================================================================
+# DEV-account CI read role for command-center evidence attestation.
+#
+# WHY THIS EXISTS: lifecycle evidence must bind a screenshot to the code that was
+# actually CI-deployed in DEV at verification time. The authoritative source is
+# the <env>-ci-orchestrator Step Functions execution history, not the burned SSM
+# last-green marker and not a caller-supplied target-sha. This tiny role lets the
+# command-center attestor read exactly that execution history from each DEV
+# account without granting it broader AWS visibility.
+# =============================================================================
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    AllowedPattern: "^[a-z]+-dev$"
+    Description: DEV environment whose ci-orchestrator execution history is readable (the env set is route66's env table, never a list here).
+
+  CommandCenterAccountId:
+    Type: String
+    Default: "760773574016"
+    AllowedPattern: "^[0-9]{12}$"
+    Description: Account that owns the evidence attestor Lambda.
+
+Resources:
+  EvidenceAttestorCIReadRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: route66-evidence-attestor-ci-read
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # Trust only the command-center attestor stack's generated Lambda role.
+          # The wildcard is limited to the known stack/resource-name prefix so a
+          # random command-center role cannot assume this by merely sharing the
+          # same account.
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${CommandCenterAccountId}:root"
+            Action: sts:AssumeRole
+            Condition:
+              ArnLike:
+                aws:PrincipalArn: !Sub "arn:aws:iam::${CommandCenterAccountId}:role/CommandCenterEvidenceAttestor-EvidenceAttestorRole-*"
+      Policies:
+        - PolicyName: read-ci-orchestrator-verdict
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # ListExecutions is state-machine scoped. The attestor then
+              # describes candidates until it finds the requested target SHA.
+              - Effect: Allow
+                Action: states:ListExecutions
+                Resource: !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${EnvironmentName}-ci-orchestrator"
+              # DescribeExecution and GetExecutionHistory are execution scoped.
+              # The finalizer scheduled payload in history carries mode and
+              # exitCode, which are required for true-green.
+              - Effect: Allow
+                Action:
+                  - states:DescribeExecution
+                  - states:GetExecutionHistory
+                Resource: !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:execution:${EnvironmentName}-ci-orchestrator:*"
+
+Outputs:
+  RoleArn:
+    Value: !GetAtt EvidenceAttestorCIReadRole.Arn
