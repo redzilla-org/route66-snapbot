@@ -49,6 +49,13 @@ recorded. Response: the statement (`object`, `observed`, `manifest`,
 `manifest_sha256`, `signature_b64`, `key_id`) plus `url` and
 `attestation_url`.
 
+For `attest-aws-resource` the returned `evidence_text` block carries an
+`observed.aws.result:` section holding the attested object body itself -- the
+SDK result JSON in the exact bytes that were signed and hashed into
+`object.sha256`, capped at 64 KiB with an `observed.aws.result-truncated: true`
+line past the cap (owner 2026-09-06, GH #3678). `scripts/cicd/attest_aws_resource.py`
+prints that block and `--text-out <path>` writes it for `gh issue comment --body-file`.
+
 Verify with `python scripts/cicd/verify_evidence_attestation.py "<url with ?versionId=>"`.
 
 ## Configuration
