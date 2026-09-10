@@ -36,12 +36,12 @@ version of that sidecar). Every URL the attestor returns carries
 Invocation shapes:
 
 ```json
-{"key": "<env>/issue-evidence/...png", "version_id": "<optional>", "ci": {"env": "california-dev", "target_sha": "<40 hex>"}}
+{"key": "<env>/issue-evidence/issue-1234/...png", "version_id": "<optional>", "ci": {"env": "california-dev", "target_sha": "<40 hex>"}, "github": {"issue": 1234, "token": "<invocation-only credential>"}}
 ```
 
 ```json
 {"action": "capture-web-ui-screenshot", "issue": 1234, "env": "california-dev", "target_sha": "<40 hex>",
- "url": "https://...", "cookies": [{"name": "SESSION", "value": "...", "url": "https://..."}]}
+ "url": "https://...", "cookies": [{"name": "SESSION", "value": "...", "url": "https://..."}], "github": {"issue": 1234, "token": "<invocation-only credential>"}}
 ```
 
 Cookies are invocation-only; only a redacted fingerprint and count are
@@ -49,12 +49,33 @@ recorded. Response: the statement (`object`, `observed`, `manifest`,
 `manifest_sha256`, `signature_b64`, `key_id`) plus `url` and
 `attestation_url`.
 
-For `attest-aws-resource` the returned `evidence_text` block carries an
-`observed.aws.result:` section holding the attested object body itself -- the
-SDK result JSON in the exact bytes that were signed and hashed into
-`object.sha256`, capped at 64 KiB with an `observed.aws.result-truncated: true`
-line past the cap (owner 2026-09-06, GH #3678). `scripts/cicd/attest_aws_resource.py`
-prints that block and `--text-out <path>` writes it for `gh issue comment --body-file`.
+## Direct publication (#3767)
+
+Every action requires `github.issue` and `github.token`. The Lambda signs, wraps
+the existing canonical v3 manifest in readable `ROUTE66 SIGNED ATTESTATION` armor, and posts that
+exact body to the issue/PR before returning `github_posted=true`, `comment_url`
+and identical `evidence_text`. The credential is removed before capture and
+never enters artifacts, logs, signatures, configuration or the response. Clients
+capture existing GH_TOKEN/GITHUB_TOKEN/gh authentication privately. GitHub issue
+comment permissions are required; publication failures fail the invocation.
+
+The clear-signed section is the exact plaintext manifest bytes covered by the
+Ed25519 signature. Only that compact signature is Base64; there is no encoded
+JSON body or duplicate manifest. Locator headers sit outside the signed section,
+whose bucket/key/version/hash let the existing verifier validate those URLs.
+Explicit angle autolinks preserve every VersionId character in GitHub's rendered
+href. A text fence preserves manifest line breaks without encoding the evidence.
+The armor preserves Ed25519 and versioned sidecars; it is not OpenPGP. AWS result
+bytes remain available in the linked signed object. After confirmed publication,
+run the verifier and inspect those bytes before a separate interpretation comment.
+`--text-out` retains the already-posted body and must not cause another comment.
+
+Sequential retries for the same object version/env/target reuse a verified
+existing comment and return its original signed observation. Discovery is bounded
+to 1,000 issue comments; exceeding it fails rather than risking a duplicate.
+New captures get new identities; concurrent submissions are not exactly-once.
+Earlier encoded presentations remain historical signed evidence. Cleartext uses
+its own retry identity so the new protocol never returns the superseded format.
 
 Verify with `python scripts/cicd/verify_evidence_attestation.py "<url with ?versionId=>"`.
 

@@ -1745,7 +1745,125 @@ async function attestAwsResource(event) {
   return attest(key, put.VersionId || "", observed, body.toString("utf8"));
 }
 
-exports.handler = async (event) => {
+// #3767: publication is part of attestation, not a caller's optional next step.
+// GitHub credentials stay in this invocation only; never pass them to capture,
+// rendering, S3 metadata, or error diagnostics. Issues and PRs share this API.
+function githubTarget(event) {
+  const target = event.github || {};
+  const issue = Number(target.issue);
+  const token = typeof target.token === "string" ? target.token.trim() : "";
+  if (!Number.isSafeInteger(issue) || issue <= 0 || !token || /[\r\n]/.test(token)) {
+    throw new Error("GitHub publication requires a positive issue/PR number and invocation-only token");
+  }
+  if (event.issue != null && Number(event.issue) !== issue) {
+    throw new Error("GitHub publication target disagrees with capture issue");
+  }
+  const keyIssue = typeof event.key === "string" && event.key.match(/\/issue-evidence\/issue-(\d+)\//);
+  if (keyIssue && Number(keyIssue[1]) !== issue) {
+    throw new Error("GitHub publication target disagrees with evidence key");
+  }
+  return { issue, token };
+}
+
+// Fixed HTTPS origin and bounded responses keep the credential away from redirects
+// and diagnostics. GitHub error bodies are deliberately not echoed to logs.
+async function githubJSON(target, method, suffix, body) {
+  const response = await fetch(`https://api.github.com/repos/redzilla-org/route66/issues/${target.issue}/comments${suffix}`, {
+    method, redirect: "error", signal: AbortSignal.timeout(15000),
+    headers: { Authorization: `Bearer ${target.token}`, Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "route66-evidence-attestor",
+      "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (!response.ok) throw new Error(`GitHub attestation ${method} failed: HTTP ${response.status}`);
+  // Bound bytes while reading, not after allocating an arbitrary response.
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of response.body) {
+    size += chunk.length;
+    if (size > 8 * 1024 * 1024) throw new Error("GitHub comment response exceeds 8 MiB");
+    chunks.push(chunk);
+  }
+  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+}
+
+// #3767 owner correction: evidence is readable plaintext, never encoded JSON.
+// The clear-signed section is EXACTLY the existing v3 manifest bytes; only the
+// 64-byte Ed25519 signature is Base64. Locator headers are outside that section,
+// and the verifier binds their artifact to the signed bucket/key/version/hash.
+function armoredAttestation(result, identity) {
+  return ["-----BEGIN ROUTE66 SIGNED ATTESTATION-----", "Algorithm: Ed25519",
+    // Explicit autolinks preserve trailing '_' in S3 VersionIds. GitHub's bare
+    // URL autolinker removed it from the actual #3767 proof, producing HTTP403.
+    `Identity: ${identity}`, `Evidence: <${result.url}>`, `Statement: <${result.attestation_url}>`,
+    `Key-ID: ${result.key_id}`, "", "```text", result.manifest + "-----BEGIN ROUTE66 SIGNATURE-----",
+    result.signature_b64, "-----END ROUTE66 SIGNATURE-----",
+    "```", "-----END ROUTE66 SIGNED ATTESTATION-----"].join("\n");
+}
+
+// A retry of the same immutable object version/target reuses its already posted
+// receipt. No new database is needed. The bounded scan fails rather than guessing
+// if an unusually long issue exceeds the supported comment window.
+async function postAttestation(target, result) {
+  // Presentation is part of retry identity: earlier encoded comments remain
+  // verifiable history, but a new invocation must publish the owner's readable
+  // format rather than silently returning the superseded encoded presentation.
+  const identity = bytesSha256(Buffer.from(JSON.stringify(["cleartext-v1", result.object.bucket, result.object.key,
+    result.object.version_id, result.observed["ci.env"] || "", result.observed["ci.target-sha"] || ""]), "utf8"));
+  for (let page = 1; page <= 10; page++) {
+    const comments = await githubJSON(target, "GET", `?per_page=100&page=${page}`);
+    if (!Array.isArray(comments)) throw new Error("GitHub comment listing is malformed");
+    for (const comment of comments) {
+      if (typeof comment.body !== "string" || !comment.body.includes(`\nIdentity: ${identity}\n`)) continue;
+      // A comment is editable: verify its original statement before accepting it
+      // as a retry receipt, and return its original CI observation unchanged.
+      // The existing versioned sidecar is the structured receipt; no second
+      // encoded JSON copy belongs in the human-facing comment. Constrain its
+      // locator to this exact artifact's sidecar before making the S3 read.
+      const match = comment.body.match(/^Statement: <(https:\/\/[^>\s]+)>$/m);
+      if (!match) throw new Error("Existing attestation comment has no sidecar locator");
+      const version = new URL(match[1]).searchParams.get("versionId");
+      if (!version || match[1] !== publicURL(CFG.bucket, result.attestation_key, version)) {
+        throw new Error("Existing attestation comment has an invalid sidecar locator");
+      }
+      const saved = await s3.send(new GetObjectCommand({ Bucket: CFG.bucket,
+        Key: result.attestation_key, VersionId: version }));
+      if (!saved.ContentLength || saved.ContentLength > 65536) throw new Error("Attestation sidecar size is invalid");
+      const prior = JSON.parse(await saved.Body.transformToString());
+      prior.url = publicURL(CFG.bucket, prior.object.key, prior.object.version_id);
+      prior.attestation_key = result.attestation_key;
+      prior.attestation_url = match[1];
+      const manifest = canonicalManifest(prior.object, prior.observed);
+      const publicKey = crypto.createPublicKey({ key: Buffer.concat([
+        Buffer.from("302a300506032b6570032100", "hex"), Buffer.from(PUBLIC_KEY.public_key_b64, "base64")]), format: "der", type: "spki" });
+      if (prior.manifest !== manifest || prior.key_id !== PUBLIC_KEY.key_id ||
+          !crypto.verify(null, Buffer.from(manifest, "utf8"), publicKey, Buffer.from(prior.signature_b64, "base64")) ||
+          prior.object.bucket !== result.object.bucket || prior.object.key !== result.object.key ||
+          prior.object.version_id !== result.object.version_id ||
+          prior.url !== result.url ||
+          prior.observed["ci.env"] !== result.observed["ci.env"] ||
+          prior.observed["ci.target-sha"] !== result.observed["ci.target-sha"] ||
+          armoredAttestation(prior, identity) !== comment.body) {
+        throw new Error("Existing attestation comment failed signed receipt validation");
+      }
+      if (!comment.html_url) throw new Error("Existing attestation comment has no publication URL");
+      phase("github-publication", "issue=" + target.issue + " reused=true");
+      return { ...prior, evidence_text: comment.body, comment_url: comment.html_url, github_posted: true };
+    }
+    if (comments.length < 100) break;
+    if (page === 10) throw new Error("GitHub attestation deduplication exceeds 1000 comments");
+  }
+  const block = armoredAttestation(result, identity);
+  if (block.length > 60000) throw new Error("Armored attestation exceeds GitHub comment size budget");
+  const posted = await githubJSON(target, "POST", "", { body: block });
+  if (posted.body !== block || !posted.html_url) throw new Error("GitHub did not confirm the identical attestation comment");
+  phase("github-publication", "issue=" + target.issue + " reused=false");
+  return { ...result, evidence_text: block, comment_url: posted.html_url, github_posted: true };
+}
+
+// Capture dispatch receives no GitHub credential. Every successful path joins the
+// same mandatory publication step before the handler returns any signed facts.
+async function captureAttestation(event) {
   // Restart the phase clock on every invocation: a warm container reuses this
   // module, so a module-init-only timestamp would make the second invocation's
   // markers read as minutes of elapsed time. Set here rather than in capturePNG
@@ -1769,4 +1887,11 @@ exports.handler = async (event) => {
     return captureHTTPRaw(event);
   }
   return attestExistingObject(event || {});
+}
+
+exports.handler = async (event) => {
+  const target = githubTarget(event || {});
+  const { github, ...capture } = event;
+  const result = await captureAttestation(capture);
+  return postAttestation(target, result);
 };
