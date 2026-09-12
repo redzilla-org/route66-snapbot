@@ -54,6 +54,9 @@
 
 const crypto = require("crypto");
 const fs = require("fs");
+const os = require("os");
+const readline = require("readline");
+const { spawn } = require("child_process");
 // `https` and `URL` serve the capture-http-raw action only. That action needs to
 // see EVERY redirect hop, and no high-level fetch client exposes them: both
 // puppeteer and fetch() follow redirects internally and hand back only the final
@@ -1889,7 +1892,125 @@ async function captureAttestation(event) {
   return attestExistingObject(event || {});
 }
 
+// ---------------------------------------------------------------------------
+// OCR image reads.
+//
+// WHY THIS LIVES IN THE SAME HANDLER. Screenshot capture and attestation already
+// own Chromium, S3 publication, and the immutable image version. Sending those
+// pixels through a separately provisioned host daemon duplicated lifecycle and
+// made local and Lambda execution different products. `ocr-image` accepts the
+// bytes directly or retrieves an exact S3 object version, then delegates only
+// the CPU-heavy Tesseract call to a private resident child. NATS, host downloads,
+// filesystem paths, and public daemon ports are deliberately absent.
+//
+// WHY A FIXED CHILD POOL. Each child owns one warm TessApi and processes one
+// request at a time. The pool width is therefore the sole in-process OCR lane
+// count. Lambda normally invokes one request per execution environment, while
+// kumo may drive several concurrent Runtime API loops in the same container;
+// both routes use this identical pool and cannot oversubscribe it accidentally.
+// ---------------------------------------------------------------------------
+const OCR_WORKER = process.env.SNAPBOT_OCR_WORKER || "/opt/snapbot/snapbot-ocr-worker";
+const OCR_LANES = (() => {
+  const available = typeof os.availableParallelism === "function" ? os.availableParallelism() : os.cpus().length;
+  const requested = Number(process.env.SNAPBOT_OCR_LANES || available);
+  if (!Number.isSafeInteger(requested) || requested < 1 || requested > available) {
+    throw new Error(`SNAPBOT_OCR_LANES must be an integer in [1, ${available}], got ${process.env.SNAPBOT_OCR_LANES}`);
+  }
+  return requested;
+})();
+
+class OCRWorker {
+  constructor(id) {
+    this.id = id;
+    this.pending = null;
+    this.child = spawn(OCR_WORKER, ["--stdio"], { stdio: ["pipe", "pipe", "inherit"] });
+    this.lines = readline.createInterface({ input: this.child.stdout, crlfDelay: Infinity });
+    this.lines.on("line", (line) => {
+      const pending = this.pending;
+      this.pending = null;
+      if (!pending) throw new Error(`snapbot OCR worker ${id} emitted an unsolicited reply`);
+      try { pending.resolve(JSON.parse(line)); } catch (error) { pending.reject(new Error(`snapbot OCR worker ${id} malformed reply: ${error.message}`)); }
+    });
+    this.child.once("error", (error) => this.fail(error));
+    this.child.once("exit", (code, signal) => this.fail(new Error(`exited code=${code} signal=${signal}`)));
+  }
+
+  fail(error) {
+    if (!this.pending) return;
+    const pending = this.pending;
+    this.pending = null;
+    pending.reject(new Error(`snapbot OCR worker ${this.id}: ${error.message}`));
+  }
+
+  read(request) {
+    if (this.pending) return Promise.reject(new Error(`snapbot OCR worker ${this.id} received concurrent work`));
+    return new Promise((resolve, reject) => {
+      this.pending = { resolve, reject };
+      this.child.stdin.write(JSON.stringify(request) + "\n", (error) => {
+        if (error) this.fail(error);
+      });
+    });
+  }
+}
+
+const ocrPool = [];
+const ocrWaiters = [];
+
+function acquireOCRWorker() {
+  if (ocrPool.length < OCR_LANES) {
+    // Reserve the lane before returning it so simultaneous cold invokes cannot
+    // all observe length zero and create an unbounded number of engines.
+    const worker = new OCRWorker(ocrPool.length);
+    ocrPool.push(worker);
+    return Promise.resolve(worker);
+  }
+  const idle = ocrPool.find((worker) => !worker.pending);
+  if (idle) return Promise.resolve(idle);
+  return new Promise((resolve) => ocrWaiters.push(resolve));
+}
+
+function releaseOCRWorker(worker) {
+  const waiter = ocrWaiters.shift();
+  if (waiter) waiter(worker);
+}
+
+async function ocrImage(event) {
+  let image = typeof event.image === "string" ? event.image : "";
+  let source = "inline";
+  if (!image && event.s3 && event.s3.bucket && event.s3.key) {
+    const object = await s3.send(new GetObjectCommand({
+      Bucket: String(event.s3.bucket), Key: String(event.s3.key),
+      VersionId: event.s3.version_id ? String(event.s3.version_id) : undefined,
+    }));
+    image = Buffer.from(await object.Body.transformToByteArray()).toString("base64");
+    source = "s3";
+  }
+  if (!image) throw new Error("ocr-image requires image base64 or s3.bucket + s3.key");
+
+  const worker = await acquireOCRWorker();
+  const started = Date.now();
+  try {
+    const result = await worker.read({ image, psm: event.psm, lang: event.lang,
+      dpi: event.dpi, upscale: event.upscale, pixel_budget: event.pixel_budget });
+    if (!result || typeof result.text !== "string" || typeof result.error !== "string") {
+      throw new Error("snapbot OCR worker reply lacks text/error strings");
+    }
+    return { text: result.text, error: result.error, metadata: {
+      source, psm: Number(event.psm || 3), lang: String(event.lang || "eng"),
+      dpi: Number(event.dpi || 300), upscale: Number(event.upscale || 1),
+      pixel_budget: Number(event.pixel_budget || 20000000), elapsed_ms: Date.now() - started,
+      worker_version: "snapbot-ocr-worker/1",
+    } };
+  } finally {
+    releaseOCRWorker(worker);
+  }
+}
+
 exports.handler = async (event) => {
+  // OCR produces a fact about pixels but no signed evidence object. It therefore
+  // needs no GitHub publication credential; every attestation action below still
+  // joins mandatory publication before returning, unchanged from #3767.
+  if (event && event.action === "ocr-image") return ocrImage(event);
   const target = githubTarget(event || {});
   const { github, ...capture } = event;
   const result = await captureAttestation(capture);

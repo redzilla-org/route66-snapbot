@@ -5,10 +5,10 @@
 # segmentation mode, how much to upscale, which language -- arrives as a request
 # PARAMETER, so the same binary serves any caller that speaks the protocol.
 [package]
-name = "ocrd"
-version = "0.2.0"
+name = "snapbot-ocr-worker"
+version = "1.0.0"
 edition = "2021"
-description = "Long-lived OCR service: resident Tesseract engines behind a JSON-lines protocol"
+description = "Resident Tesseract worker behind snapbot's private JSON-lines protocol"
 license = "MIT"
 
 [dependencies]
@@ -22,13 +22,11 @@ license = "MIT"
 #
 # default-features stay on: the default set is what carries TLS and the
 # standard connection handling, and trimming it buys nothing here.
-async-nats = "0.50"
 
 # async-nats is a tokio library, so the runtime is not a choice. Only the
 # pieces this daemon actually uses are enabled: a multi-thread runtime (the
 # OCR calls are blocking C code and are run under block_in_place, which
 # REQUIRES the multi-thread flavour) and the #[tokio::main] macro.
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 # The request carries the image INLINE as base64, so the daemon never needs to
 # share a filesystem with its caller. This is the decoder for that field.
@@ -48,7 +46,6 @@ serde_json = "1"
 # Solely for StreamExt::next: an async-nats Subscriber is a Stream and exposes
 # no inherent next(). default-features off keeps the executor/compat halves of
 # the crate out of the build; only the Stream traits are wanted.
-futures = { version = "0.3", default-features = false, features = ["std"] }
 
 # Copied from the benchmark's winning build, because the kernels in src/kstream.rs
 # were measured under exactly these settings (non-PGO; PGO measured as a wash).
