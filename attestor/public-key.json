@@ -1,0 +1,7 @@
+{
+  "algorithm": "Ed25519",
+  "created_utc": "2026-08-25T00:00:00Z",
+  "key_id": "15f05edcd4347a1d",
+  "public_key_b64": "KM7O2UaZph8v0tRbZjuwdaMv2MlRh4pvC2wLZs+sngg=",
+  "purpose": "route66 command-center evidence attestation verification"
+}

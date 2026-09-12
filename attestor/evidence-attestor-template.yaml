@@ -1,0 +1,186 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+# =============================================================================
+# Command-center evidence attestor.
+#
+# WHAT THIS STACK OWNS: one Lambda that signs statements about S3 objects it
+# fetched itself (bytes hash, version, headers) plus the DEV CI state it read
+# itself, in the existing central report bucket. The bucket stays owned by
+# command-center/report-server/test-results-template.yaml; this stack reads
+# objects from it and writes <key>.attestation.json sidecars beside them.
+#
+# WHY NO KMS: owner directive 2026-08-25 rejected KMS cost for this narrow
+# signer. The private Ed25519 seed is a wrapped blob in a plain SSM String;
+# the unwrap key is a constant in the Lambda source (owner 2026-08-26: "the AWS
+# key should be hard-coded (not Lambda env)"), so this template carries NO key
+# material and NO NoEcho parameter.
+#
+# DEV CI TARGETS: the account/region per dev env arrive as ONE JSON parameter,
+# derived by deploy.py from route66's env table (owner 2026-08-26: "these
+# should be params coming into the lambda") -- no account id is written here.
+# =============================================================================
+
+Parameters:
+  CodeS3Bucket:
+    Type: String
+    Description: DevOps bucket holding the packaged attestor zip (never the public evidence bucket).
+
+  CodeS3Key:
+    Type: String
+    Description: Content-addressed key of the packaged attestor zip.
+
+  TestResultsBucketName:
+    Type: String
+    Description: Existing central report/evidence bucket (versioned).
+
+  PrivateKeyParameterName:
+    Type: String
+    Description: SSM String parameter holding the wrapped Ed25519 private-key blob.
+
+  DevCiTargetsJson:
+    Type: String
+    Description: >-
+      JSON object {"<env>": {"account": "<12 digits>", "region": "<region>"}} of the
+      dev envs whose <env>-ci-orchestrator the attestor may read.
+
+  CiReadRoleName:
+    Type: String
+    Default: route66-evidence-attestor-ci-read
+    Description: Name of the read role deployed in each dev account (dev-ci-read-role-template.yaml).
+
+  OrganizationId:
+    Type: String
+    AllowedPattern: '^o-[a-z0-9]{10,32}$'
+    Description: AWS Organizations id allowed to invoke the signer.
+
+Resources:
+  EvidenceAttestorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: evidence-attestor-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Reads the exact object version it was asked to attest (to hash
+              # the bytes itself); writes screenshots it captured and the
+              # <key>.attestation.json sidecars. It never lists the bucket.
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                Resource: !Sub "arn:aws:s3:::${TestResultsBucketName}/*"
+              # ONE parameter, named individually and never as a path wildcard:
+              # the wrapped Ed25519 signing seed. Plain SSM String;
+              # WithDecryption=false in the handler is deliberate (no
+              # SecureString/KMS path).
+              #
+              # The GitHub read-token parameter that used to sit beside it was
+              # REMOVED 2026-09-03 with the attest-code-at-sha action (owner order:
+              # "Move the evidence-type:code implementation to a local process
+              # (cloud-compose attest)"). The parameter was never created, the
+              # action could never run, and the local subcommand reads the same
+              # facts out of the operator's git checkout with no token at all.
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource:
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${PrivateKeyParameterName}"
+              # The read role has one fixed name in every dev account; the
+              # account set is the DevCiTargetsJson parameter, and each dev
+              # account's role trust policy is what admits this stack's role.
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !Sub "arn:aws:iam::*:role/${CiReadRoleName}"
+
+  EvidenceAttestorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-app"
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt EvidenceAttestorRole.Arn
+      # TIMEOUT 180s, raised from 60 -- GH #3177. The BASELINE for a capture with
+      # no interaction at all is 37363 ms (RequestId b2724569, 2026-09-05
+      # 01:42:57Z, DMV dev): cold chromium, a networkidle2 load, the full-document
+      # lazy-load scroll, the settle wait and a fullPage shot already spend
+      # two thirds of the old 60s budget before anything is clicked. One --click
+      # then adds up to 5s of waitForSelector, a 400ms settle and up to 8s of
+      # navigation wait, and a click that NAVIGATES re-pays the settle and the
+      # shot against the new document -- which is why all five --click "#submit"
+      # captures on 2026-09-05 ended "Duration: 60000.00 ms, Status: timeout" and
+      # produced no evidence whatsoever. 180s is sized for the 8-selector cap
+      # this action allows, not for one click, and an unused ceiling costs
+      # nothing: Lambda bills duration, never the timeout.
+      Timeout: 180
+      MemorySize: 1536
+      EphemeralStorage:
+        Size: 1024
+      Code:
+        S3Bucket: !Ref CodeS3Bucket
+        S3Key: !Ref CodeS3Key
+      Environment:
+        Variables:
+          EVIDENCE_ATTESTOR_REGION: !Ref AWS::Region
+          EVIDENCE_ATTESTOR_BUCKET: !Ref TestResultsBucketName
+          EVIDENCE_ATTESTOR_SSM_PARAM: !Ref PrivateKeyParameterName
+          EVIDENCE_ATTESTOR_CI_READ_ROLE_NAME: !Ref CiReadRoleName
+          EVIDENCE_ATTESTOR_DEV_CI_JSON: !Ref DevCiTargetsJson
+
+  # WHY THIS ALARM EXISTS: this one function signs EVERY piece of closure
+  # evidence in the system, and it has no DLQ and no failure destination -- a
+  # failed invocation leaves nothing behind but a log line nobody is reading.
+  # Its failure mode is therefore SILENCE, and evidence that was never captured
+  # is indistinguishable from evidence nobody requested: a ticket simply sits
+  # unclosed and the reason is invisible. A single error over five minutes is
+  # worth surfacing because invocations are rare and deliberate, so there is no
+  # background error rate to tune out.
+  #
+  # No AlarmActions: this account has no SNS topic, and inventing one here would
+  # be infrastructure nobody asked for. The alarm's value is that its state is
+  # queryable and visible in the console; matching the two compactor alarms added
+  # 2026-09-03, which are actionless for the same reason.
+  #
+  # TreatMissingData notBreaching: this function is invoked only when evidence is
+  # requested, so most periods have no datapoints at all, and any other setting
+  # would leave the alarm permanently in INSUFFICIENT_DATA or ALARM.
+  EvidenceAttestorErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-errors"
+      AlarmDescription: >-
+        The evidence attestor Lambda reported one or more errors. It signs all
+        ticket closure evidence and has no DLQ, so a failure is otherwise silent.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref EvidenceAttestorFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  EvidenceAttestorInvokeFromOrg:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt EvidenceAttestorFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: "*"
+      PrincipalOrgID: !Ref OrganizationId
+
+Outputs:
+  EvidenceAttestorFunctionName:
+    Value: !Ref EvidenceAttestorFunction
+  EvidenceAttestorFunctionArn:
+    Value: !GetAtt EvidenceAttestorFunction.Arn

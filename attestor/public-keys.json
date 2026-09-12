@@ -1,0 +1,11 @@
+{
+  "purpose": "route66 evidence attestation: signers OTHER than the command-center attestor Lambda. The Lambda's own key stays in public-key.json, which is the file the Lambda itself reads and pins its SSM private key against; copying it here would make two sources of truth for one key, so scripts/cicd/verify_evidence_attestation.py composes the two files and refuses a duplicate signer id. A sidecar with no 'signer' field is a Lambda statement.",
+  "signers": {
+    "cloud-compose-attest": {
+      "algorithm": "Ed25519",
+      "key_id": "e51b4a2c",
+      "public_key_b64": "nbMvQBkVJcMcQSm5KvFLR/opBmyJVqcYv5azfq9VAwc=",
+      "purpose": "evidence-type:code attestations produced by `cloud-compose attest code` on the owner's workstation (owner order 2026-09-03: 'Move the evidence-type:code implementation to a local process'). This is the SAME laptop Ed25519 keypair `cloud-compose verify-keygen` mints and local-verify signs with; its public half is also committed at cloud-compose/ci-verify/allowed-signers/alexr-e51b4a2c.ed25519.pub, and key_id is that filename's fingerprint prefix. The private key never leaves the workstation, and the attestor Lambda's private key was never moved or copied."
+    }
+  }
+}

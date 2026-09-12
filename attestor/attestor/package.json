@@ -1,0 +1,10 @@
+{
+  "name": "route66-evidence-attestor",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Command-center evidence attestor Lambda with Chromium screenshot capture.",
+  "dependencies": {
+    "@sparticuz/chromium": "149.0.0",
+    "puppeteer-core": "25.9.0"
+  }
+}

@@ -1,0 +1,42 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+# =============================================================================
+# Command-center DevOps bucket: private deployment artifacts.
+#
+# WHY (owner directive 2026-08-26): the evidence attestor's Lambda zip used to
+# be staged in the PUBLIC evidence bucket (r66-test-results-<acct>, anonymous
+# GetObject bucket-wide). Deployment artifacts belong in a DevOps bucket, the
+# same role core-devops-bucket-<env>-<acct>-<region> plays in every route66
+# env; command-center had none. This stack creates it, named on that exact
+# convention, private, versioned, with old versions expiring so
+# content-addressed zips do not accumulate forever.
+# =============================================================================
+
+Resources:
+  DevOpsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "core-devops-bucket-command-center-${AWS::AccountId}-${AWS::Region}"
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-noncurrent
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 90
+
+Outputs:
+  BucketName:
+    Value: !Ref DevOpsBucket
