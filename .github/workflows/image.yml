@@ -41,3 +41,7 @@ jobs:
           gh release create "$GITHUB_SHA" route66-snapbot-linux-amd64.tar.gz \
             --target "$GITHUB_SHA" --title "snapbot $GITHUB_SHA" \
             --notes "Immutable Lambda/Kumo image for $GITHUB_SHA."
+        env:
+          # gh deliberately does not infer the Actions token; make the
+          # release publication credential explicit and step-scoped.
+          GH_TOKEN: ${{ github.token }}
