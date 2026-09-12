@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Deploy the command-center evidence attestor.
+"""Build and deploy the command-center route66-snapbot image.
 
-boto3 only, fixed command-center account/region, deterministic zip packaging,
-live preflight checks before any stack mutation.
+boto3 plus Docker, fixed command-center account/region, immutable SHA image tag,
+and live preflight checks before any stack mutation.
 
 KEY MATERIAL (owner 2026-08-26, "the AWS key should be hard-coded (not Lambda
 env)"): the AES unwrap key is the UNWRAP_KEY_B64 constant in attestor/index.js;
@@ -26,16 +26,11 @@ deploy_dev_ci_read_roles.py derives the same set from the same source.
 Modes:  preflight | package | deploy
 """
 import base64
-import hashlib
-import io
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
-import tempfile
-import zipfile
 
 import boto3
 import botocore
@@ -44,29 +39,28 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
-sys.path.insert(0, ROOT)
+ROOT = os.path.abspath(os.path.join(HERE, ".."))
+ROUTE66_ROOT = os.environ.get("R66_ROUTE66_ROOT") or os.path.abspath(os.path.join(ROOT, "..", "route66"))
+sys.path.insert(0, ROUTE66_ROOT)
 from scripts.lib.r66 import account_id, all_env_names, is_prod, region as env_region  # noqa: E402
 
 COMMAND_CENTER_ACCOUNT = "760773574016"
 REGION = "us-east-1"
-STACK_NAME = "CommandCenterEvidenceAttestor"
+STACK_NAME = "CommandCenterSnapbot"
 DEVOPS_STACK_NAME = "CommandCenterDevOpsBucket"
 STORE_BUCKET = "r66-test-results-" + COMMAND_CENTER_ACCOUNT
 DEVOPS_BUCKET = "core-devops-bucket-command-center-%s-%s" % (COMMAND_CENTER_ACCOUNT, REGION)
 PROFILE = os.environ.get("AWS_PROFILE") or "command-center"
 ORG_ID = "o-qpe4445sii"
 SSM_PARAM = "/r66/evidence-attestor/private-key.v1"
-ARTIFACT_PREFIX = "evidence-attestor/"
+ECR_REPOSITORY = "route66-snapbot"
 CI_READ_ROLE_NAME = "route66-evidence-attestor-ci-read"
 
 TEMPLATE = os.path.join(HERE, "evidence-attestor-template.yaml")
 DEVOPS_TEMPLATE = os.path.join(HERE, "devops-bucket-template.yaml")
 LAMBDA_SRC = os.path.join(HERE, "attestor", "index.js")
-LAMBDA_PACKAGE_JSON = os.path.join(HERE, "attestor", "package.json")
-LAMBDA_PACKAGE_LOCK = os.path.join(HERE, "attestor", "package-lock.json")
 PUBLIC_KEY = os.path.join(HERE, "public-key.json")
-BOOTSTRAP = os.path.join(ROOT, "tmp", "command-center-evidence-attestor-bootstrap.json")
+BOOTSTRAP = os.path.join(ROUTE66_ROOT, "tmp", "command-center-evidence-attestor-bootstrap.json")
 
 
 def session():
@@ -159,42 +153,6 @@ def ensure_private_key_parameter(sess, value, create):
     print("private-key blob CREATED: %s (value not printed)" % SSM_PARAM)
 
 
-def stage_lambda_tree(stage):
-    """Build a deployable Lambda tree with pinned browser dependencies."""
-    shutil.copy2(LAMBDA_SRC, os.path.join(stage, "index.js"))
-    shutil.copy2(PUBLIC_KEY, os.path.join(stage, "public-key.json"))
-    shutil.copy2(LAMBDA_PACKAGE_JSON, os.path.join(stage, "package.json"))
-    shutil.copy2(LAMBDA_PACKAGE_LOCK, os.path.join(stage, "package-lock.json"))
-    npm = shutil.which("npm") or shutil.which("npm.cmd")
-    if not npm:
-        sys.exit("REFUSING: npm not found on PATH; cannot package browser dependencies")
-    subprocess.run([npm, "ci", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund"],
-                   cwd=stage, check=True, timeout=300)
-
-
-def build_zip_bytes():
-    tmp = tempfile.mkdtemp(prefix="r66-evidence-attestor-")
-    buf = io.BytesIO()
-    try:
-        stage_lambda_tree(tmp)
-        members = []
-        for root, dirs, files in os.walk(tmp):
-            dirs.sort()
-            for name in sorted(files):
-                full = os.path.join(root, name)
-                members.append((os.path.relpath(full, tmp).replace(os.sep, "/"), full))
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for rel, full in members:
-                info = zipfile.ZipInfo(rel, date_time=(1980, 1, 1, 0, 0, 0))
-                info.external_attr = 0o644 << 16
-                info.compress_type = zipfile.ZIP_DEFLATED
-                with open(full, "rb") as fh:
-                    zf.writestr(info, fh.read())
-        return buf.getvalue()
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-
-
 def stack_status(cfn, name):
     try:
         return cfn.describe_stacks(StackName=name)["Stacks"][0]["StackStatus"]
@@ -231,14 +189,27 @@ def ensure_devops_bucket(sess):
 
 
 def package(sess=None):
+    """Build and push the exact checkout as an immutable ECR image."""
     sess = sess or session()
     assert_command_center(sess)
     ensure_devops_bucket(sess)
-    blob = build_zip_bytes()
-    key = "%sevidence-attestor-%s.zip" % (ARTIFACT_PREFIX, hashlib.sha256(blob).hexdigest()[:32])
-    sess.client("s3").put_object(Bucket=DEVOPS_BUCKET, Key=key, Body=blob, ContentType="application/zip")
-    print("packaged %d bytes -> s3://%s/%s" % (len(blob), DEVOPS_BUCKET, key))
-    return key
+    sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True, timeout=15).strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        sys.exit("REFUSING: git rev-parse did not return a 40-hex SHA")
+    registry = "%s.dkr.ecr.%s.amazonaws.com" % (COMMAND_CENTER_ACCOUNT, REGION)
+    image = "%s/%s:%s" % (registry, ECR_REPOSITORY, sha)
+
+    # Password travels on stdin and never appears in argv or logs. The build is
+    # amd64 because the template declares x86_64 and Chromium pins that ABI.
+    auth = sess.client("ecr").get_authorization_token()["authorizationData"][0]
+    username, password = base64.b64decode(auth["authorizationToken"]).decode("utf-8").split(":", 1)
+    subprocess.run(["docker", "login", "--username", username, "--password-stdin", registry],
+                   input=password, text=True, check=True, timeout=60)
+    subprocess.run(["docker", "build", "--platform", "linux/amd64", "-t", image, "."],
+                   cwd=ROOT, check=True, timeout=3600)
+    subprocess.run(["docker", "push", image], cwd=ROOT, check=True, timeout=1800)
+    print("packaged snapbot image %s" % image)
+    return image
 
 
 def preflight():
@@ -259,10 +230,9 @@ def deploy():
     value, create = ssm_string_value(sess)
     validate_seed_matches_public(value)
     ensure_private_key_parameter(sess, value, create)
-    key = package(sess)
+    image_uri = package(sess)
     params = [
-        {"ParameterKey": "CodeS3Bucket", "ParameterValue": DEVOPS_BUCKET},
-        {"ParameterKey": "CodeS3Key", "ParameterValue": key},
+        {"ParameterKey": "ImageUri", "ParameterValue": image_uri},
         {"ParameterKey": "TestResultsBucketName", "ParameterValue": STORE_BUCKET},
         {"ParameterKey": "PrivateKeyParameterName", "ParameterValue": SSM_PARAM},
         {"ParameterKey": "DevCiTargetsJson", "ParameterValue": json.dumps(dev_ci_targets(), sort_keys=True)},

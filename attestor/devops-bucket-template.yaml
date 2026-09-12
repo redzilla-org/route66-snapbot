@@ -13,6 +13,20 @@ AWSTemplateFormatVersion: "2010-09-09"
 # =============================================================================
 
 Resources:
+  # Snapbot is an image Lambda because Chromium and the resident native OCR
+  # engine are one deployable component. The repository is CFN-owned so a
+  # deploy never has a manual infrastructure prerequisite.
+  SnapbotRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: route66-snapbot
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: >-
+          {"rules":[{"rulePriority":1,"description":"retain latest 30 snapbot images","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":30},"action":{"type":"expire"}}]}
+
   DevOpsBucket:
     Type: AWS::S3::Bucket
     DeletionPolicy: Retain

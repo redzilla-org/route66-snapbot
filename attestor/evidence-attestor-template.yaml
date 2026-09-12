@@ -21,13 +21,9 @@ AWSTemplateFormatVersion: "2010-09-09"
 # =============================================================================
 
 Parameters:
-  CodeS3Bucket:
+  ImageUri:
     Type: String
-    Description: DevOps bucket holding the packaged attestor zip (never the public evidence bucket).
-
-  CodeS3Key:
-    Type: String
-    Description: Content-addressed key of the packaged attestor zip.
+    Description: Immutable route66-snapbot amd64 Lambda image URI.
 
   TestResultsBucketName:
     Type: String
@@ -105,8 +101,10 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub "${AWS::StackName}-app"
-      Runtime: nodejs20.x
-      Handler: index.handler
+      # One image owns Chromium, the resident Tesseract workers, and signing.
+      # Keeping PackageType explicit prevents a future zip update from silently
+      # dropping either native dependency and recreating two runtime paths.
+      PackageType: Image
       Role: !GetAtt EvidenceAttestorRole.Arn
       # TIMEOUT 180s, raised from 60 -- GH #3177. The BASELINE for a capture with
       # no interaction at all is 37363 ms (RequestId b2724569, 2026-09-05
@@ -124,9 +122,9 @@ Resources:
       MemorySize: 1536
       EphemeralStorage:
         Size: 1024
+      Architectures: [x86_64]
       Code:
-        S3Bucket: !Ref CodeS3Bucket
-        S3Key: !Ref CodeS3Key
+        ImageUri: !Ref ImageUri
       Environment:
         Variables:
           EVIDENCE_ATTESTOR_REGION: !Ref AWS::Region
