@@ -1923,6 +1923,7 @@ class OCRWorker {
   constructor(id) {
     this.id = id;
     this.pending = null;
+    this.failure = null;
     this.child = spawn(OCR_WORKER, ["--stdio"], { stdio: ["pipe", "pipe", "inherit"] });
     this.lines = readline.createInterface({ input: this.child.stdout, crlfDelay: Infinity });
     this.lines.on("line", (line) => {
@@ -1936,13 +1937,18 @@ class OCRWorker {
   }
 
   fail(error) {
+    // WHY: a child can die while idle. Remember that terminal state so the
+    // next invocation fails explicitly instead of writing to a dead pipe and
+    // potentially waiting until the Lambda timeout.
+    this.failure = new Error(`snapbot OCR worker ${this.id}: ${error.message}`);
     if (!this.pending) return;
     const pending = this.pending;
     this.pending = null;
-    pending.reject(new Error(`snapbot OCR worker ${this.id}: ${error.message}`));
+    pending.reject(this.failure);
   }
 
   read(request) {
+    if (this.failure) return Promise.reject(this.failure);
     if (this.pending) return Promise.reject(new Error(`snapbot OCR worker ${this.id} received concurrent work`));
     return new Promise((resolve, reject) => {
       this.pending = { resolve, reject };

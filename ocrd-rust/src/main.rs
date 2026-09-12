@@ -213,3 +213,30 @@ fn main() {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_request_fails_before_starting_tesseract() {
+        // WHY: the stdio boundary must always return structured JSON. This
+        // guards the parent process from mistaking malformed input for an
+        // empty OCR result and exercises the gate without host tessdata.
+        let mut engine = None;
+        let response = handle_read(&mut engine, br#"{"image":42}"#);
+        assert!(response.text.is_empty());
+        assert!(response.error.starts_with("malformed request:"));
+        assert!(engine.is_none());
+    }
+
+    #[test]
+    fn empty_image_fails_before_starting_tesseract() {
+        // WHY: an empty but syntactically valid request is a caller error, not
+        // a successful blank page, and must not allocate an OCR engine.
+        let mut engine = None;
+        let response = handle_read(&mut engine, br#"{"image":""}"#);
+        assert_eq!(response.error, "empty image");
+        assert!(engine.is_none());
+    }
+}

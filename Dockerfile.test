@@ -1,7 +1,7 @@
 # The repository gate deliberately builds the production Dockerfile's native
 # source on a compact Alpine image. It proves the Rust worker, Node handler, and
 # pinned npm closure from this checkout without requiring deployed AWS state.
-FROM public.ecr.aws/docker/library/node:20-alpine
+FROM public.ecr.aws/docker/library/node:22-alpine
 
 RUN apk add --no-cache rust cargo build-base pkgconf clang clang-dev llvm-dev \
         tesseract-ocr-dev leptonica-dev
@@ -14,7 +14,9 @@ COPY attestor ./attestor
 # node --check validates the combined handler; npm ci proves its lock file.
 RUN cd /src/ocrd-rust \
     && cargo test --locked \
+    && cargo build --locked \
     && ./target/debug/snapbot-ocr-worker --version \
     && cd /src/attestor/attestor \
     && npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
-    && node --check index.js
+    && node --check index.js \
+    && node --check kumo-runtime.js

@@ -1,0 +1,37 @@
+name: snapbot image
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The repository's one required gate compiles the real native worker and
+      # validates the combined handler from the committed lock files.
+      - run: docker build --platform linux/amd64 -f Dockerfile.test -t route66-snapbot:test .
+
+  publish:
+    if: github.event_name == 'push'
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # A full commit SHA is immutable consumer identity. No latest tag exists,
+      # so route66 cannot silently receive different bytes for the same pin.
+      - run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}"
+          docker build --platform linux/amd64 -t "$image" .
+          docker push "$image"

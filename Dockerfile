@@ -54,7 +54,7 @@ RUN printf '%s\n' \
     && ! ldd /out/snapbot-ocr-worker \
     && /out/snapbot-ocr-worker --version
 
-FROM public.ecr.aws/lambda/nodejs:20 AS runtime
+FROM public.ecr.aws/lambda/nodejs:22 AS runtime
 
 # npm's production closure contains the pinned Sparticuz Chromium build and
 # puppeteer driver. AWS SDK v3 remains supplied by the managed Lambda base, as
@@ -64,7 +64,7 @@ RUN cd ${LAMBDA_TASK_ROOT} \
     && npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
     && npm cache clean --force
 
-COPY attestor/attestor/index.js attestor/public-key.json ${LAMBDA_TASK_ROOT}/
+COPY attestor/attestor/index.js attestor/attestor/kumo-runtime.js attestor/public-key.json ${LAMBDA_TASK_ROOT}/
 COPY --from=ocr-build /out/snapbot-ocr-worker /opt/snapbot/snapbot-ocr-worker
 COPY --from=ocr-build /out/tessdata /opt/snapbot/tessdata
 
@@ -73,6 +73,7 @@ COPY --from=ocr-build /out/tessdata /opt/snapbot/tessdata
 ENV TESSDATA_PREFIX=/opt/snapbot/tessdata
 ENV SNAPBOT_OCR_WORKER=/opt/snapbot/snapbot-ocr-worker
 RUN /opt/snapbot/snapbot-ocr-worker --version \
-    && node --check ${LAMBDA_TASK_ROOT}/index.js
+    && node --check ${LAMBDA_TASK_ROOT}/index.js \
+    && node --check ${LAMBDA_TASK_ROOT}/kumo-runtime.js
 
 CMD ["index.handler"]
