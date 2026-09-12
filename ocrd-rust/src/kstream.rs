@@ -64,7 +64,9 @@ fn decode(raw: &[u8]) -> Result<(Vec<u8>, usize, usize, png::ColorType, png::Bit
 
 fn channels(ct: png::ColorType, bd: png::BitDepth) -> Result<usize, String> {
     if bd != png::BitDepth::Eight {
-        return Err(format!("unsupported bit depth {bd:?}: only 8-bit PNG is handled"));
+        return Err(format!(
+            "unsupported bit depth {bd:?}: only 8-bit PNG is handled"
+        ));
     }
     match ct {
         png::ColorType::Rgba => Ok(4),
