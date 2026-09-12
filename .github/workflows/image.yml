@@ -6,7 +6,9 @@ on:
     branches: [main]
 
 permissions:
-  contents: read
+  # The immutable release archive is the anonymous local-Kumo distribution
+  # path. GHCR organization packages default private even for public source.
+  contents: write
   packages: write
 
 jobs:
@@ -35,3 +37,7 @@ jobs:
           image="ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}"
           docker build --platform linux/amd64 -t "$image" .
           docker push "$image"
+          docker save "$image" | gzip -1 > route66-snapbot-linux-amd64.tar.gz
+          gh release create "$GITHUB_SHA" route66-snapbot-linux-amd64.tar.gz \
+            --target "$GITHUB_SHA" --title "snapbot $GITHUB_SHA" \
+            --notes "Immutable Lambda/Kumo image for $GITHUB_SHA."
