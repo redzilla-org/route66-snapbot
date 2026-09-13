@@ -18,11 +18,13 @@ sign what it retrieves. It is independent of cloud-compose"):
 
 - the S3 object: bucket, key, VersionId, its own sha256 of the bytes,
   Content-Length, Content-Type, Last-Modified, ETag, attested-at;
-- `observed.ci.*` when the caller names `ci: {env, target_sha}`: the LATEST
-  `<env>-ci-orchestrator` execution as found -- executed sha, status,
-  finalizer mode, worker exit code, `sha-match`, `true-green`, or `ci.error`
-  when the account was unreachable. It never refuses (owner 2026-08-26:
-  "never refuse, only capture!"); a RUNNING run or a newer sha is a signed
+- `observed.ci.*` when the caller names `ci: {env, target_sha}`: the newest
+  `<env>-ci-orchestrator` execution at `target_sha` as found (newest-first
+  pagination, capped at 4 pages of 50 executions; GH #3840) -- executed sha,
+  status, finalizer mode, worker exit code, `sha-match`, `true-green`, or
+  `ci.error` when the account was unreachable or no execution at `target_sha`
+  was found (then `true-green` is `false`). It never refuses (owner 2026-08-26:
+  "never refuse, only capture!"); a RUNNING run or a missing target sha is a signed
   fact, and the reader decides what it proves;
 - `observed.capture.*` for screenshots the Lambda took itself: requested and
   final URL, HTTP status, viewport, cookie fingerprint and count.
