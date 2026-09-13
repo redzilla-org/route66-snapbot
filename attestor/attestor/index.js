@@ -2062,9 +2062,31 @@ async function ocrImage(event) {
 
 exports.handler = async (event) => {
   // OCR produces a fact about pixels but no signed evidence object. It therefore
-  // needs no GitHub publication credential; every attestation action below still
-  // joins mandatory publication before returning, unchanged from #3767.
+  // needs no GitHub publication credential. Ticket evidence continues to join
+  // mandatory publication before returning; the narrowly validated run-manifest
+  // branch below is evidence infrastructure rather than a ticket artifact.
   if (event && event.action === "ocr-image") return ocrImage(event);
+
+  // WHY THIS IS THE ONLY NON-GITHUB ATTESTATION PATH (GH #3822): cloud-compose
+  // must publish one run manifest automatically for every local and CI harness run,
+  // before any ticket-specific progress comment exists. Requiring an issue token
+  // here would either make unattended CI unable to sign its own manifest or spray
+  // every routine run onto one unrelated issue. Keep the exemption narrower than
+  // the generic existing-object action: the caller must name an immutable S3
+  // VersionId and the object must be the run-prefix manifest itself. The attestor
+  // still GETs those exact bytes and captures the requested CI observation through
+  // attestExistingObject; this branch relaxes publication, never provenance.
+  if (event && event.action === "attest-run-manifest") {
+    const key = typeof event.key === "string" ? event.key : "";
+    const versionID = typeof event.version_id === "string" ? event.version_id.trim() : "";
+    if (!key.endsWith("/manifest.json")) {
+      throw new Error("attest-run-manifest requires a run-prefix manifest.json key");
+    }
+    if (!versionID) {
+      throw new Error("attest-run-manifest requires the manifest object's VersionId");
+    }
+    return attestExistingObject(event);
+  }
   const target = githubTarget(event || {});
   const { github, ...capture } = event;
   const result = await captureAttestation(capture);
