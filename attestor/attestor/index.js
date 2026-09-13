@@ -1821,20 +1821,32 @@ async function githubJSON(target, method, suffix, body) {
 // 64-byte Ed25519 signature is Base64. Locator headers are outside that section,
 // and the verifier binds their artifact to the signed bucket/key/version/hash.
 function armoredAttestation(result, identity) {
-  // Owner 2026-09-13: "the formatting of the attestion output on gh comments is a
-  // little messed up". GitHub Markdown joins lines separated by a single newline
-  // into one paragraph, so the armor line and every locator header rendered as a
-  // single run-on line. A blank line after each header gives each its own
-  // paragraph while every header line stays byte-identical, which keeps the
-  // retry lookup below (`\nIdentity: <id>\n`, `^Statement: <url>$`) and the
-  // callers' "-----BEGIN ROUTE66 SIGNED ATTESTATION-----\n" prefix check intact.
+  // Owner 2026-09-13, GH #3854: the comment rendered half as prose and half as a
+  // preformatted block; owner chose "No preformatted part". The whole attestation
+  // renders as ordinary Markdown, one visible line per armor line:
+  // - The BEGIN line and each locator header are their own paragraph (blank line
+  //   after), so each header line stays byte-identical. That keeps the retry
+  //   lookup below (`\nIdentity: <id>\n`, `^Statement: <url>$`) and the callers'
+  //   "-----BEGIN ROUTE66 SIGNED ATTESTATION-----\n" prefix check intact.
+  // - The manifest and signature lines form one paragraph joined by GFM hard
+  //   breaks (trailing backslash), with Markdown-active characters
+  //   backslash-escaped, so the RENDERED text is exactly the signed manifest
+  //   bytes. The signature is verified against the versioned sidecar in S3,
+  //   never against this comment body.
+  const signedLines = (result.manifest + "-----BEGIN ROUTE66 SIGNATURE-----\n" +
+    result.signature_b64 + "\n-----END ROUTE66 SIGNATURE-----").split("\n").map(markdownLiteral);
   return ["-----BEGIN ROUTE66 SIGNED ATTESTATION-----", "", "Algorithm: Ed25519", "",
     // Explicit autolinks preserve trailing '_' in S3 VersionIds. GitHub's bare
     // URL autolinker removed it from the actual #3767 proof, producing HTTP403.
     `Identity: ${identity}`, "", `Evidence: <${result.url}>`, "", `Statement: <${result.attestation_url}>`, "",
-    `Key-ID: ${result.key_id}`, "", "```text", result.manifest + "-----BEGIN ROUTE66 SIGNATURE-----",
-    result.signature_b64, "-----END ROUTE66 SIGNATURE-----",
-    "```", "", "-----END ROUTE66 SIGNED ATTESTATION-----"].join("\n");
+    `Key-ID: ${result.key_id}`, "", signedLines.join("\\\n"), "",
+    "-----END ROUTE66 SIGNED ATTESTATION-----"].join("\n");
+}
+
+// GFM inline-active characters in signed text (S3 keys carry '_', CI error text
+// can carry '<' or '|') are backslash-escaped so they render literally.
+function markdownLiteral(line) {
+  return line.replace(/[\\`*_\[\]<>&|~]/g, (c) => "\\" + c);
 }
 
 // A retry of the same immutable object version/target reuses its already posted
@@ -1844,8 +1856,9 @@ async function postAttestation(target, result) {
   // Presentation is part of retry identity: earlier encoded comments remain
   // verifiable history, but a new invocation must publish the owner's readable
   // format rather than silently returning the superseded encoded presentation.
-  // cleartext-v2: the blank-line-separated layout above. Bumping the tag gives a
-  // new invocation its own receipt in the new layout; v1 comments stay history.
+  // cleartext-v2: the no-preformatted layout above (GH #3854). Bumping the tag
+  // gives a new invocation its own receipt in the new layout; v1 comments stay
+  // history.
   const identity = bytesSha256(Buffer.from(JSON.stringify(["cleartext-v2", result.object.bucket, result.object.key,
     result.object.version_id, result.observed["ci.env"] || "", result.observed["ci.target-sha"] || ""]), "utf8"));
   for (let page = 1; page <= 10; page++) {
