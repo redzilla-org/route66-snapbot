@@ -205,15 +205,17 @@ def package(sess=None):
     username, password = base64.b64decode(auth["authorizationToken"]).decode("utf-8").split(":", 1)
     subprocess.run(["docker", "login", "--username", username, "--password-stdin", registry],
                    input=password, text=True, check=True, timeout=60)
-    subprocess.run(["docker", "build", "--platform", "linux/amd64", "-t", image, "."],
+    # --pull (GH #3840, first command-center deploy 2026-09-13): under Docker's
+    # containerd image store a cached base image can be present as an unpacked
+    # snapshot while its compressed layer blob is gone. The build succeeds from
+    # the snapshot and the push then fails "NotFound: content digest
+    # sha256:5ca8fe44... not found" on that base layer. Re-pulling the bases on
+    # every build restores the blobs the push must upload.
+    subprocess.run(["docker", "build", "--pull", "--platform", "linux/amd64", "-t", image, "."],
                    cwd=ROOT, check=True, timeout=3600)
-    # --platform on the PUSH as well (GH #3840, first command-center deploy
-    # 2026-09-13): with Docker's containerd image store the locally tagged image
-    # is an index inheriting the multi-platform Lambda base, whose non-amd64
-    # children were never pulled. A bare push walks the whole index and fails
-    # "NotFound: content digest ... not found" after a successful build. Pushing
-    # the one platform built also gives Lambda a single-platform manifest.
-    subprocess.run(["docker", "push", "--platform", "linux/amd64", image], cwd=ROOT, check=True, timeout=1800)
+    # Plain push. `--platform linux/amd64` was tried the same day and refused:
+    # the legacy builder's image carries no platform descriptor to select.
+    subprocess.run(["docker", "push", image], cwd=ROOT, check=True, timeout=1800)
     print("packaged snapbot image %s" % image)
     return image
 
