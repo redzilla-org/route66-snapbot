@@ -188,6 +188,94 @@ def ensure_devops_bucket(sess):
     print("devops bucket OK: %s" % DEVOPS_BUCKET)
 
 
+def _registry_get(url, token, accept=None):
+    """GET against public.ecr.aws, following blob redirects WITHOUT the bearer
+    header (the redirect target is a presigned URL that rejects extra auth)."""
+    import urllib.request
+    import urllib.error
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **k):
+            return None
+
+    headers = {"Authorization": "Bearer " + token}
+    if accept:
+        headers["Accept"] = accept
+    opener = urllib.request.build_opener(NoRedirect)
+    try:
+        return opener.open(urllib.request.Request(url, headers=headers), timeout=120)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (301, 302, 303, 307, 308):
+            return urllib.request.urlopen(exc.headers["Location"], timeout=300)
+        raise
+
+
+def seed_base_layers(ecr):
+    """Copy the runtime base image's amd64 layer blobs registry-to-registry into
+    our ECR repo before `docker push`.
+
+    WHY (GH #3840 / #3731, first command-center deploy 2026-09-13): Docker
+    Desktop's containerd image store keeps the base image's UNPACKED snapshots
+    but had garbage-collected its COMPRESSED layer blobs. The build succeeds from
+    the snapshots; the push then dies "NotFound: content digest sha256:... not
+    found" on a public.ecr.aws/lambda/nodejs:22 layer (5ca8fe44, 8e2ed86f,
+    c41802d2 in successive attempts). `docker build --pull`, `docker pull
+    --platform linux/amd64`, and untag+re-pull all report the digest present
+    and fetch nothing, because the snapshots satisfy the pull; clearing them
+    would mean discarding the Tesseract/Rust build cache. Pushing a blob the
+    registry already holds is skipped by docker ("Layer already exists"), so
+    placing the base blobs in ECR first makes the push independent of the local
+    content store. Digests are verified by ECR on complete_layer_upload.
+    """
+    import hashlib
+    import urllib.request
+
+    m = [ln.split()[1] for ln in read_text(os.path.join(ROOT, "Dockerfile")).splitlines()
+         if ln.startswith("FROM ")][-1]
+    repo_tag = m.split("public.ecr.aws/", 1)
+    if len(repo_tag) != 2 or "@" in repo_tag[1]:
+        sys.exit("REFUSING: runtime base %s is not a tag-form public.ecr.aws reference" % m)
+    repo, tag = repo_tag[1].rsplit(":", 1)
+    token = json.load(urllib.request.urlopen(
+        "https://public.ecr.aws/token/?service=public.ecr.aws&scope=repository:%s:pull" % repo, timeout=60))["token"]
+    base = "https://public.ecr.aws/v2/%s" % repo
+    accept = ("application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,"
+              "application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json")
+    doc = json.load(_registry_get("%s/manifests/%s" % (base, tag), token, accept))
+    if "manifests" in doc:
+        amd64 = [d for d in doc["manifests"]
+                 if d.get("platform", {}).get("os") == "linux" and d.get("platform", {}).get("architecture") == "amd64"]
+        doc = json.load(_registry_get("%s/manifests/%s" % (base, amd64[0]["digest"]), token, accept))
+    digests = [layer["digest"] for layer in doc["layers"]]
+    have = ecr.batch_check_layer_availability(repositoryName=ECR_REPOSITORY, layerDigests=digests)
+    missing = [l["layerDigest"] for l in have["layers"] if l["layerAvailability"] != "AVAILABLE"]
+    missing += [f["layerDigest"] for f in have.get("failures", [])]
+    print("base %s amd64: %d layers, %d to seed into ECR" % (m, len(digests), len(missing)), flush=True)
+    chunk = 20 * 1024 * 1024
+    for digest in missing:
+        upload_id = ecr.initiate_layer_upload(repositoryName=ECR_REPOSITORY)["uploadId"]
+        body = _registry_get("%s/blobs/%s" % (base, digest), token)
+        sha, offset = hashlib.sha256(), 0
+        while True:
+            buf = body.read(chunk)
+            if not buf:
+                break
+            # read() may return short on a socket; fill the part to a full chunk.
+            while len(buf) < chunk:
+                more = body.read(chunk - len(buf))
+                if not more:
+                    break
+                buf += more
+            sha.update(buf)
+            ecr.upload_layer_part(repositoryName=ECR_REPOSITORY, uploadId=upload_id,
+                                  partFirstByte=offset, partLastByte=offset + len(buf) - 1, layerPartBlob=buf)
+            offset += len(buf)
+        if "sha256:" + sha.hexdigest() != digest:
+            sys.exit("REFUSING: downloaded blob digest mismatch for %s" % digest)
+        ecr.complete_layer_upload(repositoryName=ECR_REPOSITORY, uploadId=upload_id, layerDigests=[digest])
+        print("seeded %s (%d bytes)" % (digest, offset), flush=True)
+
+
 def package(sess=None):
     """Build and push the exact checkout as an immutable ECR image."""
     sess = sess or session()
@@ -213,6 +301,7 @@ def package(sess=None):
     # every build restores the blobs the push must upload.
     subprocess.run(["docker", "build", "--pull", "--platform", "linux/amd64", "-t", image, "."],
                    cwd=ROOT, check=True, timeout=3600)
+    seed_base_layers(sess.client("ecr"))
     # Plain push. `--platform linux/amd64` was tried the same day and refused:
     # the legacy builder's image carries no platform descriptor to select.
     subprocess.run(["docker", "push", image], cwd=ROOT, check=True, timeout=1800)
