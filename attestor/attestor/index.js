@@ -14,11 +14,11 @@
 //   * the S3 object it fetched: bucket, key, VersionId, its own sha256 of the
 //     bytes, Content-Length, Content-Type, Last-Modified, ETag;
 //   * the DEV CI state it read from the env's ci-orchestrator Step Function
-//     (when the caller names an env + target sha), captured AS FOUND: the newest
-//     execution at target_sha -- its sha, status, finalizer mode/exitCode, and the derived
+//     (when the caller names an env + target sha), captured AS FOUND: latest
+//     execution's sha, status, finalizer mode/exitCode, and the derived
 //     sha_match / true_green booleans. The attestor NEVER refuses on CI state
 //     (owner 2026-08-26: "never refuse, only capture!"); a RUNNING execution,
-//     no execution at target_sha, a red run or an unreachable account are all captured as
+//     a newer sha, a red run or an unreachable account are all captured as
 //     fields and signed as observed;
 //   * for screenshots it captured itself: requested/final URL, HTTP status,
 //     viewport, cookie fingerprint/count, and every PERTURBATION it applied to
@@ -255,8 +255,7 @@ async function privateKey() {
 
 // ---------------------------------------------------------------------------
 // DEV CI capture. Reads the env's ci-orchestrator through the narrow
-// cross-account role and reports the NEWEST execution at target_sha exactly as
-// found (GH #3840: never the newest execution overall).
+// cross-account role and reports the LATEST execution exactly as found.
 // Never throws on CI state; an unreachable account or malformed history is
 // itself captured as ci.error so the signature covers "could not read CI".
 // ---------------------------------------------------------------------------
@@ -334,55 +333,15 @@ async function captureDevCI(envName, targetSHA) {
   try {
     const { env, client } = await devSfnClient(envName);
     const stateMachineArn = "arn:aws:states:" + env.region + ":" + env.account + ":stateMachine:" + envName + "-ci-orchestrator";
-    // GH #3840 / #3731: select the NEWEST execution whose input sha equals
-    // targetSHA, not the newest execution overall. The old maxResults:1 read
-    // judged whatever ran last, so once main moved past targetSHA a true-green
-    // run AT targetSHA was signed ci.true-green=false. Live incident
-    // 2026-09-13T00:18:17Z: chicago-dev execution 1f34a761-... at eb894bba8 was
-    // TRUE GREEN, but the newest chicago-dev execution was a failed 22:20Z
-    // launch at 81214a11a, and the false verdict blocked chicago-prod #3731.
-    //
-    // ListExecutions does not return the input, so each candidate is
-    // DescribeExecution'd in newest-first order and the walk stops at the first
-    // sha match. BOUND: at most CI_LIST_PAGE_CAP (4) pages of
-    // CI_LIST_PAGE_SIZE (50) = 200 executions examined; each describe is a
-    // small read, so the worst case stays well inside the 180s Lambda timeout.
-    // A target older than 200 executions is signed as "not found", not guessed.
-    const CI_LIST_PAGE_SIZE = 50;
-    const CI_LIST_PAGE_CAP = 4;
-    let ex = null;
-    let described = null;
-    let examined = 0;
-    let nextToken = undefined;
-    for (let pageNo = 0; pageNo < CI_LIST_PAGE_CAP && !ex; pageNo++) {
-      const listed = await client.send(new ListExecutionsCommand({
-        stateMachineArn, maxResults: CI_LIST_PAGE_SIZE, nextToken,
-      }));
-      for (const cand of listed.executions || []) {
-        if (!cand.executionArn) continue;
-        examined++;
-        const d = await client.send(new DescribeExecutionCommand({ executionArn: cand.executionArn }));
-        if (executionInputSHA(d.input) === targetSHA) {
-          ex = cand;
-          described = d;
-          break;
-        }
-      }
-      if (!listed.nextToken) break;
-      nextToken = listed.nextToken;
-    }
-    // The walk is now a variable-length step (1 to 200 describes), so it
-    // names itself with its elapsed ms and how far it went; a slow CI read
-    // shows up in CloudWatch instead of hiding inside the capture.
-    phase("ci-select", "env=" + envName + " examined=" + examined + " found=" + !!ex);
-    // No execution at targetSHA is itself a fact worth signing: true-green is
-    // false and ci.error says why, exactly as a failed CI read is signed.
-    if (!ex) {
-      ci["ci.error"] = "no execution with input sha " + targetSHA + " among the newest " +
-        examined + " executions of " + stateMachineArn;
-      ci["ci.true-green"] = "false";
+    // Newest first; the FIRST execution is the one that defines DEV right now,
+    // whatever its state. That is the fact worth signing.
+    const listed = await client.send(new ListExecutionsCommand({ stateMachineArn, maxResults: 1 }));
+    const ex = (listed.executions || [])[0];
+    if (!ex || !ex.executionArn) {
+      ci["ci.error"] = "no execution found for " + stateMachineArn;
       return ci;
     }
+    const described = await client.send(new DescribeExecutionCommand({ executionArn: ex.executionArn }));
     const executedSHA = executionInputSHA(described.input);
     ci["ci.execution-arn"] = ex.executionArn;
     ci["ci.executed-sha"] = executedSHA;
