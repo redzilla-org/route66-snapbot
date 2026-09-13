@@ -7,11 +7,13 @@ history-filtered from `route66/command-center/evidence-attestor` and merged.
 
 ## Invocation contract
 
-The deployed function is `CommandCenterSnapbot-app`. Attestation actions retain
-the existing `r66-evidence-attestation-v3` canonicalization, versioned sidecar
-layout, `?versionId=` locators, signing key, and mandatory GitHub publication.
-Existing statements therefore continue to verify against the committed public
-keys in route66.
+The deployed function is `CommandCenterSnapbot-app`. Attestation actions sign
+the `r66-evidence-attestation-v4` canonicalization, with the versioned sidecar
+layout, `?versionId=` locators, signing key, and mandatory GitHub publication
+unchanged. v4 dropped the derived `ci.sha-match` and `ci.true-green` fields
+(GH #3840, owner 2026-09-13: "snapbot does not judge, it only snaps."); the CI
+block records raw state and the reader decides greenness. Existing v3
+statements continue to verify against the committed public keys in route66.
 
 OCR uses the same Lambda Invoke API:
 

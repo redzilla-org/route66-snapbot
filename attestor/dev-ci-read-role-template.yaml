@@ -64,7 +64,7 @@ Resources:
                 Resource: !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${EnvironmentName}-ci-orchestrator"
               # DescribeExecution and GetExecutionHistory are execution scoped.
               # The finalizer scheduled payload in history carries mode and
-              # exitCode, which are required for true-green.
+              # exitCode, recorded raw in the signed CI snapshot (no verdict).
               - Effect: Allow
                 Action:
                   - states:DescribeExecution

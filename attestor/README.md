@@ -11,21 +11,41 @@ key should be hard-coded (not Lambda env)"). `deploy.py` reads that constant,
 unwraps the SSM value and refuses to deploy unless the seed derives to the
 committed public key.
 
-## What the attestor signs (canonicalization v3)
+## What the attestor signs (canonicalization v4)
 
 Only what it retrieved itself (owner 2026-08-26: "the attestor should only
-sign what it retrieves. It is independent of cloud-compose"):
+sign what it retrieves. It is independent of cloud-compose"). Snapbot snaps
+and never judges (owner 2026-09-13: "snapbot does not judge, it only snaps.";
+"Record only. The next step can check if a non-latest id is green"):
 
 - the S3 object: bucket, key, VersionId, its own sha256 of the bytes,
   Content-Length, Content-Type, Last-Modified, ETag, attested-at;
 - `observed.ci.*` when the caller names `ci: {env, target_sha}`: the LATEST
-  `<env>-ci-orchestrator` execution as found -- executed sha, status,
-  finalizer mode, worker exit code, `sha-match`, `true-green`, or `ci.error`
-  when the account was unreachable. It never refuses (owner 2026-08-26:
+  `<env>-ci-orchestrator` execution as found, raw fields only:
+
+  | field | source |
+  | --- | --- |
+  | `ci.env` | caller |
+  | `ci.target-sha` | caller's claim, recorded as given |
+  | `ci.checked-at-utc` | attestor clock at the read |
+  | `ci.execution-arn` | ListExecutions, newest |
+  | `ci.executed-sha` | DescribeExecution input `sha` |
+  | `ci.sfn-status` | DescribeExecution status |
+  | `ci.start-date`, `ci.stop-date` | DescribeExecution |
+  | `ci.finalizer-mode`, `ci.worker-exit-code` | execution history, finalizer input |
+  | `ci.error` | present when a read failed |
+
+  No field compares one value with another: whether `executed-sha` equals
+  `target-sha` or the execution is green is the reader's decision, made on
+  the execution id it cares about. It never refuses (owner 2026-08-26:
   "never refuse, only capture!"); a RUNNING run or a newer sha is a signed
-  fact, and the reader decides what it proves;
+  fact;
 - `observed.capture.*` for screenshots the Lambda took itself: requested and
   final URL, HTTP status, viewport, cookie fingerprint and count.
+
+Version history: v3 statements (signed before GH #3840) also carried the
+derived `ci.sha-match` and `ci.true-green`. They keep their v3 line and still
+verify; route66's verifiers rebuild each version's manifest exactly.
 
 Caller-supplied S3 user metadata is informational and unsigned. The object is
 never rewritten; the signed statement is written beside it as
@@ -52,7 +72,7 @@ recorded. Response: the statement (`object`, `observed`, `manifest`,
 ## Direct publication (#3767)
 
 Every action requires `github.issue` and `github.token`. The Lambda signs, wraps
-the existing canonical v3 manifest in readable `ROUTE66 SIGNED ATTESTATION` armor, and posts that
+the canonical manifest in readable `ROUTE66 SIGNED ATTESTATION` armor, and posts that
 exact body to the issue/PR before returning `github_posted=true`, `comment_url`
 and identical `evidence_text`. The credential is removed before capture and
 never enters artifacts, logs, signatures, configuration or the response. Clients

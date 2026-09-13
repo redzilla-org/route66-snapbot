@@ -15,11 +15,16 @@
 //     bytes, Content-Length, Content-Type, Last-Modified, ETag;
 //   * the DEV CI state it read from the env's ci-orchestrator Step Function
 //     (when the caller names an env + target sha), captured AS FOUND: latest
-//     execution's sha, status, finalizer mode/exitCode, and the derived
-//     sha_match / true_green booleans. The attestor NEVER refuses on CI state
-//     (owner 2026-08-26: "never refuse, only capture!"); a RUNNING execution,
-//     a newer sha, a red run or an unreachable account are all captured as
-//     fields and signed as observed;
+//     execution's arn, executed sha, status, start/stop dates, finalizer
+//     mode/exitCode, plus the caller's target sha recorded as its claim. NO
+//     DERIVED FIELD: owner 2026-09-13, verbatim, "snapbot does not judge, it
+//     only snaps." The sha_match / true_green booleans this block used to sign
+//     were comparisons, not observations, and are gone since canonicalization
+//     v4; judging belongs to the NEXT step, the reader (owner 2026-09-13:
+//     "Record only. The next step can check if a non-latest id is green").
+//     The attestor NEVER refuses on CI state (owner 2026-08-26: "never refuse,
+//     only capture!"); a RUNNING execution, a newer sha, a red run or an
+//     unreachable account are all captured as fields and signed as observed;
 //   * for screenshots it captured itself: requested/final URL, HTTP status,
 //     viewport, cookie fingerprint/count, and every PERTURBATION it applied to
 //     the page — aborted subresource patterns and clicked selectors — because an
@@ -36,7 +41,7 @@
 // and will not be created. Every fact it wanted is already in the operator's local
 // checkout, so `cloud-compose attest code` (cloud-compose/subcmd/attest.go) reads
 // it from git, signs with the workstation's local-verify Ed25519 key, and writes
-// the SAME canonicalization-v3 statement this file writes. One implementation of
+// the SAME canonicalization-v3 statement this file wrote at the time. One implementation of
 // that evidence type, never two.
 // Caller-supplied S3 user metadata is NOT part of the manifest. It stays on
 // the object as informational labels and the signature says nothing about it.
@@ -84,7 +89,15 @@ const {
 // bumping public-key.json, and redeploying in one change.
 const UNWRAP_KEY_B64 = "o0nZu1JyR60uvbITWZggDAefj+4EGDyzbisahMYXId8=";
 
-const CANONICALIZATION = "r66-evidence-attestation-v3";
+// v4 since GH #3840 (owner 2026-09-13, "snapbot does not judge, it only
+// snaps."): the manifest's field set lost the derived observed.ci.true-green
+// and observed.ci.sha-match lines, and a changed field set is a changed
+// canonical manifest, so the version line moves with it. Statements already
+// signed under v3 keep their v3 line and still verify: route66's verifiers
+// (cloud-compose attestation-check, scripts/cicd/verify_evidence_attestation.py)
+// accept both versions and rebuild each one exactly as it was signed.
+const CANONICALIZATION = "r66-evidence-attestation-v4";
+const STATEMENT_VERSION = 4;
 
 function requiredEnv(name) {
   const v = process.env[name];
@@ -180,7 +193,7 @@ function publicURL(bucket, key, versionId) {
 }
 
 // ---------------------------------------------------------------------------
-// Canonical manifest v3. One line per observed fact, keys sorted within the
+// Canonical manifest v4. One line per observed fact, keys sorted within the
 // observed.* block; values are single-line ASCII (newlines would let one field
 // forge another). scripts/cicd/verify_evidence_attestation.py rebuilds this
 // text byte for byte from the sidecar's fields and the object it fetches.
@@ -348,7 +361,9 @@ async function captureDevCI(envName, targetSHA) {
     ci["ci.sfn-status"] = String(described.status || "");
     ci["ci.start-date"] = described.startDate ? described.startDate.toISOString() : "";
     ci["ci.stop-date"] = described.stopDate ? described.stopDate.toISOString() : "";
-    ci["ci.sha-match"] = String(executedSHA === targetSHA);
+    // No ci.sha-match here (removed in v4, GH #3840): whether the executed sha
+    // equals the caller's claimed target-sha is a comparison a reader makes from
+    // the two raw fields above, not a fact read from AWS.
     let finalizer = null;
     try {
       finalizer = await readFinalizerInput(client, ex.executionArn);
@@ -357,14 +372,14 @@ async function captureDevCI(envName, targetSHA) {
     }
     ci["ci.finalizer-mode"] = finalizer ? finalizer.mode : "";
     ci["ci.worker-exit-code"] = finalizer && Number.isFinite(finalizer.exitCode) ? String(finalizer.exitCode) : "";
-    ci["ci.true-green"] = String(
-      executedSHA === targetSHA &&
-      described.status === "SUCCEEDED" &&
-      !!finalizer && finalizer.mode === "success" && finalizer.exitCode === 0
-    );
+    // No ci.true-green (removed in v4, GH #3840). Owner 2026-09-13: "snapbot
+    // does not judge, it only snaps." The raw sfn-status, finalizer-mode and
+    // worker-exit-code above are what was observed; deciding greenness is the
+    // reader's job, against whichever execution id the reader cares about
+    // (owner: "The next step can check if a non-latest id is green").
   } catch (err) {
+    // A failed read is itself the snapshot: ci.error alone, no verdict field.
     ci["ci.error"] = String(err && err.message ? err.message : err);
-    ci["ci.true-green"] = "false";
   }
   return ci;
 }
@@ -459,13 +474,19 @@ const TICKET_FACTS = [
   // No code.* rows: this Lambda no longer produces evidence-type:code (see the
   // file header). `cloud-compose attest code` writes those statements and renders
   // its own output.
+  // Raw CI snapshot rows only (v4, GH #3840: "snapbot does not judge, it only
+  // snaps."). The execution arn names WHICH run was the newest, so a reader can
+  // judge that exact id; the finalizer pair and sfn-status are the raw inputs a
+  // reader's own green check consumes.
+  "ci.execution-arn",
   "ci.executed-sha",
-  "ci.true-green",
-  // A green verdict decays: it names one build, read at one instant. Without the
+  "ci.target-sha",
+  // A snapshot decays: it names one build, read at one instant. Without the
   // clock and the status a reader cannot tell a run that succeeded an hour ago from
   // one that succeeded in March against a sha main has long since passed.
-  "ci.sha-match",
   "ci.sfn-status",
+  "ci.finalizer-mode",
+  "ci.worker-exit-code",
   "ci.checked-at-utc",
   "ci.error",
 ];
@@ -501,7 +522,7 @@ const RESULT_TEXT_CAP_BYTES = 64 * 1024;
 // reparsed doc would render identical-looking text that hashes differently.
 //
 // RENDERING ONLY: the signed statement and its canonicalization
-// (r66-evidence-attestation-v3) are untouched by this section.
+// (r66-evidence-attestation-v4) are untouched by this section.
 function renderResultSection(objectBodyText, url) {
   const lines = [];
   const buf = Buffer.from(objectBodyText, "utf8");
@@ -640,7 +661,9 @@ async function attest(key, versionId, observed, objectBodyText) {
   const keyObj = await privateKey();
   const signature = crypto.sign(null, Buffer.from(manifest, "utf8"), keyObj).toString("base64");
   const statement = {
-    v: 3,
+    // Tracks the canonicalization line (v4 since GH #3840) so a verifier can
+    // pick the matching manifest rebuild from either field.
+    v: STATEMENT_VERSION,
     canonicalization: CANONICALIZATION,
     algorithm: PUBLIC_KEY.algorithm,
     key_id: PUBLIC_KEY.key_id,
@@ -684,27 +707,30 @@ async function attestExistingObject(event) {
 }
 
 // ---------------------------------------------------------------------------
-// CI verdict attestation.
+// CI snapshot attestation (action name "attest-ci-verdict" kept for callers).
 //
 // WHY THIS ACTION EXISTS: captureDevCI has only ever ridden along on some OTHER
 // artifact -- a screenshot, an AWS resource dump. But a whole class of tickets
-// (the evidence-type:ci-report set) has no artifact at all: the claim being
-// closed IS "dev CI ran this sha and came back true green". Before this action
-// that claim could only be evidenced by capturing an unrelated screenshot for
-// its CI ride-along fields, which puts an irrelevant picture in the ticket and
-// makes the actual evidence a footnote of it. Here the CI read is the artifact.
+// (the evidence-type:ci-report set) has no artifact at all: the thing recorded
+// IS the dev CI state. Owner 2026-09-13: "snapbot should attest the state of the
+// CI environment when it is asked to do so (start and end of a test run)" and
+// "snapbot does not judge, it only snaps." Before this action that state could
+// only be recorded by capturing an unrelated screenshot for its CI ride-along
+// fields, which puts an irrelevant picture in the ticket and makes the actual
+// evidence a footnote of it. Here the CI read is the artifact, and whether it
+// is green is decided by the reader, never here.
 //
-// The verdict is written to S3 FIRST and attested SECOND, because `attest`
+// The snapshot is written to S3 FIRST and attested SECOND, because `attest`
 // re-fetches and hashes the stored bytes; nothing in this Lambda signs bytes
 // that exist only in memory.
 //
-// WHY THE SHA AND THE CLOCK ARE MANDATORY IN THE SIGNED DOCUMENT: "true-green"
-// alone is a claim about an unnamed build at an unnamed time, and it is a claim
-// that DECAYS -- the instant main moves, a green recorded here describes a build
-// nobody is running any more. ci.executed-sha names which build, and
-// ci.checked-at-utc names when the state was read; both come from captureDevCI
-// and are asserted below so a future refactor of that function cannot silently
-// drop them and leave an undated verdict signed as if it were current.
+// WHY THE SHA AND THE CLOCK ARE MANDATORY IN THE SIGNED DOCUMENT: a CI state is
+// a fact about one build at one instant, and it DECAYS -- the instant main
+// moves, a snapshot recorded here describes a build nobody is running any more.
+// ci.executed-sha names which build, and ci.checked-at-utc names when the state
+// was read; both come from captureDevCI and are asserted below so a future
+// refactor of that function cannot silently drop them and leave an undated
+// snapshot signed as if it were current.
 // ---------------------------------------------------------------------------
 async function attestCIVerdict(event) {
   const issue = metadataValue(event.issue ?? event.issue_number ?? "unknown", 64);
@@ -716,7 +742,7 @@ async function attestCIVerdict(event) {
   const ci = await captureDevCI(envName, targetSHA);
   // captureDevCI never throws (an unreachable account is captured as ci.error),
   // so ci.executed-sha may legitimately be absent on a failed read. What must
-  // never be absent is the clock: a verdict with no timestamp cannot be aged.
+  // never be absent is the clock: a snapshot with no timestamp cannot be aged.
   if (!ci["ci.checked-at-utc"]) throw new Error("CI capture produced no ci.checked-at-utc");
   if (ci["ci.executed-sha"] === undefined) ci["ci.executed-sha"] = "";
 
@@ -726,7 +752,7 @@ async function attestCIVerdict(event) {
   const key = envName + "/issue-evidence/issue-" + safeSegment(issue) + "/" + uuid + "/" +
     stamp + "-" + safeSegment(envName) + "-ci-verdict.json";
   // The stored object is the ci.* map exactly as it will be signed, so the
-  // evidence object and the manifest cannot disagree about the verdict.
+  // evidence object and the manifest cannot disagree about the snapshot.
   const doc = {
     v: 1,
     evidence_type: "ci-verdict",
@@ -1495,7 +1521,7 @@ async function captureHTTPRaw(event) {
   // target_sha is OPTIONAL here, matching attest-aws-resource rather than the
   // screenshot action: an http-raw capture is often taken against a URL that is
   // not tied to a build under test at all (a CDN edge, a third-party endpoint).
-  // When it IS given, the CI verdict rides along exactly as it does elsewhere.
+  // When it IS given, the CI snapshot rides along exactly as it does elsewhere.
   const targetSHA = metadataValue(event.target_sha ?? event.targetSHA, 80);
   const requestedURL = metadataValue(event.url, 2048);
   if (!envName) throw new Error("capture-http-raw requires env");
@@ -1791,7 +1817,7 @@ async function githubJSON(target, method, suffix, body) {
 }
 
 // #3767 owner correction: evidence is readable plaintext, never encoded JSON.
-// The clear-signed section is EXACTLY the existing v3 manifest bytes; only the
+// The clear-signed section is EXACTLY the canonical manifest bytes; only the
 // 64-byte Ed25519 signature is Base64. Locator headers are outside that section,
 // and the verifier binds their artifact to the signed bucket/key/version/hash.
 function armoredAttestation(result, identity) {
