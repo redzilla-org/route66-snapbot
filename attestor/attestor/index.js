@@ -99,6 +99,33 @@ const UNWRAP_KEY_B64 = "o0nZu1JyR60uvbITWZggDAefj+4EGDyzbisahMYXId8=";
 const CANONICALIZATION = "r66-evidence-attestation-v4";
 const STATEMENT_VERSION = 4;
 
+// WHY THIS GRAMMAR IS SECURITY-LOAD-BEARING (GH #3822): the evidence bucket
+// accepts writes from every account in the organization, while
+// attest-run-manifest intentionally skips GitHub publication. Restrict that
+// exception to the one durable web-regression run namespace; a suffix-only
+// check would let any organization principal place arbitrary bytes elsewhere
+// in the bucket and ask this Lambda to sign them as a run manifest.
+const RUN_MANIFEST_KEY_RE = /^(california-prod|california-dev|chicago-prod|chicago-dev|local-test)\/([0-9a-f]{40})\/(\d{8}T\d{6}Z)\/manifest\.json$/;
+
+function requireRunManifestKey(key) {
+  const match = RUN_MANIFEST_KEY_RE.exec(key);
+  if (!match) {
+    throw new Error(
+      "attest-run-manifest key must be <env>/<40-lowercase-hex-sha>/<YYYYMMDDTHHMMSSZ>/manifest.json"
+    );
+  }
+  // WHY: the shape alone admits impossible clock values such as month 99,
+  // which are not prefixes the run publisher can mint. Round-tripping through
+  // Date keeps the signing exemption equal to the publisher's UTC clock format.
+  const stamp = match[3];
+  const iso = stamp.slice(0, 4) + "-" + stamp.slice(4, 6) + "-" + stamp.slice(6, 8) +
+    "T" + stamp.slice(9, 11) + ":" + stamp.slice(11, 13) + ":" + stamp.slice(13, 15) + "Z";
+  const parsed = new Date(iso);
+  if (Number.isNaN(parsed.getTime()) || parsed.toISOString() !== iso.replace("Z", ".000Z")) {
+    throw new Error("attest-run-manifest key contains an invalid UTC run timestamp");
+  }
+}
+
 function requiredEnv(name) {
   const v = process.env[name];
   if (!v) throw new Error("missing required environment variable " + name);
@@ -2079,9 +2106,7 @@ exports.handler = async (event) => {
   if (event && event.action === "attest-run-manifest") {
     const key = typeof event.key === "string" ? event.key : "";
     const versionID = typeof event.version_id === "string" ? event.version_id.trim() : "";
-    if (!key.endsWith("/manifest.json")) {
-      throw new Error("attest-run-manifest requires a run-prefix manifest.json key");
-    }
+    requireRunManifestKey(key);
     if (!versionID) {
       throw new Error("attest-run-manifest requires the manifest object's VersionId");
     }
