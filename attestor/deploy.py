@@ -207,7 +207,13 @@ def package(sess=None):
                    input=password, text=True, check=True, timeout=60)
     subprocess.run(["docker", "build", "--platform", "linux/amd64", "-t", image, "."],
                    cwd=ROOT, check=True, timeout=3600)
-    subprocess.run(["docker", "push", image], cwd=ROOT, check=True, timeout=1800)
+    # --platform on the PUSH as well (GH #3840, first command-center deploy
+    # 2026-09-13): with Docker's containerd image store the locally tagged image
+    # is an index inheriting the multi-platform Lambda base, whose non-amd64
+    # children were never pulled. A bare push walks the whole index and fails
+    # "NotFound: content digest ... not found" after a successful build. Pushing
+    # the one platform built also gives Lambda a single-platform manifest.
+    subprocess.run(["docker", "push", "--platform", "linux/amd64", image], cwd=ROOT, check=True, timeout=1800)
     print("packaged snapbot image %s" % image)
     return image
 
