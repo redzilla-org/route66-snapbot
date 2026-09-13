@@ -6,6 +6,7 @@ but the CI source of truth lives in each DEV account's Step Functions execution
 history. This script installs the narrow cross-account role in california-dev and
 chicago-dev so the command-center Lambda can verify target commits itself.
 """
+import os
 import sys
 import time
 from pathlib import Path
@@ -13,7 +14,12 @@ from pathlib import Path
 import boto3
 import botocore
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+# The env table lives in the route66 checkout, a SIBLING of this repository.
+# parents[2] was right only while this file sat at route66/command-center/
+# evidence-attestor/; from route66-snapbot/attestor/ it resolves to the parent
+# of both checkouts (GH #3840). Same resolution as deploy.py, same override.
+ROUTE66_ROOT = os.environ.get("R66_ROUTE66_ROOT") or str(Path(__file__).resolve().parents[2] / "route66")
+sys.path.insert(0, ROUTE66_ROOT)
 from scripts.lib.r66 import account_id, all_env_names, aws_profile, is_prod, region  # noqa: E402
 
 HERE = Path(__file__).resolve().parent

@@ -31,17 +31,27 @@ Resources:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
-          # Trust only the command-center attestor stack's generated Lambda role.
+          # Trust only the command-center signer stacks' generated Lambda roles.
           # The wildcard is limited to the known stack/resource-name prefix so a
           # random command-center role cannot assume this by merely sharing the
           # same account.
+          #
+          # TWO PREFIXES, TEMPORARILY (GH #3840): the signer moved from stack
+          # CommandCenterEvidenceAttestor to CommandCenterSnapbot, whose role is
+          # CommandCenterSnapbot-EvidenceAttestorRole-*. Without that prefix every
+          # snapbot statement signs ci.error instead of the CI verdict. The old
+          # prefix stays until CommandCenterEvidenceAttestor is deleted, because
+          # already-compiled route66 binaries still sign through it; drop it in
+          # the same change that burns that stack.
           - Effect: Allow
             Principal:
               AWS: !Sub "arn:aws:iam::${CommandCenterAccountId}:root"
             Action: sts:AssumeRole
             Condition:
               ArnLike:
-                aws:PrincipalArn: !Sub "arn:aws:iam::${CommandCenterAccountId}:role/CommandCenterEvidenceAttestor-EvidenceAttestorRole-*"
+                aws:PrincipalArn:
+                  - !Sub "arn:aws:iam::${CommandCenterAccountId}:role/CommandCenterSnapbot-EvidenceAttestorRole-*"
+                  - !Sub "arn:aws:iam::${CommandCenterAccountId}:role/CommandCenterEvidenceAttestor-EvidenceAttestorRole-*"
       Policies:
         - PolicyName: read-ci-orchestrator-verdict
           PolicyDocument:
