@@ -476,6 +476,9 @@ const TICKET_FACTS = [
   // row: its defect only exists while the Property Type multiselect is open.
   "capture.blocked-url-patterns",
   "capture.click-selectors",
+  // GH #3862: the ordered step script belongs with the perturbation pair for
+  // the same reason — a page reached through nine clicks is an induced state.
+  "capture.steps",
   "capture.header.x-amz-cf-id",
   "capture.body-bytes",
   "capture.header.cache-control",
@@ -888,6 +891,83 @@ function parseClickSelectors(raw) {
   });
 }
 
+// Optional ORDERED INTERACTION SCRIPT: `steps: [{click: "<selector>"},
+// {wait_ms: N}, ...]`, run in caller order where click_selectors would run.
+//
+// WHY IT EXISTS — GH #3862. The defect ("Areas: Jump To zips 92104,92102
+// survive unchecking North Park / South Park and the map picker restores them")
+// exists only at the END of a multi-page session: check two Areas, search,
+// reopen the revise panel, uncheck both, submit "pick from map", then look at
+// the landing page's Jump To box. That is two navigating clicks with page
+// transitions and a Bootstrap collapse between them, and click_selectors has no
+// way to say "let the collapse finish before the next click". A step list whose
+// entries are either a click or an explicit pause is the smallest shape that
+// can drive such a session; it is still a photograph, not a UI test, so the
+// verbs stay exactly these two.
+//
+// WHY IT IS SIGNED (capture.steps in captureWebUIScreenshot): the same rule as
+// click_selectors and block_url_patterns — an induced page state is declared
+// evidence or it is fabrication. The WAITS are signed too, because "the panel
+// was photographed 800ms after it was toggled" qualifies what the image shows.
+//
+// WHY steps AND click_selectors ARE MUTUALLY EXCLUSIVE: two lists have no
+// defined interleaving, and guessing one would photograph an order the caller
+// never asked for. click_selectors keeps working unchanged on its own.
+//
+// WHY "|" IS REFUSED INSIDE A STEP SELECTOR: capture.steps is rendered as
+// `click:<sel>|wait_ms:<n>|...` on one manifest line. JSON would put `\"`
+// escapes into the armored GitHub block for any attribute selector, and a "|"
+// inside a selector (CSS namespace or `|=`) would let one step read as two.
+// Refusing it loudly keeps the signed line unambiguous; no capture so far has
+// needed either construct.
+//
+// BOUNDS: 12 steps (GH #3862's sequence is 9 clicks plus pauses) and 5000ms
+// per pause. The per-click cost is the click_selectors loop's own bound
+// (5s find + 8s nav + 5s idle + 1.4s), so the Lambda's platform timeout stays
+// the outer ceiling for a pathological all-navigating script, and each step's
+// [phase] line names where the time went.
+const MAX_STEPS = 12;
+const MAX_STEP_WAIT_MS = 5000;
+
+function parseSteps(raw) {
+  if (raw === undefined || raw === null) return null;
+  if (!Array.isArray(raw) || raw.length === 0) {
+    throw new Error("steps must be a non-empty array of {click: selector} / {wait_ms: N} objects");
+  }
+  if (raw.length > MAX_STEPS) {
+    throw new Error("steps accepts at most " + MAX_STEPS + " entries; got " + raw.length);
+  }
+  return raw.map((step, i) => {
+    // Exactly one key per step: an object carrying both click and wait_ms has
+    // no defined order between them, the same ambiguity refused above.
+    const keys = step && typeof step === "object" && !Array.isArray(step) ? Object.keys(step) : [];
+    if (keys.length !== 1) {
+      throw new Error("steps[" + i + "] must be an object with exactly one of click, wait_ms");
+    }
+    if (keys[0] === "click") {
+      const sel = step.click;
+      if (typeof sel !== "string" || !sel.trim()) {
+        throw new Error("steps[" + i + "].click must be a non-empty CSS selector string");
+      }
+      if (sel.includes("|")) {
+        throw new Error("steps[" + i + "].click must not contain '|' (capture.steps separator)");
+      }
+      // metadataValue for the ASCII single-line manifest, as parseClickSelectors.
+      return { click: metadataValue(sel.trim(), 256) };
+    }
+    if (keys[0] === "wait_ms") {
+      const n = step.wait_ms;
+      if (!Number.isInteger(n) || n < 0 || n > MAX_STEP_WAIT_MS) {
+        throw new Error("steps[" + i + "].wait_ms must be an integer 0.." + MAX_STEP_WAIT_MS);
+      }
+      return { wait_ms: n };
+    }
+    // An unknown verb (type, hover, ...) is refused rather than skipped: a
+    // skipped step still yields a successful capture of the wrong state.
+    throw new Error("steps[" + i + "] has unsupported key " + JSON.stringify(keys[0]) + "; allowed: click, wait_ms");
+  });
+}
+
 // Walk the document top to bottom in viewport-sized steps so lazy-loaded images
 // and any IntersectionObserver-driven content below the fold actually render,
 // then return to the top. Bounded: a page that keeps growing as it is scrolled
@@ -946,6 +1026,15 @@ async function capturePNG(event) {
   // before the browser launches, so a malformed request fails without paying a
   // chromium cold start.
   const clickSelectors = parseClickSelectors(event.click_selectors);
+  // GH #3862: the ordered step script, parsed before launch for the same
+  // fail-before-cold-start reason. click_selectors is normalized into the same
+  // step shape so ONE loop below performs every interaction and the signed
+  // capture.steps line describes exactly what ran, whichever field was used.
+  const parsedSteps = parseSteps(event.steps);
+  if (parsedSteps && clickSelectors.length) {
+    throw new Error("steps and click_selectors are mutually exclusive; put the clicks inside steps");
+  }
+  const interactions = parsedSteps || clickSelectors.map((sel) => ({ click: sel }));
   const { puppeteer, chromium } = await browserLibs();
   const executablePath = await chromium.executablePath();
   const browser = await puppeteer.launch({
@@ -1101,7 +1190,15 @@ async function capturePNG(event) {
     // Per-selector bound and the 8-selector cap are unchanged in shape: 5s to
     // find the element, then at most 8s of navigation plus a 5s network-idle
     // wait plus the 400ms settle, plus a final 1s drain.
-    for (const sel of clickSelectors) {
+    for (const step of interactions) {
+      // GH #3862: a pause step. Bounded by MAX_STEP_WAIT_MS at parse time and
+      // marked so a slow script shows which pause it spent, not only its clicks.
+      if (step.wait_ms !== undefined) {
+        await new Promise((resolve) => setTimeout(resolve, step.wait_ms));
+        phase("step-wait", "wait-ms=" + step.wait_ms);
+        continue;
+      }
+      const sel = step.click;
       await page.waitForSelector(sel, { visible: true, timeout: 5000 });
       // Splits the loop's cost into three observable sub-steps. On 2026-09-05
       // the single end-of-iteration marker could not distinguish "the selector
@@ -1244,7 +1341,11 @@ async function capturePNG(event) {
       cookieFingerprint: cookieFingerprint(cookies),
       cookieCount: cookies.length,
       blockedURLPatterns: blockPatterns,
-      clickSelectors,
+      // The clicks actually performed, in order, whichever request field
+      // carried them, so capture.click-selectors stays truthful for a steps
+      // capture too; the full ordered script (waits included) is `steps`.
+      clickSelectors: interactions.filter((s) => s.click !== undefined).map((s) => s.click),
+      steps: interactions,
       responseHeaders,
       bodySha256,
       bodyBytes,
@@ -1439,6 +1540,14 @@ async function captureWebUIScreenshot(event) {
     // exactly as blocked-url-patterns does: a reader must be able to see that a
     // capture was UNPERTURBED, which an absent field cannot say.
     "capture.click-selectors": (captured.clickSelectors || []).join("|") || "none",
+    // GH #3862: the whole ordered interaction script, pauses included, as
+    // `click:<selector>|wait_ms:<n>|...`. The verb prefix ends at the FIRST ":"
+    // (a selector's own pseudo-class colons come after it) and "|" is refused
+    // inside step selectors at parse time, so the line reads back unambiguously.
+    // "none" for an unperturbed capture, as its two siblings above.
+    "capture.steps": (captured.steps || [])
+      .map((s) => (s.wait_ms !== undefined ? "wait_ms:" + s.wait_ms : "click:" + s.click))
+      .join("|") || "none",
     "capture.ttfb-ms": String(captured.ttfbMS),
     "capture.dom-content-loaded-ms": String(captured.domContentLoadedMS),
     "capture.load-event-ms": String(captured.loadEventMS),
