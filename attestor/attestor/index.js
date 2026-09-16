@@ -171,6 +171,58 @@ function metadataValue(v, limit = 512) {
     .slice(0, limit);
 }
 
+// The ticket-facing summary is a caller-authored claim about WHY the evidence
+// was captured, whether it is the BEFORE or AFTER half of a proof, and WHAT
+// resource was examined. Those values must be signed beside the observed facts:
+// rendering unsigned prose inside an attestation would let an edited comment
+// change its meaning while the object signature continued to verify. Published
+// attestations therefore require all three fields and store them in the existing
+// observed.* map, which canonicalization v4 already signs generically.
+function existingAttestationTarget(event) {
+  // Target identity already belongs to each capture action. Requiring a second
+  // free-form `target` would let two caller fields disagree about what Snapbot
+  // actually observed, so derive the human claim from the canonical action input.
+  switch (event.action) {
+    case "capture-web-ui-screenshot":
+    case "capture-http-raw":
+      return metadataValue(event.url, 2000).trim();
+    case "attest-ci-verdict":
+      return metadataValue(`${event.env ?? event.environment ?? ""}@${event.target_sha ?? event.targetSHA ?? ""}`, 2000).trim();
+    case "attest-aws-resource":
+      return metadataValue(`${event.service ?? ""}.${event.operation ?? ""} ${JSON.stringify(event.params || {})}`, 2000).trim();
+    default: {
+      const ci = event.ci && typeof event.ci === "object" ? event.ci : {};
+      const sha = ci.target_sha ?? ci.targetSHA;
+      if (sha) return metadataValue(`${ci.env ?? ""}@${sha}`, 2000).trim();
+      return metadataValue(`s3://${CFG.bucket}/${event.key ?? ""}${event.version_id ? `?versionId=${event.version_id}` : ""}`, 2000).trim();
+    }
+  }
+}
+
+function requiredAttestationContext(event) {
+  const intent = metadataValue(event.intent, 1000).trim();
+  const category = metadataValue(event.category, 16).trim().toUpperCase();
+  const target = existingAttestationTarget(event);
+  if (!intent) throw new Error("published attestation requires intent");
+  if (category !== "BEFORE" && category !== "AFTER") {
+    throw new Error("published attestation category must be BEFORE or AFTER");
+  }
+  if (!target) throw new Error("published attestation action has no target identity");
+  return {
+    "claim.intent": intent,
+    "claim.category": category,
+    "claim.target": target,
+  };
+}
+
+// Run manifests intentionally have no GitHub publication and therefore no
+// human-facing claim. Every ticket publication is validated by the handler and
+// arrives here with this private normalized map attached to its capture event.
+function addAttestationContext(observed, event) {
+  Object.assign(observed, event._attestation_context || {});
+  return observed;
+}
+
 // ---------------------------------------------------------------------------
 // PHASE MARKERS.
 //
@@ -570,12 +622,12 @@ function renderResultSection(objectBodyText, url) {
   return lines;
 }
 
-function renderEvidenceText(statement, url, attestationURL, objectBodyText) {
+function renderEvidenceText(statement, url, attestationURL) {
   const observed = statement.observed || {};
-  const lines = [
-    "<!-- evidence-attestor signed block: repost verbatim, edit nothing -->",
-    "",
-  ];
+  // GH #3933: the ticket is an adjudication surface, not a sidecar dump. Keep
+  // only the signed human claim and its clock visible; the versioned Evidence
+  // and Statement links retain every object/CI/capture/AWS fact and signature.
+  const lines = ["-----BEGIN ROUTE66 SIGNED ATTESTATION-----", ""];
   // Inline the image so the evidence is SEEN, not merely linked (owner
   // 2026-09-03). A link is a URL a reader has to choose to follow, and the
   // GH #3150 misreading happened precisely because nobody opened the picture;
@@ -592,81 +644,19 @@ function renderEvidenceText(statement, url, attestationURL, objectBodyText) {
     lines.push("![" + inlineImageAlt(statement) + "](" + url + ")");
     lines.push("");
   }
-  // One fact per row wastes most of the comment's width: the majority of these
-  // values are a boolean, a millisecond count or a short token, so a two-column
-  // table renders ~50 rows of mostly empty space and buries the image the block
-  // exists to present. Facts are therefore split by VALUE LENGTH, not by meaning:
-  // long values (URLs, ARNs, hashes) keep a full-width row because wrapping them
-  // into a narrow column makes them unreadable and un-copyable, while short ones
-  // pack three pairs to a row. Splitting on length rather than on a hand-kept
-  // list of "important" keys means a new observed field lands in the right shape
-  // automatically and no future key is silently mis-filed.
-  // Only the facts a reader adjudicates a ticket with, in the order they are read
-  // (identity, then what the CDN did, then how long it took, then which build):
-  // owner 2026-09-03. Everything else the attestor observed is STILL signed and
-  // still in the sidecar -- this list governs presentation only, and the
-  // attestation-url row above is how a reader gets from the block to the complete
-  // statement. The list lives HERE, in the signer, rather than in the poster or a
-  // flag, so which facts a ticket shows stays a property of the attestor and not
-  // something the person writing the comment chooses per post.
-  const pairs = TICKET_FACTS
-    .map((name) => [name, ticketFactValue(name, statement, observed, url, attestationURL)])
-    // A fact absent from this evidence type is dropped rather than rendered
-    // blank: an aws-resource-dump has no capture.* fields, and a row of empty
-    // values reads as a measurement that came back empty.
-    .filter(([, v]) => v !== undefined && v !== null && v !== "");
-  // A pipe inside a value would otherwise split the row and silently move a
-  // value into a column it does not belong to.
-  const cell = (v) => String(v == null ? "" : v).replace(/\|/g, "\\|");
-  const isWide = ([, v]) => cell(v).length > 48;
-
-  const wide = pairs.filter(isWide);
-  if (wide.length) {
-    lines.push("| attested fact | value |", "| --- | --- |");
-    for (const [k, v] of wide) lines.push("| `" + k + "` | " + cell(v) + " |");
-    lines.push("");
-  }
-
-  const narrow = pairs.filter((p) => !isWide(p));
-  if (narrow.length) {
-    const PAIRS_PER_ROW = 3;
-    lines.push("| fact | value | fact | value | fact | value |");
-    lines.push("| --- | --- | --- | --- | --- | --- |");
-    for (let i = 0; i < narrow.length; i += PAIRS_PER_ROW) {
-      const cells = [];
-      for (let j = 0; j < PAIRS_PER_ROW; j++) {
-        const p = narrow[i + j];
-        // A short row is padded with empty cells rather than truncated: a
-        // markdown row with fewer cells than the header silently drops columns.
-        cells.push(p ? "`" + p[0] + "`" : "", p ? cell(p[1]) : "");
-      }
-      lines.push("| " + cells.join(" | ") + " |");
-    }
-    lines.push("");
-  }
-  // The dump itself, after the facts that identify it and before the verifier
-  // line, so a reader meets the result in the same order they would read the
-  // object: who asked, what was asked, then what came back (owner 2026-09-06,
-  // GH #3678). Emitted only when the caller handed down the attested body --
-  // a screenshot has no text body to inline, and its pixels are already above.
-  if (objectBodyText) {
-    for (const line of renderResultSection(objectBodyText, url)) lines.push(line);
-  }
-  // Said plainly, because a reader who assumes these rows ARE the statement would
-  // conclude the signature covers only what is shown. It covers everything the
-  // attestor observed; the sidecar has the rest, and the verifier prints it all.
-  lines.push("Selected facts; the signed statement covers more. Verify and print every field:");
-  lines.push("");
-  lines.push("`python scripts/cicd/verify_evidence_attestation.py \"" + url + "\"`");
+  lines.push(`**${observed["claim.category"]}: ${observed["claim.intent"]}**`, "");
+  lines.push(`Target: ${observed["claim.target"]}`, "");
+  lines.push(`Attested: ${statement.object.attested_at_utc}`, "");
+  lines.push(`Evidence: <${url}>`, "");
+  lines.push(`Statement: <${attestationURL}>`, "");
+  lines.push(`${statement.canonicalization} · Key-ID: ${statement.key_id}`, "");
+  lines.push("-----END ROUTE66 SIGNED ATTESTATION-----");
   return lines.join("\n");
 }
 
-// objectBodyText is OPTIONAL and RENDERING-ONLY (owner 2026-09-06, GH #3678):
-// the caller passes the exact utf-8 text it PUT to this key when that text is
-// worth showing in the ticket comment. It never enters the manifest, the
-// signature, or the sidecar; the hash of these same bytes is already
-// object.sha256, computed here from the object as re-read from S3.
-async function attest(key, versionId, observed, objectBodyText) {
+// Every observed field, including the compact claim.* summary, is signed in the
+// canonical manifest. The linked sidecar remains the complete machine record.
+async function attest(key, versionId, observed) {
   if (!key || typeof key !== "string") throw new Error("missing object key");
   const headArgs = { Bucket: CFG.bucket, Key: key };
   if (versionId) headArgs.VersionId = versionId;
@@ -717,7 +707,7 @@ async function attest(key, versionId, observed, objectBodyText) {
     url,
     attestation_key: sidecarKey,
     attestation_url: attestationURL,
-    evidence_text: renderEvidenceText(statement, url, attestationURL, objectBodyText),
+    evidence_text: renderEvidenceText(statement, url, attestationURL),
   });
 }
 
@@ -733,6 +723,7 @@ async function attestExistingObject(event) {
     if (!envName || !targetSHA) throw new Error("ci requires both env and target_sha");
     Object.assign(observed, await captureDevCI(envName, targetSHA));
   }
+  addAttestationContext(observed, event);
   return attest(event.key, event.version_id ? String(event.version_id) : "", observed);
 }
 
@@ -802,10 +793,10 @@ async function attestCIVerdict(event) {
       "evidence-type": "ci-verdict", "captured-by": "command-center evidence-attestor",
     },
   }));
-  const observed = Object.assign({
+  const observed = addAttestationContext(Object.assign({
     "ci.evidence-type": "ci-verdict",
     "ci.issue": issue,
-  }, ci);
+  }, ci), event);
   return attest(key, put.VersionId || "", observed);
 }
 
@@ -1510,7 +1501,7 @@ async function captureWebUIScreenshot(event) {
   const put = await s3.send(new PutObjectCommand({
     Bucket: CFG.bucket, Key: key, Body: captured.bytes, ContentType: "image/png", Metadata: metadata,
   }));
-  const observed = Object.assign({
+  const observed = addAttestationContext(Object.assign({
     "capture.evidence-type": "web-ui-screenshot",
     "capture.issue": issue,
     "capture.captured-at-utc": capturedAt,
@@ -1557,7 +1548,7 @@ async function captureWebUIScreenshot(event) {
     // markup rather than its pixels becomes evidenceable at all.
     "capture.body-sha256": captured.bodySha256,
     "capture.body-bytes": String(captured.bodyBytes),
-  }, timingObserved(captured.timing || {}), headerObserved(captured.responseHeaders), ci);
+  }, timingObserved(captured.timing || {}), headerObserved(captured.responseHeaders), ci), event);
   // The last phase, and the one nobody would guess is expensive: attest() does a
   // HeadObject, re-DOWNLOADS the object it just wrote to hash the bytes itself
   // (deliberately -- it signs only what it retrieved), fetches and unwraps the
@@ -1762,6 +1753,7 @@ async function captureHTTPRaw(event) {
   // is the page body.
   Object.assign(observed, headerObserved(finalRes.headers));
   if (targetSHA) Object.assign(observed, await captureDevCI(envName, targetSHA));
+  addAttestationContext(observed, event);
   return attest(key, put.VersionId || "", observed);
 }
 
@@ -1903,11 +1895,10 @@ async function attestAwsResource(event) {
     "aws.error": doc.error ? doc.error.name + ": " + doc.error.message : "",
   };
   if (targetSHA) Object.assign(observed, await captureDevCI(envName, targetSHA));
-  // Hand the attested bytes down for rendering. `body` is the buffer that was
-  // just PUT, so the fenced block in evidence_text is byte-identical to the
-  // object and hashes to object.sha256 (owner 2026-09-06, GH #3678: "the cfn
-  // attestation is lacking the actual output").
-  return attest(key, put.VersionId || "", observed, body.toString("utf8"));
+  addAttestationContext(observed, event);
+  // The compact comment links this exact versioned body instead of inlining a
+  // potentially enormous SDK result; its hash remains in the signed sidecar.
+  return attest(key, put.VersionId || "", observed);
 }
 
 // #3767: publication is part of attestation, not a caller's optional next step.
@@ -1957,25 +1948,22 @@ async function githubJSON(target, method, suffix, body) {
 // 64-byte Ed25519 signature is Base64. Locator headers are outside that section,
 // and the verifier binds their artifact to the signed bucket/key/version/hash.
 function armoredAttestation(result, identity) {
-  // Owner 2026-09-13, GH #3854: the comment rendered half as prose and half as a
-  // preformatted block; owner chose "No preformatted part". The whole attestation
-  // renders as ordinary Markdown, one visible line per armor line:
-  // - The BEGIN line and each locator header are their own paragraph (blank line
-  //   after), so each header line stays byte-identical. That keeps the retry
-  //   lookup below (`\nIdentity: <id>\n`, `^Statement: <url>$`) and the callers'
-  //   "-----BEGIN ROUTE66 SIGNED ATTESTATION-----\n" prefix check intact.
-  // - The manifest and signature lines form one paragraph joined by GFM hard
-  //   breaks (trailing backslash), with Markdown-active characters
-  //   backslash-escaped, so the RENDERED text is exactly the signed manifest
-  //   bytes. The signature is verified against the versioned sidecar in S3,
-  //   never against this comment body.
-  const signedLines = (result.manifest + "-----BEGIN ROUTE66 SIGNATURE-----\n" +
-    result.signature_b64 + "\n-----END ROUTE66 SIGNATURE-----").split("\n").map(markdownLiteral);
-  return ["-----BEGIN ROUTE66 SIGNED ATTESTATION-----", "", "Algorithm: Ed25519", "",
+  // GH #3933: comments carry the four facts a reviewer needs, while the exact
+  // object facts and signature remain in the immutable versioned Statement.
+  // The three claim.* values are inside the signed v4 observed map, so compact
+  // presentation does not turn caller intent into editable unsigned prose.
+  const observed = result.observed || {};
+  return ["-----BEGIN ROUTE66 SIGNED ATTESTATION-----", "",
+    `**${markdownLiteral(observed["claim.category"])}: ${markdownLiteral(observed["claim.intent"])}**`, "",
+    `Target: ${markdownLiteral(observed["claim.target"])}`, "",
+    `Attested: ${result.object.attested_at_utc}`, "",
     // Explicit autolinks preserve trailing '_' in S3 VersionIds. GitHub's bare
     // URL autolinker removed it from the actual #3767 proof, producing HTTP403.
-    `Identity: ${identity}`, "", `Evidence: <${result.url}>`, "", `Statement: <${result.attestation_url}>`, "",
-    `Key-ID: ${result.key_id}`, "", signedLines.join("\\\n"), "",
+    `Evidence: <${result.url}>`, "", `Statement: <${result.attestation_url}>`, "",
+    `${result.canonicalization} · Key-ID: ${result.key_id}`, "",
+    // Retry identity is machine state, not ticket content. Hide it while keeping
+    // bounded comment discovery deterministic and independently checkable.
+    `<!-- r66-attestation-identity: ${identity} -->`, "",
     "-----END ROUTE66 SIGNED ATTESTATION-----"].join("\n");
 }
 
@@ -1992,16 +1980,17 @@ async function postAttestation(target, result) {
   // Presentation is part of retry identity: earlier encoded comments remain
   // verifiable history, but a new invocation must publish the owner's readable
   // format rather than silently returning the superseded encoded presentation.
-  // cleartext-v2: the no-preformatted layout above (GH #3854). Bumping the tag
-  // gives a new invocation its own receipt in the new layout; v1 comments stay
-  // history.
-  const identity = bytesSha256(Buffer.from(JSON.stringify(["cleartext-v2", result.object.bucket, result.object.key,
-    result.object.version_id, result.observed["ci.env"] || "", result.observed["ci.target-sha"] || ""]), "utf8"));
+  // compact-v1 is a new receipt identity because old cleartext comments remain
+  // immutable history and must never be mistaken for the #3933 presentation.
+  const identity = bytesSha256(Buffer.from(JSON.stringify(["compact-v1", result.object.bucket, result.object.key,
+    result.object.version_id, result.observed["ci.env"] || "", result.observed["ci.target-sha"] || "",
+    result.observed["claim.category"], result.observed["claim.intent"], result.observed["claim.target"]]), "utf8"));
   for (let page = 1; page <= 10; page++) {
     const comments = await githubJSON(target, "GET", `?per_page=100&page=${page}`);
     if (!Array.isArray(comments)) throw new Error("GitHub comment listing is malformed");
     for (const comment of comments) {
-      if (typeof comment.body !== "string" || !comment.body.includes(`\nIdentity: ${identity}\n`)) continue;
+      if (typeof comment.body !== "string" ||
+          !comment.body.includes(`\n<!-- r66-attestation-identity: ${identity} -->\n`)) continue;
       // A comment is editable: verify its original statement before accepting it
       // as a retry receipt, and return its original CI observation unchanged.
       // The existing versioned sidecar is the structured receipt; no second
@@ -2222,7 +2211,11 @@ exports.handler = async (event) => {
     return attestExistingObject(event);
   }
   const target = githubTarget(event || {});
+  const attestationContext = requiredAttestationContext(event || {});
   const { github, ...capture } = event;
+  // Private transport key: capture actions receive the already-normalized
+  // signed claim without having to repeat validation or trust raw event fields.
+  capture._attestation_context = attestationContext;
   const result = await captureAttestation(capture);
   return postAttestation(target, result);
 };
