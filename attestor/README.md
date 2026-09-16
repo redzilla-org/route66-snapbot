@@ -56,12 +56,12 @@ version of that sidecar). Every URL the attestor returns carries
 Invocation shapes:
 
 ```json
-{"key": "<env>/issue-evidence/issue-1234/...png", "version_id": "<optional>", "ci": {"env": "california-dev", "target_sha": "<40 hex>"}, "github": {"issue": 1234, "token": "<invocation-only credential>"}}
+{"key": "<env>/issue-evidence/issue-1234/...png", "version_id": "<optional>", "ci": {"env": "california-dev", "target_sha": "<40 hex>"}, "intent": "what this evidence is meant to prove", "category": "BEFORE", "github": {"issue": 1234, "token": "<invocation-only credential>"}}
 ```
 
 ```json
 {"action": "capture-web-ui-screenshot", "issue": 1234, "env": "california-dev", "target_sha": "<40 hex>",
- "url": "https://...", "cookies": [{"name": "SESSION", "value": "...", "url": "https://..."}], "github": {"issue": 1234, "token": "<invocation-only credential>"}}
+ "url": "https://...", "intent": "what this evidence is meant to prove", "category": "AFTER", "cookies": [{"name": "SESSION", "value": "...", "url": "https://..."}], "github": {"issue": 1234, "token": "<invocation-only credential>"}}
 ```
 
 Cookies are invocation-only; only a redacted fingerprint and count are
@@ -71,18 +71,21 @@ recorded. Response: the statement (`object`, `observed`, `manifest`,
 
 ## Direct publication (#3767)
 
-Every action requires `github.issue` and `github.token`. The Lambda signs, wraps
-the canonical manifest in readable `ROUTE66 SIGNED ATTESTATION` armor, and posts that
+Every published action requires `github.issue`, `github.token`, `intent`, and a
+`category` of `BEFORE` or `AFTER`. The target is derived from the action's existing
+canonical URL, SHA, resource operation, or versioned object key; callers never
+repeat it in a second field that could disagree. The Lambda signs those values as `observed.claim.*`,
+wraps a compact summary in `ROUTE66 SIGNED ATTESTATION` armor, and posts that
 exact body to the issue/PR before returning `github_posted=true`, `comment_url`
 and identical `evidence_text`. The credential is removed before capture and
 never enters artifacts, logs, signatures, configuration or the response. Clients
 capture existing GH_TOKEN/GITHUB_TOKEN/gh authentication privately. GitHub issue
 comment permissions are required; publication failures fail the invocation.
 
-The clear-signed section is the exact plaintext manifest bytes covered by the
-Ed25519 signature. Only that compact signature is Base64; there is no encoded
-JSON body or duplicate manifest. Locator headers sit outside the signed section,
-whose bucket/key/version/hash let the existing verifier validate those URLs.
+The ticket comment shows only category, intent, target, attestation time, and the
+two versioned locators, plus canonicalization and Key-ID. The Statement locator
+contains the complete object/observation manifest and Ed25519 signature; removing
+those machine fields from the comment changes presentation, not integrity.
 Explicit angle autolinks preserve every VersionId character in GitHub's rendered
 href. A text fence preserves manifest line breaks without encoding the evidence.
 The armor preserves Ed25519 and versioned sidecars; it is not OpenPGP. AWS result
