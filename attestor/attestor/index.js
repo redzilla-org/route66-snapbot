@@ -186,16 +186,17 @@ function existingAttestationTarget(event) {
     case "capture-web-ui-screenshot":
     case "capture-http-raw":
       return metadataValue(event.url, 2000).trim();
+    // Owner 2026-09-17: "Attestation Target printed to the user should be the URL or
+    // resource name, not the env/sha." A CI snapshot names the CI orchestrator it
+    // reads; attestCIVerdict narrows it to the observed execution ARN after capture.
     case "attest-ci-verdict":
-      return metadataValue(`${event.env ?? event.environment ?? ""}@${event.target_sha ?? event.targetSHA ?? ""}`, 2000).trim();
+      return ciOrchestratorArn(metadataValue(event.env ?? event.environment, 64));
     case "attest-aws-resource":
       return metadataValue(`${event.service ?? ""}.${event.operation ?? ""} ${JSON.stringify(event.params || {})}`, 2000).trim();
-    default: {
-      const ci = event.ci && typeof event.ci === "object" ? event.ci : {};
-      const sha = ci.target_sha ?? ci.targetSHA;
-      if (sha) return metadataValue(`${ci.env ?? ""}@${sha}`, 2000).trim();
+    // An existing object is itself the resource, whether or not a CI observation
+    // rides along with it: its versioned S3 location, never the CI env@sha.
+    default:
       return metadataValue(`s3://${CFG.bucket}/${event.key ?? ""}${event.version_id ? `?versionId=${event.version_id}` : ""}`, 2000).trim();
-    }
   }
 }
 
@@ -416,6 +417,14 @@ async function devSfnClient(envName) {
   };
 }
 
+// ciOrchestratorArn names an env's CI orchestrator state machine, or "" for an env
+// with no DEV CI target, which the published-attestation check then refuses.
+function ciOrchestratorArn(envName) {
+  const env = CFG.devCI[envName];
+  if (!env) return "";
+  return "arn:aws:states:" + env.region + ":" + env.account + ":stateMachine:" + envName + "-ci-orchestrator";
+}
+
 async function captureDevCI(envName, targetSHA) {
   const ci = {
     "ci.env": envName,
@@ -424,7 +433,7 @@ async function captureDevCI(envName, targetSHA) {
   };
   try {
     const { env, client } = await devSfnClient(envName);
-    const stateMachineArn = "arn:aws:states:" + env.region + ":" + env.account + ":stateMachine:" + envName + "-ci-orchestrator";
+    const stateMachineArn = ciOrchestratorArn(envName);
     // Newest first; the FIRST execution is the one that defines DEV right now,
     // whatever its state. That is the fact worth signing.
     const listed = await client.send(new ListExecutionsCommand({ stateMachineArn, maxResults: 1 }));
@@ -797,6 +806,9 @@ async function attestCIVerdict(event) {
     "ci.evidence-type": "ci-verdict",
     "ci.issue": issue,
   }, ci), event);
+  // The snapshot's resource is the execution it read. A failed read (ci.error, no
+  // execution) keeps the orchestrator ARN the handler validated.
+  if (ci["ci.execution-arn"] && observed["claim.target"]) observed["claim.target"] = ci["ci.execution-arn"];
   return attest(key, put.VersionId || "", observed);
 }
 
