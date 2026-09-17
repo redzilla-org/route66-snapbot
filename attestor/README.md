@@ -73,10 +73,10 @@ recorded. Response: the statement (`object`, `observed`, `manifest`,
 
 Every published action requires `github.issue`, `github.token`, `intent`, and a
 `category` of `BEFORE` or `AFTER`. The target is derived from the action's existing
-canonical input and always names a URL or resource, never an env@sha (owner
-2026-09-17): the captured page URL, the AWS resource operation, the observed
-`<env>-ci-orchestrator` execution ARN (the state machine ARN when the read
-failed), or the versioned `s3://` object; callers never repeat it in a second
+canonical input (owner 2026-09-17): a CI run attestation (`attest-ci-verdict`, or
+an object carrying `ci.target_sha`) names `<env>@<sha>`; every other target names a
+URL or resource: the captured page URL, the AWS resource operation, or the
+versioned `s3://` object. Callers never repeat it in a second
 field that could disagree. The Lambda signs those values as `observed.claim.*`,
 wraps a compact summary in `ROUTE66 SIGNED ATTESTATION` armor, and posts that
 exact body to the issue/PR before returning `github_posted=true`, `comment_url`
