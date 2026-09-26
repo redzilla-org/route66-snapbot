@@ -57,11 +57,30 @@ RUN printf '%s\n' \
 FROM public.ecr.aws/lambda/nodejs:22 AS runtime
 
 # npm's production closure contains the pinned Sparticuz Chromium build and
-# puppeteer driver. AWS SDK v3 remains supplied by the managed Lambda base, as
-# it was for the imported zip deployment.
+# puppeteer driver.
+#
+# The AWS SDK v3 clients are installed HERE, into ${LAMBDA_TASK_ROOT}/node_modules,
+# which Node resolves before the managed base's /var/runtime/node_modules.
+# redzilla-org/route66#4039: the base's bundled SDK is not one coherent version
+# set -- its cloudwatch-logs, cloudwatch and dynamodb clients failed every call
+# before sending with "serializerMiddleware is not found when adding
+# endpointV2Middleware middleware before serializerMiddleware" (a client built
+# against a different @smithy middleware stack than the shared endpoint/serde
+# packages it loaded), while its s3/ssm/sts clients worked. One npm install of
+# every client the handler builds dedupes a single @aws-sdk/core + @smithy/*
+# set. --before freezes that set to a date so a rebuild resolves the same
+# versions; bump it deliberately. --no-save keeps package-lock.json (and the
+# npm ci proof in Dockerfile.test) untouched. index.js refuses any aws-resource
+# client that does not resolve from this directory, so a service missing from
+# this list fails loudly instead of silently falling back to the base's copy.
 COPY attestor/attestor/package.json attestor/attestor/package-lock.json ${LAMBDA_TASK_ROOT}/
 RUN cd ${LAMBDA_TASK_ROOT} \
     && npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
+    && npm install --no-save --omit=dev --ignore-scripts --no-audit --no-fund \
+         --before=2026-09-26T00:00:00Z \
+         @aws-sdk/client-s3 @aws-sdk/client-ssm @aws-sdk/client-sts @aws-sdk/client-sfn \
+         @aws-sdk/client-cloudwatch @aws-sdk/client-cloudwatch-logs @aws-sdk/client-dynamodb \
+         @aws-sdk/client-cloudformation \
     && npm cache clean --force
 
 COPY attestor/attestor/index.js attestor/attestor/browse.js attestor/attestor/kumo-runtime.js attestor/attestor/kumo-lane.js attestor/public-key.json ${LAMBDA_TASK_ROOT}/

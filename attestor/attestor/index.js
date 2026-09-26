@@ -60,6 +60,9 @@
 const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
+// `path` locates the image's own node_modules for the aws-resource client check
+// (redzilla-org/route66#4039).
+const path = require("path");
 const readline = require("readline");
 const { spawn } = require("child_process");
 // `https` and `URL` serve the capture-http-raw action only. That action needs to
@@ -1784,9 +1787,13 @@ async function captureHTTPRaw(event) {
 // makes the call itself with those credentials, identifies the caller through
 // STS GetCallerIdentity with the same credentials, writes the SDK result as a
 // JSON evidence object, and attests it with observed.aws.* facts. A failed
-// call is still a result: the error is written and captured, never refused.
-// The clients come from the runtime's bundled AWS SDK v3; an unknown service
-// or operation is an invocation error. Credentials are never logged or
+// SDK call is REFUSED (redzilla-org/route66#4039): nothing is stored, signed or
+// published, and the invocation fails with FAILURE TO ATTEST. An error payload
+// signed as evidence shows nothing the ticket claimed and was posted under a
+// headline describing what the capture was meant to show.
+// The clients come from the image's pinned AWS SDK v3 set (Dockerfile), never
+// the runtime's bundled copy; an unknown service or operation is an invocation
+// error. Credentials are never logged or
 // stored; only the identity they resolve to is recorded.
 // ---------------------------------------------------------------------------
 // `Filter` is on this list because FilterLogEvents is the call a CloudWatch-logs
@@ -1802,12 +1809,21 @@ function loadServiceClient(service, operation) {
   if (!READ_ONLY_OPERATION.test(operation)) {
     throw new Error("operation " + operation + " is not an allow-listed read-only operation");
   }
-  let mod;
+  let resolved;
   try {
-    mod = require("@aws-sdk/client-" + service);
+    resolved = require.resolve("@aws-sdk/client-" + service);
   } catch (err) {
     throw new Error("no AWS SDK client for service " + service + ": " + (err && err.message ? err.message : err));
   }
+  // redzilla-org/route66#4039: the Lambda base's bundled SDK mixes middleware
+  // stack versions and fails every call before sending. Only the coherent set
+  // the Dockerfile installs beside this file may serve a call; a client that
+  // resolves anywhere else (NODE_PATH=/var/runtime/node_modules) is refused.
+  if (!resolved.startsWith(path.join(__dirname, "node_modules") + path.sep)) {
+    throw new Error("AWS SDK client for service " + service + " is not in the image's pinned SDK set (resolved " +
+      resolved + "); add @aws-sdk/client-" + service + " to the Dockerfile install");
+  }
+  const mod = require(resolved);
   const Command = mod[operation + "Command"];
   if (typeof Command !== "function") throw new Error("service " + service + " has no operation " + operation);
   const clientKey = Object.keys(mod).find((k) => k !== "Client" && /Client$/.test(k) && typeof mod[k] === "function");
@@ -1882,6 +1898,14 @@ async function attestAwsResource(event) {
     };
     httpStatus = doc.error.http_status;
   }
+  // Fail closed (redzilla-org/route66#4039): an SDK or API error is not evidence
+  // of the resource. Refuse BEFORE the S3 put, attest() and the handler's GitHub
+  // publication, so nothing is stored, signed or posted; the thrown error is the
+  // invocation's failure result to the caller.
+  if (doc.error) {
+    throw new Error("FAILURE TO ATTEST: " + service + " " + operation + " failed: " +
+      doc.error.name + ": " + doc.error.message + (httpStatus ? " (HTTP " + httpStatus + ")" : ""));
+  }
   const paramsJSON = JSON.stringify(params);
   const body = Buffer.from(JSON.stringify(doc, null, 2), "utf8");
   const uuid = crypto.randomUUID();
@@ -1906,7 +1930,9 @@ async function attestAwsResource(event) {
     "aws.caller-account": doc.caller.account,
     "aws.called-at-utc": calledAt,
     "aws.http-status": httpStatus,
-    "aws.error": doc.error ? doc.error.name + ": " + doc.error.message : "",
+    // Always empty since #4039 refuses errored calls above; the line stays so
+    // the signed statement keeps the shape existing readers parse.
+    "aws.error": "",
   };
   if (targetSHA) Object.assign(observed, await captureDevCI(envName, targetSHA));
   addAttestationContext(observed, event);
