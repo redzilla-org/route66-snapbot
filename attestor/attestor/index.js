@@ -1630,11 +1630,17 @@ function rawBodyExtension(contentType) {
 // what comes back here is what crossed the wire, which is the point of the
 // action. The timeout is on the socket rather than around the promise so a
 // hung connection is destroyed rather than merely abandoned.
+//
+// An http:// hop goes to the stack's IPv6 fetch function instead (fetch-hop.js,
+// redzilla-org/route66#3659): the prod rendezvous health origins are AAAA-only
+// plain http, and this function's own egress is IPv4-only. Only http is routed
+// there, so every https hop keeps the in-process path it always had.
 function requestOneHop(targetURL, headers, timeoutMS) {
+  if (new URL(targetURL).protocol === "http:") return requestOneHopViaIPv6Fetch(targetURL, headers, timeoutMS);
   return new Promise((resolve, reject) => {
     const u = new URL(targetURL);
     if (u.protocol !== "https:") {
-      reject(new Error("capture-http-raw refuses non-https hop " + targetURL));
+      reject(new Error("capture-http-raw refuses non-http(s) hop " + targetURL));
       return;
     }
     const req = https.request({
@@ -1659,6 +1665,38 @@ function requestOneHop(targetURL, headers, timeoutMS) {
   });
 }
 
+// The IPv6 hop (redzilla-org/route66#3659). The fetch function is snapbot's own,
+// declared in this stack and invocable only by this function's role, so the
+// bytes signed below are still bytes snapbot retrieved itself. Its name arrives
+// as an env var the template sets; it is read here, not in CFG, so local Kumo
+// (which never makes an http hop) needs no new variable. The client is loaded
+// lazily for the same reason.
+let lambdaClient = null;
+async function requestOneHopViaIPv6Fetch(targetURL, headers, timeoutMS) {
+  // A session cookie on plain http would cross the internet in cleartext.
+  if (headers.cookie) throw new Error("capture-http-raw refuses to send cookies over http: " + targetURL);
+  const fn = requiredEnv("EVIDENCE_ATTESTOR_HTTP_FETCH_FUNCTION");
+  const { LambdaClient, InvokeCommand } = require("@aws-sdk/client-lambda");
+  lambdaClient = lambdaClient || new LambdaClient({ region: CFG.region });
+  const out = await lambdaClient.send(new InvokeCommand({
+    FunctionName: fn,
+    Payload: Buffer.from(JSON.stringify({ url: targetURL, headers, timeout_ms: timeoutMS })),
+  }));
+  const reply = JSON.parse(Buffer.from(out.Payload || []).toString("utf8") || "null");
+  if (out.FunctionError) {
+    throw new Error("IPv6 fetch of " + targetURL + " failed: " + metadataValue(reply && reply.errorMessage, 512));
+  }
+  return {
+    status: reply.status,
+    headers: reply.headers || {},
+    body: Buffer.from(reply.body_b64 || "", "base64"),
+    // Signed per hop by captureHTTPRaw: which function fetched it, and the
+    // IPv6 peer it actually connected to.
+    fetchedBy: fn,
+    remoteAddress: "[" + reply.remote_address + "]:" + reply.remote_port,
+  };
+}
+
 async function captureHTTPRaw(event) {
   const issue = metadataValue(event.issue ?? event.issue_number ?? "unknown", 64);
   const envName = metadataValue(event.env ?? event.environment, 64);
@@ -1669,7 +1707,9 @@ async function captureHTTPRaw(event) {
   const targetSHA = metadataValue(event.target_sha ?? event.targetSHA, 80);
   const requestedURL = metadataValue(event.url, 2048);
   if (!envName) throw new Error("capture-http-raw requires env");
-  if (!/^https:\/\//.test(requestedURL)) throw new Error("capture-http-raw requires an https URL");
+  // http is admitted because an http hop is fetched by the stack's IPv6 fetch
+  // function (redzilla-org/route66#3659); the screenshot action stays https-only.
+  if (!/^https?:\/\//.test(requestedURL)) throw new Error("capture-http-raw requires an http(s) URL");
   const timeoutMS = Math.max(1000, Math.min(30000, Number(event.timeout_ms || 15000)));
   const maxRedirects = Math.max(0, Math.min(RAW_MAX_REDIRECTS, Number(
     event.max_redirects === undefined || event.max_redirects === null ? RAW_MAX_REDIRECTS : event.max_redirects)));
@@ -1697,7 +1737,8 @@ async function captureHTTPRaw(event) {
     const res = await requestOneHop(current, requestHeaders, timeoutMS);
     const location = res.headers.location === undefined ? "" : String(res.headers.location);
     const isRedirect = res.status >= 300 && res.status < 400 && !!location;
-    hops.push({ url: current, status: res.status, location: isRedirect ? location : "" });
+    hops.push({ url: current, status: res.status, location: isRedirect ? location : "",
+      fetchedBy: res.fetchedBy || "", remoteAddress: res.remoteAddress || "" });
     last = { url: current, res };
     if (!isRedirect || i >= maxRedirects) break;
     // Relative Location values are legal and common; resolving against the hop's
@@ -1762,6 +1803,11 @@ async function captureHTTPRaw(event) {
     observed[prefix + "url"] = metadataValue(hop.url, 512);
     observed[prefix + "status"] = String(hop.status);
     observed[prefix + "location"] = metadataValue(hop.location, 512);
+    // Only on an IPv6-fetched hop, so https statements keep their exact line set.
+    if (hop.fetchedBy) {
+      observed[prefix + "fetched-by"] = metadataValue(hop.fetchedBy, 256);
+      observed[prefix + "remote-address"] = metadataValue(hop.remoteAddress, 128);
+    }
   });
   // The final response's headers through the SAME allowlist the screenshot path
   // uses -- including x-cache and age, the edge-vs-origin discriminators -- and

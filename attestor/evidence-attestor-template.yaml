@@ -96,6 +96,12 @@ Resources:
               - Effect: Allow
                 Action: sts:AssumeRole
                 Resource: !Sub "arn:aws:iam::*:role/${CiReadRoleName}"
+              # The http:// hops of capture-http-raw (route66#3659). Same-account
+              # identity grant, so the fetch function needs no resource policy
+              # and nothing else can invoke it.
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt HttpFetchFunction.Arn
 
   EvidenceAttestorFunction:
     Type: AWS::Lambda::Function
@@ -132,6 +138,135 @@ Resources:
           EVIDENCE_ATTESTOR_SSM_PARAM: !Ref PrivateKeyParameterName
           EVIDENCE_ATTESTOR_CI_READ_ROLE_NAME: !Ref CiReadRoleName
           EVIDENCE_ATTESTOR_DEV_CI_JSON: !Ref DevCiTargetsJson
+          EVIDENCE_ATTESTOR_HTTP_FETCH_FUNCTION: !Ref HttpFetchFunction
+
+  # ===========================================================================
+  # IPv6 FETCH PATH (route66#3659). Owner, verbatim: "#3659: enable the ipv6
+  # egress, with no additional costs".
+  #
+  # WHY A SECOND FUNCTION AND NOT A VPC ON THE SIGNER: the prod rendezvous health
+  # origins are AAAA-only plain http on :7080, and a Lambda outside a VPC has
+  # IPv4-only egress. A VPC-attached Lambda gets IPv6 through an egress-only
+  # internet gateway but LOSES IPv4 internet without a NAT gateway, and the
+  # signer needs IPv4: GitHub (no AAAA) for publication, plus STS, SSM and Step
+  # Functions. So the signer keeps its networking and only the http:// hop runs
+  # here, in fetch-hop.js from the SAME image.
+  #
+  # WHY THIS STAYS "the attestor should only sign what it retrieves" (owner
+  # 2026-08-26): the fetch function lives in this stack, runs this stack's
+  # immutable image, and only the signer's role may invoke it. The retrieval is
+  # snapbot's own; no caller can hand the signer bytes through this path.
+  #
+  # ZERO COST AT REST, every resource below: VPC, subnet, route table, route,
+  # security group, the Amazon-provided IPv6 /56 and the egress-only internet
+  # gateway carry no hourly charge; Lambda's VPC ENIs are free; the function
+  # bills per invocation only. There is deliberately NO NAT gateway, NO internet
+  # gateway, NO public IPv4, NO interface endpoint and NO provisioned concurrency.
+  # Per-GB data transfer out through the egress-only gateway applies to the few
+  # KB a /health read moves.
+  # ===========================================================================
+  HttpFetchVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      # IPv4 is mandatory for a VPC and unused for egress: no route leaves it.
+      CidrBlock: 10.66.0.0/24
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+  HttpFetchVpcIpv6:
+    Type: AWS::EC2::VPCCidrBlock
+    Properties:
+      VpcId: !Ref HttpFetchVpc
+      AmazonProvidedIpv6CidrBlock: true
+
+  # One subnet: the function is invoked a few times a day for evidence, so a
+  # second AZ buys nothing; an AZ outage fails the capture loudly.
+  HttpFetchSubnet:
+    Type: AWS::EC2::Subnet
+    DependsOn: HttpFetchVpcIpv6
+    Properties:
+      VpcId: !Ref HttpFetchVpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: 10.66.0.0/26
+      Ipv6CidrBlock: !Select [0, !Cidr [!Select [0, !GetAtt HttpFetchVpc.Ipv6CidrBlocks], 1, 64]]
+      MapPublicIpOnLaunch: false
+
+  HttpFetchEgressOnlyGateway:
+    Type: AWS::EC2::EgressOnlyInternetGateway
+    Properties:
+      VpcId: !Ref HttpFetchVpc
+
+  HttpFetchRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref HttpFetchVpc
+
+  # The ONLY route out: IPv6 through the egress-only gateway. No 0.0.0.0/0.
+  HttpFetchIpv6DefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref HttpFetchRouteTable
+      DestinationIpv6CidrBlock: "::/0"
+      EgressOnlyInternetGatewayId: !Ref HttpFetchEgressOnlyGateway
+
+  HttpFetchSubnetRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref HttpFetchSubnet
+      RouteTableId: !Ref HttpFetchRouteTable
+
+  # Declaring egress replaces the default allow-all IPv4 rule, so the function
+  # can open only these IPv6 ports. DNS to the VPC resolver is not SG-filtered.
+  HttpFetchSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: snapbot IPv6 fetch hop, outbound http 80/443/7080 over IPv6 only
+      VpcId: !Ref HttpFetchVpc
+      SecurityGroupEgress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIpv6: "::/0" }
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIpv6: "::/0" }
+        - { IpProtocol: tcp, FromPort: 7080, ToPort: 7080, CidrIpv6: "::/0" }
+
+  # Needs nothing but its logs and the ENI lifecycle the managed policy grants.
+  HttpFetchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+
+  # Declared so the group carries a retention; an auto-created Lambda log
+  # group has none.
+  HttpFetchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-http-fetch"
+      RetentionInDays: 30
+
+  HttpFetchFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: [HttpFetchLogGroup, HttpFetchSubnetRoutes, HttpFetchIpv6DefaultRoute]
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-http-fetch"
+      PackageType: Image
+      Role: !GetAtt HttpFetchRole.Arn
+      # The caller's socket timeout is capped at 30s; the rest covers cold start.
+      Timeout: 45
+      MemorySize: 256
+      Architectures: [x86_64]
+      Code:
+        ImageUri: !Ref ImageUri
+      ImageConfig:
+        Command: ["fetch-hop.handler"]
+      VpcConfig:
+        Ipv6AllowedForDualStack: true
+        SubnetIds: [!Ref HttpFetchSubnet]
+        SecurityGroupIds: [!Ref HttpFetchSecurityGroup]
 
   # WHY THIS ALARM EXISTS: this one function signs EVERY piece of closure
   # evidence in the system, and it has no DLQ and no failure destination -- a

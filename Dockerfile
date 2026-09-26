@@ -80,10 +80,13 @@ RUN cd ${LAMBDA_TASK_ROOT} \
          --before=2026-09-26T00:00:00Z \
          @aws-sdk/client-s3 @aws-sdk/client-ssm @aws-sdk/client-sts @aws-sdk/client-sfn \
          @aws-sdk/client-cloudwatch @aws-sdk/client-cloudwatch-logs @aws-sdk/client-dynamodb \
-         @aws-sdk/client-cloudformation \
+         @aws-sdk/client-cloudformation @aws-sdk/client-lambda \
     && npm cache clean --force
 
-COPY attestor/attestor/index.js attestor/attestor/browse.js attestor/attestor/kumo-runtime.js attestor/attestor/kumo-lane.js attestor/public-key.json ${LAMBDA_TASK_ROOT}/
+# fetch-hop.js is the IPv6 fetch function's handler (route66#3659): the same
+# image runs as a second, VPC-attached function with ImageConfig.Command
+# ["fetch-hop.handler"], so the hop code ships under the same immutable SHA.
+COPY attestor/attestor/index.js attestor/attestor/browse.js attestor/attestor/kumo-runtime.js attestor/attestor/kumo-lane.js attestor/attestor/fetch-hop.js attestor/public-key.json ${LAMBDA_TASK_ROOT}/
 COPY --from=ocr-build /out/snapbot-ocr-worker /opt/snapbot/snapbot-ocr-worker
 COPY --from=ocr-build /out/tessdata /opt/snapbot/tessdata
 
@@ -95,6 +98,7 @@ RUN /opt/snapbot/snapbot-ocr-worker --version \
     && node --check ${LAMBDA_TASK_ROOT}/index.js \
     && node --check ${LAMBDA_TASK_ROOT}/browse.js \
     && node --check ${LAMBDA_TASK_ROOT}/kumo-runtime.js \
-    && node --check ${LAMBDA_TASK_ROOT}/kumo-lane.js
+    && node --check ${LAMBDA_TASK_ROOT}/kumo-lane.js \
+    && node --check ${LAMBDA_TASK_ROOT}/fetch-hop.js
 
 CMD ["index.handler"]
