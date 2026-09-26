@@ -15,6 +15,41 @@ RUN node --check browse.js && node --check kumo-lane.js \
     && node /opt/bench/browse-bench.js \
     && echo ok > /tmp/browse-bench.ok
 
+# redzilla-org/route66#4039 regression gate. Built on the SAME production Lambda
+# runtime base and the SAME npm install stanza as the Dockerfile `runtime` stage
+# (kept byte-identical to it on purpose), so these tests exercise the real pinned
+# AWS SDK closure the production image ships, never a stand-in. Neither the
+# browse-test stage above nor the final stage below installs the SDK client
+# set; each checks only syntax/OCR/browse behavior, which is why this bug
+# shipped past them.
+FROM public.ecr.aws/lambda/nodejs:22 AS gh4039-aws-clients-test
+
+COPY attestor/attestor/package.json attestor/attestor/package-lock.json ${LAMBDA_TASK_ROOT}/
+RUN cd ${LAMBDA_TASK_ROOT} \
+    && npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
+    && npm install --no-save --omit=dev --ignore-scripts --no-audit --no-fund \
+         --before=2026-09-26T00:00:00Z \
+         @aws-sdk/client-s3 @aws-sdk/client-ssm @aws-sdk/client-sts @aws-sdk/client-sfn \
+         @aws-sdk/client-cloudwatch @aws-sdk/client-cloudwatch-logs @aws-sdk/client-dynamodb \
+         @aws-sdk/client-cloudformation \
+    && npm cache clean --force
+
+COPY attestor/attestor/index.js attestor/attestor/browse.js attestor/attestor/kumo-runtime.js attestor/attestor/kumo-lane.js attestor/public-key.json ${LAMBDA_TASK_ROOT}/
+COPY attestor/attestor/test/gh4039_sdk_client_load_test.js ${LAMBDA_TASK_ROOT}/test/gh4039_sdk_client_load_test.js
+COPY attestor/attestor/test/gh4039_attest_aws_resource_failure_test.js ${LAMBDA_TASK_ROOT}/test/gh4039_attest_aws_resource_failure_test.js
+COPY attestor/attestor/test/gh4039_debug_clientkey.js ${LAMBDA_TASK_ROOT}/test/gh4039_debug_clientkey.js
+
+# Behavior (a): the three clients the observed bug broke build and send a
+# request from the image's own pinned node_modules with no
+# "serializerMiddleware is not found" error.
+# Behavior (b): an AWS call that errors makes attestAwsResource throw
+# "FAILURE TO ATTEST" with no S3 put, no signing, no GitHub post.
+RUN cd ${LAMBDA_TASK_ROOT} \
+    && node test/gh4039_debug_clientkey.js \
+    && node test/gh4039_sdk_client_load_test.js \
+    && node test/gh4039_attest_aws_resource_failure_test.js \
+    && echo ok > /tmp/gh4039.ok
+
 # The repository gate deliberately builds the production Dockerfile's native
 # source on a compact Alpine image. It proves the Rust worker, Node handler, and
 # pinned npm closure from this checkout without requiring deployed AWS state.
@@ -26,9 +61,11 @@ RUN apk add --no-cache rust cargo build-base pkgconf clang clang-dev llvm-dev \
 WORKDIR /src
 COPY ocrd-rust ./ocrd-rust
 COPY attestor ./attestor
-# Pulling the marker makes the browse-test stage a dependency of this one, so a
-# BuildKit build (which skips unreferenced stages) still runs the benchmark.
+# Pulling the markers makes the browse-test and gh4039-aws-clients-test stages
+# dependencies of this one, so a BuildKit build (which skips unreferenced
+# stages) still runs both.
 COPY --from=browse-test /tmp/browse-bench.ok /tmp/browse-bench.ok
+COPY --from=gh4039-aws-clients-test /tmp/gh4039.ok /tmp/gh4039.ok
 
 # `cargo test` compiles the retained preprocessing tests and the stdio worker;
 # node --check validates the combined handler; npm ci proves its lock file.
