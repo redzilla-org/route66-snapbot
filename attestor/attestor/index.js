@@ -76,6 +76,8 @@ const {
   PutObjectCommand,
 } = require("@aws-sdk/client-s3");
 const { SSMClient, GetParameterCommand } = require("@aws-sdk/client-ssm");
+// The browse action and its process-lifetime browser pool (see browse.js).
+const browse = require("./browse.js");
 const { STSClient, AssumeRoleCommand } = require("@aws-sdk/client-sts");
 const {
   SFNClient,
@@ -2197,12 +2199,24 @@ async function ocrImage(event) {
   }
 }
 
+// browse's cloud store: the SAME bucket and client capture-web-ui-screenshot puts
+// to. Unsigned on purpose -- a browse artifact is a harness input, not evidence.
+async function browseS3Put(key, bytes, contentType) {
+  const put = await s3.send(new PutObjectCommand({ Bucket: CFG.bucket, Key: key, Body: bytes, ContentType: contentType }));
+  return { bucket: CFG.bucket, versionId: put.VersionId || "" };
+}
+
 exports.handler = async (event) => {
   // OCR produces a fact about pixels but no signed evidence object. It therefore
   // needs no GitHub publication credential. Ticket evidence continues to join
   // mandatory publication before returning; the narrowly validated run-manifest
   // branch below is evidence infrastructure rather than a ticket artifact.
   if (event && event.action === "ocr-image") return ocrImage(event);
+
+  // browse is a pure capture service (owner 2026-09-26: snapbot hosts the browser
+  // sessions; web-regression stays the judge). It knows no baselines or checks and
+  // publishes nothing to GitHub: it returns per-step facts plus artifact refs.
+  if (event && event.action === "browse") return browse.browse(event, { ocrImage, s3Put: browseS3Put });
 
   // WHY THIS IS THE ONLY NON-GITHUB ATTESTATION PATH (GH #3822): cloud-compose
   // must publish one run manifest automatically for every local and CI harness run,

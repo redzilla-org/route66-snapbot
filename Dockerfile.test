@@ -1,3 +1,20 @@
+# browse-test runs the browse pool end to end on the SAME Lambda base the
+# production image ships: 40 lane processes, real Chromium, a fake Runtime API
+# (attestor/bench/browse-bench.js). It must be the production base because the
+# bundled Chromium needs Amazon Linux's userland, which Alpine cannot provide.
+FROM public.ecr.aws/lambda/nodejs:22 AS browse-test
+
+WORKDIR /var/task
+COPY attestor/attestor/package.json attestor/attestor/package-lock.json ./
+RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund
+COPY attestor/attestor/index.js attestor/attestor/browse.js attestor/attestor/kumo-runtime.js attestor/attestor/kumo-lane.js attestor/public-key.json ./
+COPY attestor/bench/browse-bench.js /opt/bench/browse-bench.js
+# The benchmark exits non-zero on any failed request, a refused-but-accepted
+# 39-process pool, or a screenshot whose stored sha256 does not match.
+RUN node --check browse.js && node --check kumo-lane.js \
+    && node /opt/bench/browse-bench.js \
+    && echo ok > /tmp/browse-bench.ok
+
 # The repository gate deliberately builds the production Dockerfile's native
 # source on a compact Alpine image. It proves the Rust worker, Node handler, and
 # pinned npm closure from this checkout without requiring deployed AWS state.
@@ -9,6 +26,9 @@ RUN apk add --no-cache rust cargo build-base pkgconf clang clang-dev llvm-dev \
 WORKDIR /src
 COPY ocrd-rust ./ocrd-rust
 COPY attestor ./attestor
+# Pulling the marker makes the browse-test stage a dependency of this one, so a
+# BuildKit build (which skips unreferenced stages) still runs the benchmark.
+COPY --from=browse-test /tmp/browse-bench.ok /tmp/browse-bench.ok
 
 # `cargo test` compiles the retained preprocessing tests and the stdio worker;
 # node --check validates the combined handler; npm ci proves its lock file.
@@ -19,4 +39,6 @@ RUN cd /src/ocrd-rust \
     && cd /src/attestor/attestor \
     && npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
     && node --check index.js \
-    && node --check kumo-runtime.js
+    && node --check browse.js \
+    && node --check kumo-runtime.js \
+    && node --check kumo-lane.js
