@@ -1804,8 +1804,31 @@ async function captureHTTPRaw(event) {
 // gate whose entire job is to admit reads only.
 const READ_ONLY_OPERATION = /^(Describe|Get|List|Head|Lookup|Query|Scan|BatchGet|Filter)[A-Za-z0-9]*$/;
 
+// redzilla-org/route66#4039: the concrete client class is named EXACTLY per
+// service. A suffix match on "Client" picked the smithy base class every
+// @aws-sdk/client-* package also exports as "__Client" (first in key order),
+// and that abstract base fails every call with "serializerMiddleware is not
+// found when adding endpointV2Middleware". Package names do not derive the
+// class name mechanically (dynamodb -> DynamoDBClient, sfn -> SFNClient), so
+// this map mirrors the Dockerfile's pinned install set one-for-one; a service
+// outside it is an invocation error.
+const SERVICE_CLIENT_EXPORT = {
+  "s3": "S3Client",
+  "ssm": "SSMClient",
+  "sts": "STSClient",
+  "sfn": "SFNClient",
+  "cloudwatch": "CloudWatchClient",
+  "cloudwatch-logs": "CloudWatchLogsClient",
+  "dynamodb": "DynamoDBClient",
+  "cloudformation": "CloudFormationClient",
+};
+
 function loadServiceClient(service, operation) {
   if (!/^[a-z0-9-]+$/.test(service)) throw new Error("invalid service name " + service);
+  if (!Object.prototype.hasOwnProperty.call(SERVICE_CLIENT_EXPORT, service)) {
+    throw new Error("service " + service + " is not in the attestor's pinned AWS SDK client set");
+  }
+  const clientExport = SERVICE_CLIENT_EXPORT[service];
   if (!READ_ONLY_OPERATION.test(operation)) {
     throw new Error("operation " + operation + " is not an allow-listed read-only operation");
   }
@@ -1826,9 +1849,11 @@ function loadServiceClient(service, operation) {
   const mod = require(resolved);
   const Command = mod[operation + "Command"];
   if (typeof Command !== "function") throw new Error("service " + service + " has no operation " + operation);
-  const clientKey = Object.keys(mod).find((k) => k !== "Client" && /Client$/.test(k) && typeof mod[k] === "function");
-  if (!clientKey) throw new Error("service " + service + " exposes no Client class");
-  return { Client: mod[clientKey], Command };
+  // Exact export only (see SERVICE_CLIENT_EXPORT); absence fails hard.
+  if (typeof mod[clientExport] !== "function") {
+    throw new Error("@aws-sdk/client-" + service + " does not export " + clientExport);
+  }
+  return { Client: mod[clientExport], Command };
 }
 
 // JSON-safe copy of an SDK result: binary to base64, streams read to a cap,
