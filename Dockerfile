@@ -58,7 +58,18 @@ RUN printf '%s\n' \
         'exec g++ -static -static-libstdc++ -static-libgcc "$@" -Wl,-Bstatic' \
         > /usr/local/bin/snapbot-static-cxx-link \
     && chmod +x /usr/local/bin/snapbot-static-cxx-link
-ENV PKG_CONFIG_PATH=/opt/snapbot-static/lib/pkgconfig \
+# rustup's musl toolchain links HOST artifacts static by default, and a static
+# build script cannot dlopen libclang for bindgen (leptonica-sys,
+# tesseract-sys). Host units are the rustc calls without --target; this
+# wrapper links only those dynamically against Alpine's musl.
+RUN printf '%s\n' \
+        '#!/bin/sh' \
+        'case " $* " in *" --target "*|*" --target="*) exec "$@";; esac' \
+        'exec "$@" -C target-feature=-crt-static' \
+        > /usr/local/bin/snapbot-host-rustc \
+    && chmod +x /usr/local/bin/snapbot-host-rustc
+ENV RUSTC_WRAPPER=/usr/local/bin/snapbot-host-rustc \
+    PKG_CONFIG_PATH=/opt/snapbot-static/lib/pkgconfig \
     PKG_CONFIG_ALL_STATIC=1 \
     CARGO_BUILD_TARGET=x86_64-unknown-linux-musl \
     RUSTFLAGS="-C linker=/usr/local/bin/snapbot-static-cxx-link -C target-feature=+crt-static -C relocation-model=static -C link-arg=-no-pie"
