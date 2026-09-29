@@ -65,19 +65,20 @@ ENV RUSTC_WRAPPER=/usr/local/bin/snapbot-host-rustc \
     RUSTFLAGS="-C linker=/usr/local/bin/snapbot-static-cxx-link -C target-feature=+crt-static -C relocation-model=static -C link-arg=-no-pie"
 
 WORKDIR /src
-COPY Cargo.toml ./
+# The committed lock, --locked, exactly as Dockerfile: the gate proves the
+# dependency set the release image ships.
+COPY Cargo.toml Cargo.lock ./
 COPY ocrd-rust/Cargo.toml ocrd-rust/Cargo.toml
 COPY snapbot/Cargo.toml snapbot/Cargo.toml
 RUN mkdir -p ocrd-rust/src snapbot/src \
     && echo '' > ocrd-rust/src/lib.rs \
     && echo 'fn main() {}' > snapbot/src/main.rs \
-    && cargo build --release \
-    && rm -rf ocrd-rust/src snapbot/src \
-    && echo LOCKFILE-BEGIN && cat Cargo.lock && echo LOCKFILE-END
+    && cargo build --release --locked \
+    && rm -rf ocrd-rust/src snapbot/src
 COPY ocrd-rust/src ocrd-rust/src
 COPY snapbot/src snapbot/src
 RUN touch ocrd-rust/src/lib.rs snapbot/src/main.rs \
-    && cargo build --release \
+    && cargo build --release --locked \
     && mkdir -p /out/tessdata \
     && cp target/x86_64-unknown-linux-musl/release/snapbot /out/bootstrap \
     && ! ldd /out/bootstrap \
@@ -92,7 +93,7 @@ RUN mkdir -p /out/bench-tessdata \
         "https://github.com/tesseract-ocr/tessdata_best/raw/4.1.0/eng.traineddata"
 
 # The unit tests, on the same toolchain and static libraries.
-RUN cargo test --release --workspace \
+RUN cargo test --release --workspace --locked \
     && echo ok > /out/unit-tests.ok
 
 FROM public.ecr.aws/docker/library/golang:1.27-alpine@sha256:4c9fe60190a2a3350ddc51de80d0224b8a6698d12bdfc999fee45ea9d6c46dbc AS chromium
