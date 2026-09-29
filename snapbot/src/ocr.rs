@@ -3,16 +3,22 @@
 //! Owner 2026-09-29: "so keep OCR in the Chromium lane then", "also avoid image
 //! transmission; do the OCR at capture point in snapbot", and "can you keep
 //! domain knowledge out of snapbot". The screenshot step hands the PNG bytes
-//! it just captured -- in memory, never re-encoded, never written to a temp
-//! file -- to this process's one resident Tesseract engine. The spec is
-//! generic: `passes` run first; `fallback` runs only when fewer than
-//! `min_fraction` of the caller's keywords appear in the text so far. Text is
-//! unioned in submission order, one read per line block, as route66's former
-//! two-wave reader assembled it.
+//! CDP just returned to this process's one resident Tesseract engine, which
+//! decodes them once in memory. The spec is generic: `passes` run in order and
+//! stop as soon as `stop_when` is met; `fallback` runs only when it is still
+//! unmet. Keywords and regions come from the caller's page-side JavaScript.
+//!
+//! REQUEST (a screenshot step's `ocr` field):
+//!   passes:    [{psm, lang, dpi, upscale, pixel_budget}]  required, non-empty
+//!   fallback:  [{...same...}]                             optional
+//!   stop_when: {keywords_fn: "<JS fn source -> string[]>", min_fraction: 0..1}
+//!   regions:   [{x, y, width, height}] | "<JS fn source -> rects>"   optional
+//! `upscale` is the pass scale: (0, 1) downscales, 1 (default) reads the
+//! captured pixels, a whole 2..4 upscales (bounded by pixel_budget).
 
 use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
-use snapbot_ocr::{Engine, Image, Pass, Rect};
+use snapbot_ocr::{Engine, Gray, Pass, Rect};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -55,31 +61,34 @@ pub fn parse_rects(v: &Value, what: &str) -> Result<Vec<Rect>> {
 
 fn parse_pass(v: &Value, what: &str) -> Result<Pass> {
     let o = v.as_object().ok_or_else(|| anyhow!("{what} must be an object"))?;
-    let num = |k: &str| -> Result<u64> {
+    let num = |k: &str| -> Result<f64> {
         match o.get(k) {
-            None | Some(Value::Null) => Ok(0),
-            Some(x) => x
-                .as_f64()
-                .filter(|f| *f >= 0.0 && f.fract() == 0.0)
-                .map(|f| f as u64)
-                .ok_or_else(|| anyhow!("{what}.{k} must be a non-negative integer")),
+            None | Some(Value::Null) => Ok(0.0),
+            Some(x) => x.as_f64().filter(|f| f.is_finite() && *f >= 0.0).ok_or_else(|| anyhow!("{what}.{k} must be a non-negative number")),
         }
+    };
+    let int = |k: &str| -> Result<u64> {
+        let f = num(k)?;
+        if f.fract() != 0.0 {
+            bail!("{what}.{k} must be an integer");
+        }
+        Ok(f as u64)
     };
     let lang = match o.get("lang") {
         None | Some(Value::Null) => String::new(),
         Some(Value::String(s)) => s.clone(),
         Some(_) => bail!("{what}.lang must be a string"),
     };
-    Ok(Pass { psm: num("psm")? as u32, lang, dpi: num("dpi")? as u32, upscale: num("upscale")? as u32, pixel_budget: num("pixel_budget")? }
-        .normalized())
+    let p = Pass { psm: int("psm")? as u32, lang, dpi: int("dpi")? as u32, scale: num("upscale")?, pixel_budget: int("pixel_budget")? }
+        .normalized();
+    p.validate().map_err(|e| anyhow!("{what}.upscale: {e}"))?;
+    Ok(p)
 }
 
 fn parse_passes(v: Option<&Value>, what: &str, required: bool) -> Result<Vec<Pass>> {
     match v {
         None | Some(Value::Null) if !required => Ok(Vec::new()),
-        Some(Value::Array(a)) if !a.is_empty() || !required => {
-            a.iter().enumerate().map(|(i, p)| parse_pass(p, &format!("{what}[{i}]"))).collect()
-        }
+        Some(Value::Array(a)) if !a.is_empty() || !required => a.iter().enumerate().map(|(i, p)| parse_pass(p, &format!("{what}[{i}]"))).collect(),
         _ => bail!("{what} must be a non-empty array of passes"),
     }
 }
@@ -105,11 +114,12 @@ pub fn parse(v: &Value) -> Result<(Spec, PageFns)> {
             _ => bail!("ocr.stop_when.keywords_fn must be a JavaScript function source"),
         }
         if let Some(m) = sw.get("min_fraction").filter(|v| !v.is_null()) {
-            min_fraction = m
-                .as_f64()
-                .filter(|f| (0.0..=1.0).contains(f))
-                .ok_or_else(|| anyhow!("ocr.stop_when.min_fraction must be a number in [0, 1]"))?;
+            min_fraction =
+                m.as_f64().filter(|f| (0.0..=1.0).contains(f)).ok_or_else(|| anyhow!("ocr.stop_when.min_fraction must be a number in [0, 1]"))?;
         }
+    }
+    if !fallback.is_empty() && keywords_fn.is_none() {
+        bail!("ocr.fallback needs ocr.stop_when: without keywords it could never run");
     }
     Ok((Spec { passes, fallback, min_fraction, regions }, PageFns { keywords_fn, regions_fn }))
 }
@@ -119,23 +129,24 @@ pub fn normalize(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
 }
 
-/// The fraction of keywords present in `text` (case-insensitive, whitespace-
-/// collapsed substring). Keywords that normalize to empty are not counted.
-pub fn keyword_fraction(text: &str, keywords: &[String]) -> Option<f64> {
+/// The keywords present in `text` (case-insensitive, whitespace-collapsed
+/// substring) and their fraction of the keywords that normalize non-empty.
+pub fn keyword_match(text: &str, keywords: &[String]) -> (Vec<String>, Option<f64>) {
     let hay = normalize(text);
-    let kws: Vec<String> = keywords.iter().map(|k| normalize(k)).filter(|k| !k.is_empty()).collect();
+    let kws: Vec<&String> = keywords.iter().filter(|k| !normalize(k).is_empty()).collect();
     if kws.is_empty() {
-        return None;
+        return (Vec::new(), None);
     }
-    let hit = kws.iter().filter(|k| hay.contains(k.as_str())).count();
-    Some(hit as f64 / kws.len() as f64)
+    let hit: Vec<String> = kws.iter().filter(|k| hay.contains(normalize(k).as_str())).map(|k| k.to_string()).collect();
+    let f = hit.len() as f64 / kws.len() as f64;
+    (hit, Some(f))
 }
 
 struct Job {
     png: Arc<Vec<u8>>,
     spec: Spec,
     keywords: Option<Vec<String>>,
-    reply: oneshot::Sender<Value>,
+    reply: oneshot::Sender<Result<Value, String>>,
 }
 
 static ENGINE: OnceLock<Mutex<mpsc::Sender<Job>>> = OnceLock::new();
@@ -163,71 +174,74 @@ fn engine() -> mpsc::Sender<Job> {
         .clone()
 }
 
-fn pass_json(wave: u32, p: &Pass, t: &snapbot_ocr::PassTiming) -> Value {
-    json!({"wave": wave, "psm": p.psm, "lang": p.lang, "dpi": p.dpi, "upscale": p.upscale, "pixel_budget": p.pixel_budget,
-           "scale": t.scale, "decode_ms": t.decode_ms, "preprocess_ms": t.preprocess_ms, "ocr_ms": t.ocr_ms,
-           "region_ms": t.region_ms})
-}
-
-fn run_job(engine: &mut Engine, png: &[u8], spec: &Spec, keywords: Option<&[String]>) -> Value {
-    let started = Instant::now();
-    let mut img = Image::new(png);
+/// Run a spec over an already decoded plane. Public so the bench can drive
+/// the exact request path with its own engines.
+pub fn run_spec(engine: &mut Engine, g: &Gray, spec: &Spec, keywords: Option<&[String]>) -> Result<Value, String> {
     let mut text = String::new();
     let mut passes = Vec::new();
-    let (mut decode, mut pre, mut ocr) = (0u64, 0u64, 0u64);
-    let mut waves_run = 0u32;
-    let mut error = String::new();
-    let met = |t: &str| keywords.and_then(|k| keyword_fraction(t, k)).map(|f| f >= spec.min_fraction);
-    'waves: for (wave, list) in [(1u32, &spec.passes), (2u32, &spec.fallback)] {
-        if list.is_empty() {
-            continue;
-        }
+    let (mut resample, mut ocr) = (0u64, 0u64);
+    let mut won = Value::Null;
+    let met = |t: &str| keywords.and_then(|k| keyword_match(t, k).1).map(|f| f >= spec.min_fraction);
+    'waves: for (wave, list) in [("passes", &spec.passes), ("fallback", &spec.fallback)] {
         // The fallback wave runs only when keywords were supplied and are unmet.
-        if wave == 2 && met(&text) != Some(false) {
+        if wave == "fallback" && met(&text) != Some(false) {
             break;
         }
-        waves_run = wave;
-        for p in list.iter() {
-            match engine.read(&mut img, p, &spec.regions) {
-                Ok((t, timing)) => {
-                    decode += timing.decode_ms;
-                    pre += timing.preprocess_ms;
-                    ocr += timing.ocr_ms;
-                    passes.push(pass_json(wave, p, &timing));
-                    text.push_str(&t);
-                    text.push('\n');
-                }
-                Err(e) => {
-                    error = e;
-                    break 'waves;
-                }
-            }
+        for (i, p) in list.iter().enumerate() {
+            let (t, timing) = engine.read(g, p, &spec.regions)?;
+            resample += timing.resample_ms;
+            ocr += timing.ocr_ms;
+            text.push_str(&t);
+            text.push('\n');
+            let f = keywords.and_then(|k| keyword_match(&text, k).1);
+            passes.push(json!({"wave": wave, "index": i, "psm": p.psm, "lang": p.lang, "dpi": p.dpi, "upscale": p.scale,
+                               "pixel_budget": p.pixel_budget, "pixels": timing.pixels, "resample_ms": timing.resample_ms,
+                               "ocr_ms": timing.ocr_ms, "fraction": f}));
             // Stop as soon as the keyword floor is met: the union is monotonic,
             // so the reads skipped could not have changed the answer.
             if met(&text) == Some(true) {
+                won = json!({"wave": wave, "index": i});
                 break 'waves;
             }
         }
     }
-    let fraction = keywords.and_then(|k| keyword_fraction(&text, k));
-    json!({
+    let (matched, fraction) = match keywords {
+        Some(k) => {
+            let (m, f) = keyword_match(&text, k);
+            (json!(m), f)
+        }
+        None => (Value::Null, None),
+    };
+    Ok(json!({
         "text": text,
-        "error": error,
-        "waves_run": waves_run,
-        "keyword_fraction": fraction,
-        "met": fraction.map(|f| f >= spec.min_fraction),
+        "keywords": keywords,
+        "matched": matched,
+        "fraction": fraction,
         "min_fraction": spec.min_fraction,
+        "met": fraction.map(|f| f >= spec.min_fraction),
+        "won": won,
         "passes": passes,
-        "timings": {"decode_ms": decode, "preprocess_ms": pre, "ocr_ms": ocr, "total_ms": started.elapsed().as_millis() as u64},
-        "metadata": {"worker_version": WORKER_VERSION},
-    })
+        "engine": WORKER_VERSION,
+        "timings": {"resample_ms": resample, "ocr_ms": ocr},
+    }))
+}
+
+fn run_job(engine: &mut Engine, png: &[u8], spec: &Spec, keywords: Option<&[String]>) -> Result<Value, String> {
+    let t = Instant::now();
+    let g = snapbot_ocr::decode(png)?;
+    let decode_ms = t.elapsed().as_millis() as u64;
+    let mut out = run_spec(engine, &g, spec, keywords)?;
+    out["timings"]["decode_ms"] = json!(decode_ms);
+    out["timings"]["total_ms"] = json!(t.elapsed().as_millis() as u64);
+    out["image"] = json!({"width": g.w, "height": g.h});
+    Ok(out)
 }
 
 /// OCR `png` in this process's engine. The bytes are shared, not copied.
 pub async fn read(png: Arc<Vec<u8>>, spec: Spec, keywords: Option<Vec<String>>) -> Result<Value> {
     let (reply, rx) = oneshot::channel();
     engine().send(Job { png, spec, keywords, reply }).map_err(|_| anyhow!("OCR engine thread is gone"))?;
-    rx.await.map_err(|_| anyhow!("OCR engine thread died"))
+    rx.await.map_err(|_| anyhow!("OCR engine thread died"))?.map_err(|e| anyhow!("ocr: {e}"))
 }
 
 #[cfg(test)]
@@ -235,22 +249,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn keyword_fraction_is_case_and_whitespace_insensitive() {
+    fn keyword_match_is_case_and_whitespace_insensitive() {
         // WHY: the fallback wave keys on this fraction; a miss here re-reads
-        // every screenshot at three times the cost.
+        // every screenshot at a higher scale.
         let kws = vec!["Save  and\nContinue".to_string(), "Missing".to_string(), "  ".to_string()];
-        assert_eq!(keyword_fraction("header\nSAVE AND   continue footer", &kws), Some(0.5));
-        assert_eq!(keyword_fraction("anything", &[]), None);
+        let (hit, f) = keyword_match("header\nSAVE AND   continue footer", &kws);
+        assert_eq!(f, Some(0.5));
+        assert_eq!(hit, vec!["Save  and\nContinue".to_string()]);
+        assert_eq!(keyword_match("anything", &[]).1, None);
     }
 
     #[test]
-    fn spec_requires_passes_and_a_bounded_fraction() {
+    fn spec_requires_passes_bounded_fraction_and_valid_scale() {
         assert!(parse(&json!({"passes": []})).is_err());
         assert!(parse(&json!({"passes": [{}], "stop_when": {"keywords_fn": "() => []", "min_fraction": 2}})).is_err());
-        let (spec, f) = parse(&json!({"passes": [{"psm": 3}], "fallback": [{"psm": 6, "upscale": 3}],
+        assert!(parse(&json!({"passes": [{"upscale": 1.5}]})).is_err());
+        assert!(parse(&json!({"passes": [{}], "fallback": [{"upscale": 2}]})).is_err());
+        let (spec, f) = parse(&json!({"passes": [{"psm": 3, "upscale": 0.5}], "fallback": [{"psm": 6, "upscale": 2}],
                                       "stop_when": {"keywords_fn": "() => []", "min_fraction": 0.7}}))
         .unwrap();
-        assert_eq!(spec.passes[0].upscale, 1);
+        assert_eq!(spec.passes[0].scale, 0.5);
         assert_eq!(spec.fallback[0].pixel_budget, 20_000_000);
         assert_eq!(f.keywords_fn.as_deref(), Some("() => []"));
         assert!(spec.regions.is_empty());

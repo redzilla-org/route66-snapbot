@@ -71,6 +71,12 @@ RUN touch ocrd-rust/src/lib.rs snapbot/src/main.rs \
     && curl -fsSL -o /out/tessdata/eng.traineddata \
         "https://github.com/tesseract-ocr/tessdata_fast/raw/4.1.0/eng.traineddata"
 
+# tessdata_best, for the bench's fast-vs-best comparison only; the production
+# image ships tessdata_fast alone.
+RUN mkdir -p /out/bench-tessdata \
+    && curl -fsSL -o /out/bench-tessdata/eng.traineddata \
+        "https://github.com/tesseract-ocr/tessdata_best/raw/4.1.0/eng.traineddata"
+
 # The unit tests, on the same toolchain and static libraries.
 RUN cargo test --release --workspace \
     && echo ok > /out/unit-tests.ok
@@ -107,3 +113,12 @@ RUN /var/runtime/bootstrap --version \
     && /var/runtime/bootstrap probe
 
 CMD ["index.handler"]
+
+# bench: the per-read OCR cost on a tall listing page (GH #4115), in the
+# production userland. fixtures/big.png is a 1366x5477 listing detail capture;
+# the page shows it at 1:1 so the full-page capture is that tall.
+FROM runtime AS bench
+COPY --from=native-build /out/bench-tessdata /opt/bench/best
+COPY fixtures/big.png /opt/bench/big.png
+RUN printf '%s' '<!doctype html><html><body style="margin:0"><img src="big.png" style="display:block"></body></html>' > /opt/bench/tall.html \
+    && /var/runtime/bootstrap bench file:///opt/bench/tall.html /opt/bench/best

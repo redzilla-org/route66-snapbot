@@ -527,14 +527,18 @@ impl Page {
     }
 
     /// Page.captureScreenshot: png, optimizeForSpeed (owner 2026-09-29: request
-    /// the fast encoder), captureBeyondViewport for a full-page shot.
+    /// the fast encoder). A full-page shot clips to the CSS content size with
+    /// captureBeyondViewport, as puppeteer does; without the clip Chromium
+    /// returns only the viewport.
     pub async fn screenshot(&self, full_page: bool) -> Result<Vec<u8>> {
-        let r = self
-            .send(
-                "Page.captureScreenshot",
-                json!({"format": "png", "optimizeForSpeed": true, "fromSurface": true, "captureBeyondViewport": full_page}),
-            )
-            .await?;
+        let mut p = json!({"format": "png", "optimizeForSpeed": true, "fromSurface": true, "captureBeyondViewport": full_page});
+        if full_page {
+            let m = self.send("Page.getLayoutMetrics", json!({})).await?;
+            let size = m.get("cssContentSize").or_else(|| m.get("contentSize")).ok_or_else(|| anyhow!("getLayoutMetrics returned no content size"))?;
+            let dim = |k: &str| size.get(k).and_then(Value::as_f64).filter(|f| *f > 0.0).ok_or_else(|| anyhow!("content size has no {k}"));
+            p["clip"] = json!({"x": 0, "y": 0, "width": dim("width")?.ceil(), "height": dim("height")?.ceil(), "scale": 1});
+        }
+        let r = self.send("Page.captureScreenshot", p).await?;
         let data = r.get("data").and_then(Value::as_str).ok_or_else(|| anyhow!("captureScreenshot returned no data"))?;
         Ok(base64::engine::general_purpose::STANDARD.decode(data)?)
     }

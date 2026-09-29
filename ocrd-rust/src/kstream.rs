@@ -285,6 +285,12 @@ fn upscale_2x(src: &[u8], w: usize, h: usize) -> Vec<u8> {
     dst
 }
 
+/// Upscale an already decoded gray plane (or a crop of it) by a whole factor:
+/// the engine rescales the one decoded plane per pass instead of re-decoding.
+pub fn upscale_gray(src: &[u8], w: usize, h: usize, scale: usize) -> Vec<u8> {
+    upscale_k(src, w, h, scale)
+}
+
 /// Factor-2 specialization when available, general scaler for any other factor.
 fn upscale_k(src: &[u8], w: usize, h: usize, scale: usize) -> Vec<u8> {
     if scale <= 1 {

@@ -6,11 +6,13 @@
 //!   snapbot kumo-lane        one pool lane (started by kumo-runtime)
 //!   snapbot probe            image build check: Chromium renders a page, the
 //!                            in-process engine OCRs the captured PNG
+//!   snapbot bench <url> <dir> OCR cost measurements (Dockerfile.test only)
 //!   snapbot --version
 
 mod actions;
 mod attest;
 mod awsres;
+mod bench;
 mod browse;
 mod browser;
 mod capture;
@@ -59,6 +61,12 @@ async fn run() -> Result<()> {
             kumo::run_lane(handler).await
         }
         "probe" => probe().await,
+        // Test-image only: the OCR cost measurements on a tall page.
+        "bench" => {
+            let a: Vec<String> = std::env::args().skip(2).collect();
+            anyhow::ensure!(a.len() == 2, "usage: snapbot bench <url> <best-tessdata-dir>");
+            bench::run(&a[0], &a[1]).await
+        }
         "" | "index.handler" | "fetch-hop.handler" => {
             let h = if arg.is_empty() { handler } else { arg };
             init(&h)?;

@@ -423,16 +423,14 @@ async fn screenshot_step(step: &Step, page: &Page, ctx: &RunCtx<'_>) -> Result<O
     let mut timings = json!({"fns_ms": fns_ms, "capture_ms": capture_ms, "store_ms": store_ms});
     if let Some(spec) = spec {
         let regions: Vec<Value> = spec.regions.iter().map(|r| json!({"x": r.x, "y": r.y, "width": r.width, "height": r.height})).collect();
-        // In the lane, on the bytes just captured: no re-encode, no temp file.
-        let mut out = ocr::read(Arc::new(png), spec, keywords.clone()).await?;
-        let text = out["text"].as_str().unwrap_or("").to_string();
-        for k in ["decode_ms", "preprocess_ms", "ocr_ms"] {
+        // In the lane, on the bytes just captured: decoded once in memory, no
+        // re-encode, no temp file. The text rides back in the response.
+        let mut out = ocr::read(Arc::new(png), spec, keywords).await?;
+        for k in ["decode_ms", "resample_ms", "ocr_ms"] {
             timings[k] = out["timings"][k].clone();
         }
-        out["keywords"] = json!(keywords);
         out["regions"] = json!(regions);
         stored["ocr"] = out;
-        stored["ocr_artifact"] = store::put(ctx.event, &format!("{name}.ocr.txt"), text.as_bytes(), "text/plain; charset=utf-8").await?;
     }
     stored["timings"] = timings;
     Ok(Some(stored))

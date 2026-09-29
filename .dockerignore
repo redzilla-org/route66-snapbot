@@ -6,6 +6,8 @@
 !Cargo.lock
 !ocrd-rust
 !snapbot
+# The tall listing page Dockerfile.test's OCR bench renders.
+!fixtures/big.png
 ocrd-rust/target
 ocrd-rust/target-*
 ocrd-rust/bin
