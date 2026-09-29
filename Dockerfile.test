@@ -45,9 +45,11 @@ RUN curl -fsSL "https://github.com/tesseract-ocr/tesseract/archive/refs/tags/${T
     && make install \
     && cd / && rm -rf /tmp/build/tesseract-*
 
+# rustc passes -nodefaultlibs: libstdc++ (then libc) is named explicitly, as
+# in Dockerfile.
 RUN printf '%s\n' \
         '#!/bin/sh' \
-        'exec g++ -static -static-libstdc++ -static-libgcc "$@" -Wl,-Bstatic' \
+        'exec g++ -static -static-libstdc++ -static-libgcc "$@" -Wl,-Bstatic -lstdc++ -lc' \
         > /usr/local/bin/snapbot-static-cxx-link \
     && chmod +x /usr/local/bin/snapbot-static-cxx-link
 # Host units (build scripts, proc macros: rustc calls without --target) link

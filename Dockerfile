@@ -52,10 +52,12 @@ RUN curl -fsSL "https://github.com/tesseract-ocr/tesseract/archive/refs/tags/${T
 # The sys crates insert a late dynamic-link switch; this wrapper restores
 # static mode for the C++ runtime so `ldd` below is a hard build assertion.
 # The flags ride on the explicit --target so build scripts and proc macros
-# (host artifacts) link normally.
+# (host artifacts) link normally. rustc passes -nodefaultlibs, so g++ adds no
+# C++ runtime: Tesseract's objects need libstdc++ named explicitly, with libc
+# after it for the symbols libstdc++ itself pulls.
 RUN printf '%s\n' \
         '#!/bin/sh' \
-        'exec g++ -static -static-libstdc++ -static-libgcc "$@" -Wl,-Bstatic' \
+        'exec g++ -static -static-libstdc++ -static-libgcc "$@" -Wl,-Bstatic -lstdc++ -lc' \
         > /usr/local/bin/snapbot-static-cxx-link \
     && chmod +x /usr/local/bin/snapbot-static-cxx-link
 # rustup's musl toolchain links HOST artifacts static by default, and a static
