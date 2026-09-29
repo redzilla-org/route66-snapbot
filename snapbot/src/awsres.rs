@@ -235,7 +235,9 @@ async fn call(svc: &str, op: &str, region: &str, params: &Value, c: &Creds) -> R
     let host = format!("{host}.{region}.amazonaws.com");
     let (reply, is_json, parsed) = match proto {
         Proto::Json(ver, target) => {
-            let body = serde_json::to_vec(if params.is_object() { params } else { &json!({}) })?;
+            // A non-object params sends {}; the binding outlives the borrow.
+            let empty = json!({});
+            let body = serde_json::to_vec(if params.is_object() { params } else { &empty })?;
             let r = signed(
                 "POST",
                 &format!("https://{host}/"),

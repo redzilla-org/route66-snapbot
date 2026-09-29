@@ -20,7 +20,8 @@ path = "src/main.rs"
 snapbot-ocr = { path = "../ocrd-rust" }
 
 anyhow = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process", "io-util", "net", "fs"] }
+# io-std: a pool lane watches its stdin for the dispatcher's EOF (kumo.rs).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process", "io-util", "io-std", "net", "fs"] }
 # Raw CDP over the DevTools websocket (loopback only, so no TLS feature).
 tokio-tungstenite = "0.24"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
