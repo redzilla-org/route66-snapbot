@@ -481,26 +481,36 @@ fn transform_kstream(
 
 // ---- public seam ----
 
-/// The public entry point: PNG bytes in, 8-bit grayscale plane out.
-///
-/// Returns the plane with its post-scale geometry, ready to hand straight to an
-/// OCR engine — no intermediate file, which is the other half of what this
-/// service exists to remove.
-pub fn preprocess(
-    raw: &[u8],
-    max_scale: usize,
-    pixel_budget: u64,
-) -> Result<(Vec<u8>, usize, usize), String> {
-    let (buf, w, h, ct, bd) = decode(raw)?;
-    let scale = factor_within_budget(w, h, max_scale, pixel_budget);
-    let scaled = transform_kstream(&buf, w, h, ct, bd, scale)?;
-    Ok((scaled, w * scale, h * scale))
+/// One decoded PNG frame. Decoding is split from the transform so a caller
+/// running several passes over one screenshot decodes it exactly once and
+/// can time the decode apart from the preprocessing (GH #4115).
+pub struct Decoded {
+    buf: Vec<u8>,
+    w: usize,
+    h: usize,
+    ct: png::ColorType,
+    bd: png::BitDepth,
 }
 
-/// The scale `preprocess` would apply, computed from the PNG header alone
-/// (no frame decode). Exposed so the caller can route scale-1 requests around
-/// the preprocess entirely — see read_page in main.rs for the measured WHY.
-pub fn planned_scale(raw: &[u8], max_scale: usize, pixel_budget: u64) -> Result<usize, String> {
+/// PNG bytes in, one decoded frame out.
+pub fn decode_png(raw: &[u8]) -> Result<Decoded, String> {
+    let (buf, w, h, ct, bd) = decode(raw)?;
+    Ok(Decoded { buf, w, h, ct, bd })
+}
+
+/// Grayscale + contrast-stretch + upscale of an already decoded frame by the
+/// caller's budgeted `scale`: the 8-bit plane with its post-scale geometry,
+/// ready for the OCR engine.
+pub fn transform_at(d: &Decoded, scale: usize) -> Result<(Vec<u8>, usize, usize), String> {
+    let scale = scale.max(1);
+    let scaled = transform_kstream(&d.buf, d.w, d.h, d.ct, d.bd, scale)?;
+    Ok((scaled, d.w * scale, d.h * scale))
+}
+
+/// The image geometry from the PNG header alone (no frame decode), so the
+/// caller can plan the scale and route scale-1 reads around the preprocess
+/// entirely — see Engine::read in lib.rs for the measured WHY.
+pub fn dimensions(raw: &[u8]) -> Result<(usize, usize), String> {
     let mut options = png::DecodeOptions::default();
     options.set_ignore_checksums(true);
     options.set_ignore_text_chunk(true);
@@ -508,12 +518,7 @@ pub fn planned_scale(raw: &[u8], max_scale: usize, pixel_budget: u64) -> Result<
     let dec = png::Decoder::new_with_options(Cursor::new(raw), options);
     let reader = dec.read_info().map_err(|e| format!("png read_info: {e}"))?;
     let info = reader.info();
-    Ok(factor_within_budget(
-        info.width as usize,
-        info.height as usize,
-        max_scale,
-        pixel_budget,
-    ))
+    Ok((info.width as usize, info.height as usize))
 }
 
 /// Largest factor up to `max` whose output respects `pixel_budget`.
@@ -521,7 +526,7 @@ pub fn planned_scale(raw: &[u8], max_scale: usize, pixel_budget: u64) -> Result<
 /// The upscale is quadratic, so an unbounded factor on a tall page can cost more
 /// than every other page in a batch combined. The budget belongs to the caller;
 /// this only picks the best factor that honors it, and 1 is always admissible.
-fn factor_within_budget(w: usize, h: usize, max: usize, pixel_budget: u64) -> usize {
+pub fn factor_within_budget(w: usize, h: usize, max: usize, pixel_budget: u64) -> usize {
     let pixels = w as u64 * h as u64;
     let mut factor = max.max(1);
 

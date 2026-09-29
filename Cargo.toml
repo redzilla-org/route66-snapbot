@@ -1,0 +1,24 @@
+# One workspace, one lockfile: the snapbot Lambda handler (snapbot/) and the
+# in-process OCR engine it links (ocrd-rust/). GH #4115 replaced the Node
+# coordinator and the --stdio OCR child with this single static binary.
+[workspace]
+members = ["ocrd-rust", "snapbot"]
+resolver = "2"
+
+# Thin LTO keeps the AWS SDK's link time sane; the measured image kernels in
+# ocrd-rust/src/kstream.rs keep codegen-units = 1 (the benchmark's settings,
+# non-PGO) through the per-package overrides below. panic = "abort": a bug
+# kills the process loudly instead of unwinding into a half-served request.
+[profile.release]
+opt-level = 3
+lto = "thin"
+panic = "abort"
+
+[profile.release.package.snapbot-ocr]
+codegen-units = 1
+
+[profile.release.package.png]
+codegen-units = 1
+
+[profile.release.package.fdeflate]
+codegen-units = 1

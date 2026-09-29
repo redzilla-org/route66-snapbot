@@ -1,10 +1,12 @@
-# Both Dockerfiles COPY only ocrd-rust/ and attestor/. Everything else in this
+# Both Dockerfiles COPY only the Cargo workspace. Everything else in this
 # checkout (benchmarks, profiles, sibling toolchains, local build output) sent
 # ~7.4GB of context per build; exclude it so the daemon receives what it uses.
 *
+!Cargo.toml
+!Cargo.lock
 !ocrd-rust
-!attestor
+!snapbot
 ocrd-rust/target
 ocrd-rust/target-*
 ocrd-rust/bin
-attestor/attestor/node_modules
+snapbot/target

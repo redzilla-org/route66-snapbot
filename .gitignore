@@ -1,6 +1,7 @@
 # Build and measurement outputs are reproducible; only sources and results are tracked.
 out/
 bin/
+/target/
 rust/target/
 zig/.zig-cache/
 zig/out/

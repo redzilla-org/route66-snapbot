@@ -1,58 +1,25 @@
-# ocrd — a generic, long-lived OCR service.
+# snapbot-ocr -- the in-process OCR engine linked into the snapbot handler.
 #
 # GENERIC BY CONSTRUCTION: nothing here knows what a "market", a "brand" or a
-# "screenshot" is. Every project-specific choice -- which image, which
-# segmentation mode, how much to upscale, which language -- arrives as a request
-# PARAMETER, so the same binary serves any caller that speaks the protocol.
+# "check" is. Every choice -- segmentation mode, upscale, language, budget --
+# arrives as a Pass from the caller (GH #4115: the stdio child and its base64
+# JSON protocol are deleted; the handler hands this crate the bytes it captured).
 [package]
-name = "snapbot-ocr-worker"
-version = "1.0.0"
+name = "snapbot-ocr"
+version = "2.0.0"
 edition = "2021"
-description = "Resident Tesseract worker behind snapbot's private JSON-lines protocol"
+description = "Resident Tesseract engine linked into route66-snapbot"
 license = "MIT"
 
+[lib]
+path = "src/lib.rs"
+
 [dependencies]
-# THE TRANSPORT. A NATS queue-group subscriber replaced the loopback TCP
-# listener because a TCP port cannot cross a machine boundary that the caller
-# and the daemon do not share: a Linux ocrd in a WSL2 container answering a
-# Windows harness on loopback could never see a Windows filesystem path, and
-# could never prove WHICH daemon answered. A per-run-unique subject prefix
-# solves both -- the image travels in the message, and answering on a subject
-# only this run knows IS the identity proof.
-#
-# default-features stay on: the default set is what carries TLS and the
-# standard connection handling, and trimming it buys nothing here.
-
-# async-nats is a tokio library, so the runtime is not a choice. Only the
-# pieces this daemon actually uses are enabled: a multi-thread runtime (the
-# OCR calls are blocking C code and are run under block_in_place, which
-# REQUIRES the multi-thread flavour) and the #[tokio::main] macro.
-
-# The request carries the image INLINE as base64, so the daemon never needs to
-# share a filesystem with its caller. This is the decoder for that field.
-base64 = "0.22"
-
-# The Tesseract binding. The model is loaded ONCE and stays resident for the
-# life of the process -- the entire reason this service exists.
+# The Tesseract binding. The model is loaded ONCE per pool process and stays
+# resident -- the entire reason this engine exists.
 leptess = "0.14"
 
-# The DECODER, not a general image library: png 0.18.1 + fdeflate is the
-# decoder of ../img-scaling-benchmark's overall winner ("Pure Rust KSTREAM,
-# non-PGO": 28.98/54.77/34.14 ms). src/kstream.rs carries the port.
+# The DECODER, not a general image library: png 0.18 + fdeflate is the decoder
+# of ../img-scaling-benchmark's overall winner ("Pure Rust KSTREAM, non-PGO").
+# src/kstream.rs carries the port.
 png = "0.18"
-
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-# Solely for StreamExt::next: an async-nats Subscriber is a Stream and exposes
-# no inherent next(). default-features off keeps the executor/compat halves of
-# the crate out of the build; only the Stream traits are wanted.
-
-# Copied from the benchmark's winning build, because the kernels in src/kstream.rs
-# were measured under exactly these settings (non-PGO; PGO measured as a wash).
-[profile.release]
-opt-level = 3
-codegen-units = 1
-# Whole-program LTO across the png crate boundary, and abort-on-panic so no
-# unwind landing pads are emitted around the hot loops.
-lto = "fat"
-panic = "abort"

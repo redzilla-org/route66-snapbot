@@ -1,17 +1,29 @@
-# route66-snapbot ships Chromium, attestation, and OCR as one amd64 Lambda
-# image. Building Tesseract and Leptonica statically keeps their native-library
-# closure out of the Lambda base and makes the final runtime self-contained.
-FROM public.ecr.aws/docker/library/golang:1.27-alpine@sha256:4c9fe60190a2a3350ddc51de80d0224b8a6698d12bdfc999fee45ea9d6c46dbc AS ocr-build
+# route66-snapbot: one amd64 Lambda image holding one static Rust binary (the
+# handler, GH #4115), Chromium, and the Tesseract English model. No Node, npm
+# or Playwright: the owner burned the Node coordinator on 2026-09-29.
+
+# ---------------------------------------------------------------------------
+# native-build: static Leptonica + Tesseract, and the static musl handler.
+# Building Tesseract statically keeps its native closure out of the runtime
+# image; the handler links it in-process (no OCR child, no pipe).
+# ---------------------------------------------------------------------------
+FROM public.ecr.aws/docker/library/golang:1.27-alpine@sha256:4c9fe60190a2a3350ddc51de80d0224b8a6698d12bdfc999fee45ea9d6c46dbc AS native-build
 
 ARG LEPTONICA_VERSION=1.87.0
 ARG TESSERACT_VERSION=5.5.2
+# The AWS SDK's MSRV (1.94.1) is newer than Alpine's packaged rustc, so the
+# toolchain is rustup's pinned musl build.
+ARG RUST_VERSION=1.97.0
 
-# These packages exist only in the build stage. The final Lambda image receives
-# one static executable and the English model, never a compiler or package cache.
-RUN apk add --no-cache rust cargo build-base linux-headers musl-dev pkgconf \
+RUN apk add --no-cache build-base linux-headers musl-dev pkgconf \
         clang clang-dev llvm-dev ca-certificates curl autoconf automake libtool \
         zlib-dev zlib-static libpng-dev libpng-static libjpeg-turbo-dev \
-        libjpeg-turbo-static giflib-dev giflib-static libstdc++-dev
+        libjpeg-turbo-static giflib-dev giflib-static libstdc++-dev cmake perl \
+    && curl -fsSL -o /tmp/rustup-init https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-musl/rustup-init \
+    && chmod +x /tmp/rustup-init \
+    && /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain ${RUST_VERSION} \
+    && rm /tmp/rustup-init
+ENV PATH=/root/.cargo/bin:${PATH}
 
 WORKDIR /tmp/build
 RUN curl -fsSL "https://github.com/DanBloomberg/leptonica/archive/refs/tags/${LEPTONICA_VERSION}.tar.gz" \
@@ -33,72 +45,81 @@ RUN curl -fsSL "https://github.com/tesseract-ocr/tesseract/archive/refs/tags/${T
     && make -j"$(nproc)" \
     && make install
 
-COPY ocrd-rust /src
-WORKDIR /src
-
-# The sys crates insert a late dynamic-link switch. This wrapper restores static
-# mode for the C++ runtime so `ldd` below becomes a hard image-build assertion.
+# The sys crates insert a late dynamic-link switch; this wrapper restores
+# static mode for the C++ runtime so `ldd` below is a hard build assertion.
+# The flags ride on the explicit --target so build scripts and proc macros
+# (host artifacts) link normally.
 RUN printf '%s\n' \
         '#!/bin/sh' \
         'exec g++ -static -static-libstdc++ -static-libgcc "$@" -Wl,-Bstatic' \
         > /usr/local/bin/snapbot-static-cxx-link \
-    && chmod +x /usr/local/bin/snapbot-static-cxx-link \
-    && PKG_CONFIG_PATH=/opt/snapbot-static/lib/pkgconfig PKG_CONFIG_ALL_STATIC=1 \
-        cargo rustc --release --locked --target-dir target-static --bin snapbot-ocr-worker -- \
-        -C linker=/usr/local/bin/snapbot-static-cxx-link \
-        -C target-feature=+crt-static -C relocation-model=static -C link-arg=-no-pie \
+    && chmod +x /usr/local/bin/snapbot-static-cxx-link
+ENV PKG_CONFIG_PATH=/opt/snapbot-static/lib/pkgconfig \
+    PKG_CONFIG_ALL_STATIC=1 \
+    CARGO_BUILD_TARGET=x86_64-unknown-linux-musl \
+    RUSTFLAGS="-C linker=/usr/local/bin/snapbot-static-cxx-link -C target-feature=+crt-static -C relocation-model=static -C link-arg=-no-pie"
+
+WORKDIR /src
+# Dependencies first, against stub sources, so a source edit reuses them.
+COPY Cargo.toml Cargo.lock ./
+COPY ocrd-rust/Cargo.toml ocrd-rust/Cargo.toml
+COPY snapbot/Cargo.toml snapbot/Cargo.toml
+RUN mkdir -p ocrd-rust/src snapbot/src \
+    && echo '' > ocrd-rust/src/lib.rs \
+    && echo 'fn main() {}' > snapbot/src/main.rs \
+    && cargo build --release --locked \
+    && rm -rf ocrd-rust/src snapbot/src
+COPY ocrd-rust/src ocrd-rust/src
+COPY snapbot/src snapbot/src
+RUN touch ocrd-rust/src/lib.rs snapbot/src/main.rs \
+    && cargo build --release --locked \
     && mkdir -p /out/tessdata \
-    && cp target-static/release/snapbot-ocr-worker /out/snapbot-ocr-worker \
+    && cp target/x86_64-unknown-linux-musl/release/snapbot /out/bootstrap \
+    && ! ldd /out/bootstrap \
+    && /out/bootstrap --version \
     && curl -fsSL -o /out/tessdata/eng.traineddata \
-        "https://github.com/tesseract-ocr/tessdata_fast/raw/4.1.0/eng.traineddata" \
-    && ! ldd /out/snapbot-ocr-worker \
-    && /out/snapbot-ocr-worker --version
+        "https://github.com/tesseract-ocr/tessdata_fast/raw/4.1.0/eng.traineddata"
 
-FROM public.ecr.aws/lambda/nodejs:22 AS runtime
+# ---------------------------------------------------------------------------
+# chromium: the @sparticuz/chromium 149.0.0 payload the Node handler ran,
+# fetched as the published npm tarball (integrity-checked against the former
+# lockfile's sha512) and inflated once at build time instead of into /tmp on
+# every cold start. Same binary, same fonts, same flags: same pixels.
+# ---------------------------------------------------------------------------
+FROM public.ecr.aws/docker/library/golang:1.27-alpine@sha256:4c9fe60190a2a3350ddc51de80d0224b8a6698d12bdfc999fee45ea9d6c46dbc AS chromium
 
-# npm's production closure contains the pinned Sparticuz Chromium build and
-# puppeteer driver.
-#
-# The AWS SDK v3 clients are installed HERE, into ${LAMBDA_TASK_ROOT}/node_modules,
-# which Node resolves before the managed base's /var/runtime/node_modules.
-# redzilla-org/route66#4039: the base's bundled SDK is not one coherent version
-# set -- its cloudwatch-logs, cloudwatch and dynamodb clients failed every call
-# before sending with "serializerMiddleware is not found when adding
-# endpointV2Middleware middleware before serializerMiddleware" (a client built
-# against a different @smithy middleware stack than the shared endpoint/serde
-# packages it loaded), while its s3/ssm/sts clients worked. One npm install of
-# every client the handler builds dedupes a single @aws-sdk/core + @smithy/*
-# set. --before freezes that set to a date so a rebuild resolves the same
-# versions; bump it deliberately. --no-save keeps package-lock.json (and the
-# npm ci proof in Dockerfile.test) untouched. index.js refuses any aws-resource
-# client that does not resolve from this directory, so a service missing from
-# this list fails loudly instead of silently falling back to the base's copy.
-COPY attestor/attestor/package.json attestor/attestor/package-lock.json ${LAMBDA_TASK_ROOT}/
-RUN cd ${LAMBDA_TASK_ROOT} \
-    && npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
-    && npm install --no-save --omit=dev --ignore-scripts --no-audit --no-fund \
-         --before=2026-09-26T00:00:00Z \
-         @aws-sdk/client-s3 @aws-sdk/client-ssm @aws-sdk/client-sts @aws-sdk/client-sfn \
-         @aws-sdk/client-cloudwatch @aws-sdk/client-cloudwatch-logs @aws-sdk/client-dynamodb \
-         @aws-sdk/client-cloudformation @aws-sdk/client-lambda \
-    && npm cache clean --force
+ARG SPARTICUZ_VERSION=149.0.0
+ARG SPARTICUZ_SHA512=2NECBVKlUA9xIUXb4fT8OoGKdAJs+I2tNYscO8FwcxCKCWA7FmpPI0fdVxGJoIJglrFZYn+4YEJqChq4rdrxQg==
 
-# fetch-hop.js is the IPv6 fetch function's handler (route66#3659): the same
-# image runs as a second, VPC-attached function with ImageConfig.Command
-# ["fetch-hop.handler"], so the hop code ships under the same immutable SHA.
-COPY attestor/attestor/index.js attestor/attestor/browse.js attestor/attestor/kumo-runtime.js attestor/attestor/kumo-lane.js attestor/attestor/fetch-hop.js attestor/public-key.json ${LAMBDA_TASK_ROOT}/
-COPY --from=ocr-build /out/snapbot-ocr-worker /opt/snapbot/snapbot-ocr-worker
-COPY --from=ocr-build /out/tessdata /opt/snapbot/tessdata
+RUN apk add --no-cache brotli curl openssl tar \
+    && curl -fsSL -o /tmp/chromium.tgz "https://registry.npmjs.org/@sparticuz/chromium/-/chromium-${SPARTICUZ_VERSION}.tgz" \
+    && test "$(openssl dgst -sha512 -binary /tmp/chromium.tgz | base64 -w0)" = "${SPARTICUZ_SHA512}" \
+    && mkdir -p /tmp/pkg /out/chromium/fonts /out/chromium/al2023 \
+    && tar -xzf /tmp/chromium.tgz -C /tmp/pkg \
+    && brotli -dc /tmp/pkg/package/bin/chromium.br > /out/chromium/chromium \
+    && chmod 0755 /out/chromium/chromium \
+    && brotli -dc /tmp/pkg/package/bin/swiftshader.tar.br | tar -x -C /out/chromium \
+    && brotli -dc /tmp/pkg/package/bin/fonts.tar.br | tar -x -C /out/chromium/fonts \
+    && brotli -dc /tmp/pkg/package/bin/al2023.tar.br | tar -x -C /out/chromium/al2023 \
+    && grep -rl '/tmp/fonts' /out/chromium/fonts | xargs -r sed -i 's#/tmp/fonts#/opt/chromium/fonts#g' \
+    && ls -R /out/chromium | head -n 60
 
-# Both checks execute in the final userland. A wrong architecture, dynamic
-# native dependency, malformed handler, or missing executable fails the build.
+# ---------------------------------------------------------------------------
+# runtime: the Lambda custom-runtime base. The binary is the bootstrap; the
+# CMD (ImageConfig.Command) names the handler: index.handler, or
+# fetch-hop.handler for the IPv6 fetch function. The local Kumo pool runs the
+# same image as `/var/runtime/bootstrap kumo-runtime`.
+# ---------------------------------------------------------------------------
+FROM public.ecr.aws/lambda/provided:al2023 AS runtime
+
+COPY --from=native-build /out/bootstrap /var/runtime/bootstrap
+COPY --from=native-build /out/tessdata /opt/snapbot/tessdata
+COPY --from=chromium /out/chromium /opt/chromium
 ENV TESSDATA_PREFIX=/opt/snapbot/tessdata
-ENV SNAPBOT_OCR_WORKER=/opt/snapbot/snapbot-ocr-worker
-RUN /opt/snapbot/snapbot-ocr-worker --version \
-    && node --check ${LAMBDA_TASK_ROOT}/index.js \
-    && node --check ${LAMBDA_TASK_ROOT}/browse.js \
-    && node --check ${LAMBDA_TASK_ROOT}/kumo-runtime.js \
-    && node --check ${LAMBDA_TASK_ROOT}/kumo-lane.js \
-    && node --check ${LAMBDA_TASK_ROOT}/fetch-hop.js
+
+# Both checks execute in the final userland: the binary runs, and Chromium
+# launches and navigates with the baked libraries and fonts.
+RUN /var/runtime/bootstrap --version \
+    && /var/runtime/bootstrap probe
 
 CMD ["index.handler"]

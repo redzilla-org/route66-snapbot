@@ -1,0 +1,58 @@
+# snapbot -- the route66-snapbot Lambda handler, one static binary (GH #4115).
+#
+# Owner 2026-09-29: "Can you rewrite the Node.js coordinator in Rust?!". This
+# crate replaces attestor/attestor/{index,browse,kumo-runtime,kumo-lane,
+# fetch-hop}.js: the Lambda Runtime API loop, the browse pool driving Chromium
+# over raw CDP, attestation/signing/publication, and the in-process OCR engine.
+[package]
+name = "snapbot"
+version = "2.0.0"
+edition = "2021"
+description = "route66-snapbot Lambda handler: capture, attestation, OCR"
+license = "MIT"
+
+[[bin]]
+name = "snapbot"
+path = "src/main.rs"
+
+[dependencies]
+# The OCR engine, linked in-process: no child, no pipe, no base64.
+snapbot-ocr = { path = "../ocrd-rust" }
+
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process", "io-util", "net", "fs"] }
+# Raw CDP over the DevTools websocket (loopback only, so no TLS feature).
+tokio-tungstenite = "0.24"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+serde = { version = "1", features = ["derive"] }
+# preserve_order: the signed statement, observed map and step results keep the
+# insertion order the JS handler emitted.
+serde_json = { version = "1", features = ["preserve_order"] }
+# Runtime API, GitHub publication and http-raw hops. No gzip feature: http-raw
+# signs the bytes exactly as served.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1"
+aws-sdk-ssm = "1"
+aws-sdk-sts = "1"
+aws-sdk-sfn = "1"
+aws-sdk-lambda = "1"
+aws-smithy-types = "1"
+aws-credential-types = "1"
+# attest-aws-resource signs its own generic read-only request with the caller's
+# temporary credentials (there is no dynamic client dispatch in the Rust SDK).
+aws-sigv4 = "1"
+
+ed25519-dalek = "2"
+aes-gcm = "0.10"
+sha2 = "0.10"
+base64 = "0.22"
+hex = "0.4"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+regex = "1"
+url = "2"
+percent-encoding = "2"
+quick-xml = "0.36"
+libc = "0.2"
