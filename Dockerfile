@@ -26,6 +26,8 @@ RUN apk add --no-cache build-base linux-headers musl-dev pkgconf \
 ENV PATH=/root/.cargo/bin:${PATH}
 
 WORKDIR /tmp/build
+# Each native build deletes its source tree in the same RUN, so the layer
+# holds only the installed prefix.
 RUN curl -fsSL "https://github.com/DanBloomberg/leptonica/archive/refs/tags/${LEPTONICA_VERSION}.tar.gz" \
         | tar -xz \
     && cd "leptonica-${LEPTONICA_VERSION}" \
@@ -33,7 +35,8 @@ RUN curl -fsSL "https://github.com/DanBloomberg/leptonica/archive/refs/tags/${LE
     && ./configure --prefix=/opt/snapbot-static --disable-shared --enable-static \
         --without-libtiff --without-libwebp --without-libopenjpeg \
     && make -j"$(nproc)" \
-    && make install
+    && make install \
+    && cd / && rm -rf /tmp/build/leptonica-*
 
 RUN curl -fsSL "https://github.com/tesseract-ocr/tesseract/archive/refs/tags/${TESSERACT_VERSION}.tar.gz" \
         | tar -xz \
@@ -43,7 +46,8 @@ RUN curl -fsSL "https://github.com/tesseract-ocr/tesseract/archive/refs/tags/${T
         --prefix=/opt/snapbot-static --disable-shared --enable-static \
         --disable-openmp --disable-graphics --disable-training-tools \
     && make -j"$(nproc)" \
-    && make install
+    && make install \
+    && cd / && rm -rf /tmp/build/tesseract-*
 
 # The sys crates insert a late dynamic-link switch; this wrapper restores
 # static mode for the C++ runtime so `ldd` below is a hard build assertion.
