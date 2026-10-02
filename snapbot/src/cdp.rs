@@ -127,7 +127,25 @@ impl Cdp {
             self.pending.lock().unwrap().remove(&id);
             return Err(anyhow!("Protocol error ({method}): Target closed"));
         }
-        match rx.await {
+        // GH #4082: retain the same pending reply after one diagnostic. This
+        // observes the 22–84s stalls without cancelling or retrying any command.
+        let reply = if crate::runtime::diagnostic_enabled() {
+            let identity = crate::runtime::diagnostic_identity();
+            let started = std::time::Instant::now();
+            let mut rx = rx;
+            match tokio::time::timeout(std::time::Duration::from_secs(5), &mut rx).await {
+                Ok(reply) => reply,
+                Err(_) => {
+                    eprintln!("[snapbot diagnostic] {identity} cdp_id={id} method={method} session={} pending_ms={} closed={}", session.unwrap_or("browser"), started.elapsed().as_millis(), self.is_closed());
+                    let reply = rx.await;
+                    eprintln!("[snapbot diagnostic] {identity} cdp_id={id} method={method} returned_ms={}", started.elapsed().as_millis());
+                    reply
+                }
+            }
+        } else {
+            rx.await
+        };
+        match reply {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(e)) => Err(anyhow!("Protocol error ({method}): {e}")),
             Err(_) => Err(anyhow!("Protocol error ({method}): Target closed")),

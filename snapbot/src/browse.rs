@@ -618,6 +618,7 @@ where
     Fut: std::future::Future<Output = Result<T>>,
 {
     let acquire_start = Instant::now();
+    crate::runtime::diagnostic_phase("page-acquire");
     let spare = {
         let mut st = pool().lock().await;
         ensure_browser(&mut st, browser_args).await?;
@@ -627,8 +628,10 @@ where
     // Shared so tasks f spawns on the page (a capture's click and navigation
     // waiters) may outlive f; the context close ends them.
     let page = Arc::new(spare.page);
+    crate::runtime::diagnostic_phase("page-acquired");
     let result = f(page.clone(), acquire_ms).await;
 
+    crate::runtime::diagnostic_phase("page-cleanup");
     let mut st = pool().lock().await;
     if let Some(b) = &st.browser {
         if let Err(e) = browser::dispose_context(&b.cdp, &spare.context).await {
@@ -650,11 +653,13 @@ where
         "store": "s3",
     });
     drop(st);
+    crate::runtime::diagnostic_phase("page-released");
     Ok((result?, worker))
 }
 
 async fn run_request(event: &Value, page: &Page, c: &mut Ctx, steps: &[Step], started: Instant, acquire_ms: u64) -> Result<Value> {
     let setup_start = Instant::now();
+    crate::runtime::diagnostic_phase("context-setup");
     install_context(page, c).await?;
     let setup_ms = setup_start.elapsed().as_millis() as u64;
     let mut ctx = RunCtx {
@@ -676,6 +681,11 @@ async fn run_request(event: &Value, page: &Page, c: &mut Ctx, steps: &[Step], st
             continue;
         }
         let t0 = Instant::now();
+        // Step identifiers and operations locate a stalled journey; arguments
+        // can contain credentials and are deliberately absent from diagnostics.
+        if crate::runtime::diagnostic_enabled() {
+            crate::runtime::diagnostic_phase(&format!("step-start id={} op={}", step.id, step.op));
+        }
         let mut r = Map::new();
         r.insert("id".into(), json!(step.id));
         r.insert("op".into(), json!(step.op));
@@ -698,6 +708,9 @@ async fn run_request(event: &Value, page: &Page, c: &mut Ctx, steps: &[Step], st
             }
         };
         r.insert("elapsed_ms".into(), json!(t0.elapsed().as_millis() as u64));
+        if crate::runtime::diagnostic_enabled() {
+            crate::runtime::diagnostic_phase(&format!("step-return id={} op={} elapsed_ms={} ok={ok}", step.id, step.op, t0.elapsed().as_millis()));
+        }
         if !ok && !step.optional() {
             stopped = true;
             all_ok = false;
