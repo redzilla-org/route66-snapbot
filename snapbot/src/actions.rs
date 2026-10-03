@@ -247,8 +247,15 @@ impl Page {
 
     /// The locator preconditions: attached, in the viewport (scrolled if not),
     /// a stable bounding box across two animation frames, and enabled.
-    async fn locator_ready(&self, selector: &str) -> Result<Option<String>> {
-        let Some(obj) = self.query(selector).await? else { return Ok(None) };
+    async fn locator_ready(
+        &self,
+        selector: &str,
+        phase: &mut &str,
+        last_error: &mut Option<String>,
+    ) -> Result<Option<String>> {
+        let Some(obj) = self.query(selector).await? else {
+            return Ok(None);
+        };
         let ready = "async function() {
             const inView = await new Promise(r => { const o = new IntersectionObserver(es => { r(es[0].intersectionRatio > 0); o.disconnect(); }); o.observe(this); });
             if (!inView) this.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});
@@ -259,7 +266,13 @@ impl Page {
         }";
         match self.call_on(&obj, ready, vec![]).await {
             Ok(Some(Value::Bool(true))) => Ok(Some(obj)),
-            _ => {
+            result => {
+                // Keep readiness retries unchanged, but retain the error that
+                // would otherwise disappear before a locator timeout.
+                if let Err(error) = result {
+                    *last_error = Some(error.to_string());
+                }
+                *phase = "readiness-release";
                 self.release(&obj).await;
                 Ok(None)
             }
@@ -268,26 +281,58 @@ impl Page {
 
     /// Retry `action` on a ready element every 100ms until it succeeds or the
     /// locator timeout passes (puppeteer's retryAndRaceWithSignalAndTimer).
-    async fn with_locator<F, Fut>(&self, selector: &str, timeout_ms: u64, mut action: F) -> Result<()>
+    async fn with_locator<F, Fut>(
+        &self,
+        selector: &str,
+        timeout_ms: u64,
+        mut action: F,
+    ) -> Result<()>
     where
         F: FnMut(String) -> Fut,
         Fut: std::future::Future<Output = Result<()>>,
     {
         let dl = deadline(timeout_ms);
+        // A four-second locator timeout cancels CDP before its five-second
+        // slow-call trace. Retain the exact phase without changing the action.
+        let mut phase = "readiness";
+        let mut attempts = 0;
+        let mut last_error = None;
         let attempt = async {
             loop {
-                if let Some(obj) = self.locator_ready(selector).await.unwrap_or(None) {
+                attempts += 1;
+                phase = "readiness";
+                let ready = self
+                    .locator_ready(selector, &mut phase, &mut last_error)
+                    .await;
+                if let Err(error) = &ready {
+                    last_error = Some(error.to_string());
+                }
+                if let Some(obj) = ready.unwrap_or(None) {
+                    phase = "action";
                     let r = action(obj.clone()).await;
+                    if let Err(error) = &r {
+                        last_error = Some(error.to_string());
+                    }
+                    phase = "action-release";
                     self.release(&obj).await;
                     if r.is_ok() {
                         return;
                     }
                 }
+                phase = "retry-delay";
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         };
         match dl {
-            Some(d) => tokio::time::timeout_at(d.into(), attempt).await.map_err(|_| anyhow!("Timed out after waiting {timeout_ms}ms")),
+            Some(d) => match tokio::time::timeout_at(d.into(), attempt).await {
+                Ok(()) => Ok(()),
+                Err(_) => {
+                    if crate::runtime::diagnostic_enabled() {
+                        eprintln!("[snapbot diagnostic] {} locator_timeout_ms={timeout_ms} phase={phase} attempts={attempts} last_error={last_error:?}", crate::runtime::diagnostic_identity());
+                    }
+                    Err(anyhow!("Timed out after waiting {timeout_ms}ms"))
+                }
+            },
             None => {
                 attempt.await;
                 Ok(())

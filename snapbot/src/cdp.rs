@@ -32,6 +32,32 @@ pub struct Cdp {
     closed: AtomicBool,
 }
 
+// An enclosing action can cancel its waiter before the existing slow-call
+// trace fires. Observe that drop without cancelling or replaying the command.
+struct CancelledCommandDiagnostic<'a> {
+    id: u64,
+    method: &'a str,
+    session: Option<&'a str>,
+    identity: String,
+    started: std::time::Instant,
+    completed: bool,
+}
+
+impl Drop for CancelledCommandDiagnostic<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            eprintln!(
+                "[snapbot diagnostic] {} cdp_id={} method={} session={} cancelled_ms={}",
+                self.identity,
+                self.id,
+                self.method,
+                self.session.unwrap_or("browser"),
+                self.started.elapsed().as_millis()
+            );
+        }
+    }
+}
+
 impl Cdp {
     /// Connect to the browser endpoint. Frame and message caps are lifted: a
     /// full-page screenshot of a tall page arrives as one large base64 reply.
@@ -127,6 +153,15 @@ impl Cdp {
             self.pending.lock().unwrap().remove(&id);
             return Err(anyhow!("Protocol error ({method}): Target closed"));
         }
+        let mut cancellation =
+            crate::runtime::diagnostic_enabled().then(|| CancelledCommandDiagnostic {
+                id,
+                method,
+                session,
+                identity: crate::runtime::diagnostic_identity(),
+                started: std::time::Instant::now(),
+                completed: false,
+            });
         // GH #4082: retain the same pending reply after one diagnostic. This
         // observes the 22–84s stalls without cancelling or retrying any command.
         let reply = if crate::runtime::diagnostic_enabled() {
@@ -145,6 +180,9 @@ impl Cdp {
         } else {
             rx.await
         };
+        if let Some(diagnostic) = cancellation.as_mut() {
+            diagnostic.completed = true;
+        }
         match reply {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(e)) => Err(anyhow!("Protocol error ({method}): {e}")),
