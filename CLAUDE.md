@@ -36,5 +36,9 @@ The first builds `ghcr.io/redzilla-org/route66-snapbot:<sha>` locally and
 creates the `snapbot-<sha>` release. The second tags that local image into the
 ECR repository, pushes it, and prints the ECR digest. f3b4946 was published this
 way (`sha256:d522f0f4eae89af8e92951a266bf33193c9b649fd6a6432ad3d78489af44de1d`).
+The 429 is intermittent: c78ae6f and 33472fc passed `test`, then failed
+`publish` on `a release with the same tag name already exists`, because the
+workstation release landed first. `publish` now exits 0 when `snapbot-<sha>`
+already exists, so CI never pushes a second build under a published pin.
 The Lambda moves to a new image through route66
 `scripts/deployment/deploy_snapbot.py`.

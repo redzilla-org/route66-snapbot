@@ -34,6 +34,12 @@ jobs:
       # A full commit SHA is immutable consumer identity. No latest tag exists,
       # so route66 cannot silently receive different bytes for the same pin.
       - run: |
+          # The workstation publish (CLAUDE.md) may already own this sha's
+          # release; rebuilding would push different bytes under the same pin.
+          if gh release view "snapbot-$GITHUB_SHA" > /dev/null 2>&1; then
+            echo "snapbot-$GITHUB_SHA already published; nothing to do"
+            exit 0
+          fi
           image="ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}"
           docker build --platform linux/amd64 -t "$image" .
           docker push "$image"
