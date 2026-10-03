@@ -197,8 +197,10 @@ impl Page {
 
     /// ElementHandle.click: scrollIntoViewIfNeeded, clickablePoint, mouse click.
     async fn click_handle(&self, obj: &str) -> Result<()> {
-        let intersect = "async function(threshold) { const ratio = await new Promise(r => { const o = new IntersectionObserver(es => { r(es[0].intersectionRatio); o.disconnect(); }); o.observe(this); }); return threshold === 1 ? ratio === 1 : ratio > threshold; }";
-        let full = self.call_on(obj, intersect, vec![json!(1)]).await?;
+        // A background tab may never deliver IntersectionObserver callbacks;
+        // read the viewport synchronously before using the same CDP click quads.
+        let intersect = "function() { const r = this.getBoundingClientRect(); return r.width > 0 && r.height > 0 && r.left >= 0 && r.top >= 0 && r.right <= innerWidth && r.bottom <= innerHeight; }";
+        let full = self.call_on(obj, intersect, vec![]).await?;
         if full != Some(json!(true)) {
             self.call_on(obj, "function() { this.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'}); }", vec![]).await?;
         }
@@ -246,7 +248,7 @@ impl Page {
     }
 
     /// The locator preconditions: attached, in the viewport (scrolled if not),
-    /// a stable bounding box across two animation frames, and enabled.
+    /// a stable bounding box across two host-clock samples, and enabled.
     async fn locator_ready(
         &self,
         selector: &str,
@@ -256,16 +258,31 @@ impl Page {
         let Some(obj) = self.query(selector).await? else {
             return Ok(None);
         };
-        let ready = "async function() {
-            const inView = await new Promise(r => { const o = new IntersectionObserver(es => { r(es[0].intersectionRatio > 0); o.disconnect(); }); o.observe(this); });
-            if (!inView) this.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});
-            const [a, b] = await new Promise(r => requestAnimationFrame(() => { const r1 = this.getBoundingClientRect(); requestAnimationFrame(() => r([r1, this.getBoundingClientRect()])); }));
-            if (a.x !== b.x || a.y !== b.y || a.width !== b.width || a.height !== b.height) return false;
-            if (this instanceof HTMLElement && ['BUTTON','INPUT','SELECT','TEXTAREA','OPTION','OPTGROUP'].includes(this.nodeName) && this.hasAttribute('disabled')) return false;
-            return true;
+        // Hidden Chromium tabs can suspend observer and animation-frame callbacks.
+        // Two CDP reads separated by the host clock retain the stability check.
+        let snapshot = "function() {
+            if (!this.isConnected) return null;
+            let r = this.getBoundingClientRect();
+            if (r.width <= 0 || r.height <= 0) return null;
+            if (r.right <= 0 || r.bottom <= 0 || r.left >= innerWidth || r.top >= innerHeight) {
+                this.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});
+                r = this.getBoundingClientRect();
+            }
+            if (r.width <= 0 || r.height <= 0 || r.right <= 0 || r.bottom <= 0 || r.left >= innerWidth || r.top >= innerHeight) return null;
+            if (this instanceof HTMLElement && ['BUTTON','INPUT','SELECT','TEXTAREA','OPTION','OPTGROUP'].includes(this.nodeName) && this.hasAttribute('disabled')) return null;
+            return [r.x, r.y, r.width, r.height];
         }";
-        match self.call_on(&obj, ready, vec![]).await {
-            Ok(Some(Value::Bool(true))) => Ok(Some(obj)),
+        let first = self.call_on(&obj, snapshot, vec![]).await;
+        let result = match first {
+            Ok(Some(ref a)) if !a.is_null() => {
+                tokio::time::sleep(Duration::from_millis(32)).await;
+                self.call_on(&obj, snapshot, vec![]).await.map(|b| b.is_some_and(|v| v == *a))
+            }
+            Ok(_) => Ok(false),
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(true) => Ok(Some(obj)),
             result => {
                 // Keep readiness retries unchanged, but retain the error that
                 // would otherwise disappear before a locator timeout.
