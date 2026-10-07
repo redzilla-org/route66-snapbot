@@ -16,8 +16,13 @@ ARG TESSERACT_VERSION=5.5.2
 # rustup's pinned build.
 ARG RUST_VERSION=1.97.0
 
+# The toolchain, plus the shared libraries libcef.so loads: the handler runs
+# here too (--version), so the builder resolves them as well.
 RUN dnf install -y --setopt=install_weak_deps=False gcc gcc-c++ make cmake ninja-build clang clang-devel llvm-devel \
-        autoconf automake libtool pkgconf-pkg-config tar gzip bzip2 xz findutils perl which >/dev/null \
+        autoconf automake libtool pkgconf-pkg-config tar gzip bzip2 xz findutils diffutils perl which \
+        nss nspr atk at-spi2-atk at-spi2-core cups-libs libdrm libxkbcommon libXcomposite libXdamage \
+        libXrandr libXfixes libXext libX11 libxcb mesa-libgbm pango cairo alsa-lib dbus-libs expat glib2 \
+        libxshmfence fontconfig freetype >/dev/null \
     && dnf clean all \
     && curl -fsSL -o /tmp/rustup-init https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init \
     && chmod +x /tmp/rustup-init \

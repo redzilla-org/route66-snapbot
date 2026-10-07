@@ -141,7 +141,6 @@ pub struct Shot {
 /// One attached page session.
 pub struct Page {
     pub handle: PageHandle,
-    pub session: String,
     pub state: Arc<Mutex<PageState>>,
     pub tick: watch::Receiver<u64>,
     pub intercept: Arc<Mutex<Option<Intercept>>>,
@@ -252,8 +251,7 @@ impl Page {
         let (tick_tx, tick) = watch::channel(0u64);
         let intercept: Arc<Mutex<Option<Intercept>>> = Arc::new(Mutex::new(None));
         tokio::spawn(event_loop(handle.id, rx, state.clone(), tick_tx, intercept.clone()));
-        let session = handle.id.to_string();
-        let page = Page { handle, session, state, tick, intercept, viewport: Mutex::new(None) };
+        let page = Page { handle, state, tick, intercept, viewport: Mutex::new(None) };
         page.send("Page.enable", json!({})).await?;
         let tree = page.send("Page.getFrameTree", json!({})).await?;
         {
