@@ -151,6 +151,9 @@ struct Job {
 
 static ENGINE: OnceLock<Mutex<mpsc::Sender<Job>>> = OnceLock::new();
 
+/// WHY: the OCR thread's niceness, below the renderers' 0 so page waits keep their CPU.
+const OCR_NICE: libc::c_int = 10;
+
 /// The process's one engine thread, started on first use. It owns the
 /// Tesseract instance, so no C handle ever crosses a thread.
 fn engine() -> mpsc::Sender<Job> {
@@ -160,6 +163,20 @@ fn engine() -> mpsc::Sender<Job> {
             std::thread::Builder::new()
                 .name("snapbot-ocr".to_string())
                 .spawn(move || {
+                    // WHY (route66 GH #4082, owner 2026-10-07: "The pool must be restored to
+                    // 40"): with 40 lanes, 40 OCR threads competed level with 40 Chromium
+                    // renderers on the VM's vCPUs, and renderer-side 4s waits failed while
+                    // the server answered in under a second. OCR is throughput work with no
+                    // deadline; page waits have one. Nicing only this thread (Linux
+                    // setpriority on the tid) lets the renderers win the CPU without
+                    // capping OCR, and raising niceness needs no privilege.
+                    #[cfg(target_os = "linux")]
+                    unsafe {
+                        let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+                        if libc::setpriority(libc::PRIO_PROCESS, tid, OCR_NICE) != 0 {
+                            panic!("snapbot-ocr: setpriority({OCR_NICE}) failed: {}", std::io::Error::last_os_error());
+                        }
+                    }
                     let mut engine = Engine::new();
                     for job in rx {
                         let out = run_job(&mut engine, &job.png, &job.spec, job.keywords.as_deref());
