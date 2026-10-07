@@ -385,15 +385,14 @@ async fn capture_with(
     }
     phase("settle", &format!("wait-ms={wait_ms}"));
     phase("screenshot-start", &format!("full-page={full_page}"));
-    let bytes = tokio::time::timeout(Duration::from_secs(30), page.screenshot(full_page))
+    let shot = tokio::time::timeout(Duration::from_secs(30), page.screenshot(full_page))
         .await
         .map_err(|_| anyhow!("screenshot exceeded 30s (phase=screenshot)"))??;
+    // Attested evidence stays synchronous (owner 2026-10-07): the statement signs
+    // the stored PNG, so it is encoded here, in the request, from the raw frame.
+    let (w, h) = (shot.frame.width as i64, shot.frame.height as i64);
+    let bytes = crate::pngenc::encode(&shot.frame)?;
     phase("screenshot", &format!("png-bytes={} full-page={full_page}", bytes.len()));
-    let (w, h) = if bytes.len() > 24 {
-        (u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]) as i64, u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]) as i64)
-    } else {
-        (-1, -1)
-    };
     Ok(Captured {
         bytes,
         full_page,
@@ -443,10 +442,8 @@ pub async fn capture_web_ui_screenshot(event: &Value) -> Result<Value> {
     let vid = attest::put_evidence(&key, c.bytes.clone(), "image/png", &metadata).await?;
     // WHY (route66 GH #4082, owner 2026-10-07: "log the PNG URL for investigation"):
     // the attested capture names its evidence object too. Measurement only.
-    let (cdp_ms, b64_ms) = *crate::browser::LAST_CAPTURE.lock().unwrap();
     eprintln!("SNAPBOT-SHOT {}", json!({"name": "web-ui-screenshot.png", "url": c.final_url, "png": format!("{key}?versionId={vid}"),
-                                        "full_page": c.full_page, "width": c.width, "height": c.height, "png_bytes": c.bytes.len(),
-                                        "cdp_ms": cdp_ms, "b64_ms": b64_ms}));
+                                        "full_page": c.full_page, "width": c.width, "height": c.height, "png_bytes": c.bytes.len()}));
     let mut o = Map::new();
     let mut put = |k: &str, v: String| {
         o.insert(k.to_string(), json!(v));

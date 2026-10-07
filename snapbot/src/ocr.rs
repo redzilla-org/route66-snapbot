@@ -2,9 +2,9 @@
 //!
 //! Owner 2026-09-29: "so keep OCR in the Chromium lane then", "also avoid image
 //! transmission; do the OCR at capture point in snapbot", and "can you keep
-//! domain knowledge out of snapbot". The screenshot step hands the PNG bytes
-//! CDP just returned to this process's one resident Tesseract engine, which
-//! decodes them once in memory. The spec is generic: `passes` run in order and
+//! domain knowledge out of snapbot". The screenshot step hands the raw BGRA
+//! frame CEF just painted to this process's one resident Tesseract engine, which
+//! converts it once to gray in memory (no codec). The spec is generic: `passes` run in order and
 //! stop as soon as `stop_when` is met; `fallback` runs only when it is still
 //! unmet. Keywords and regions come from the caller's page-side JavaScript.
 //!
@@ -18,6 +18,7 @@
 
 use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
+use crate::shm::Frame;
 use snapbot_ocr::{Engine, Gray, Pass, Rect};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -143,7 +144,7 @@ pub fn keyword_match(text: &str, keywords: &[String]) -> (Vec<String>, Option<f6
 }
 
 struct Job {
-    png: Arc<Vec<u8>>,
+    frame: Arc<Frame>,
     spec: Spec,
     keywords: Option<Vec<String>>,
     /// Who asked (screenshot name, page URL); only logged, never read by the engine.
@@ -180,7 +181,7 @@ fn engine() -> mpsc::Sender<Job> {
                     let mut engine_init_ms = Some(t.elapsed().as_millis() as u64);
                     for job in rx {
                         let (wall, cpu) = (Instant::now(), thread_cpu_ms());
-                        let mut out = run_job(&mut engine, &job.png, &job.spec, job.keywords.as_deref());
+                        let mut out = run_job(&mut engine, &job.frame, &job.spec, job.keywords.as_deref());
                         let (wall_ms, cpu_ms) = (wall.elapsed().as_millis() as u64, (thread_cpu_ms() - cpu).round() as u64);
                         let init = engine_init_ms.take().unwrap_or(0);
                         if let Ok(v) = out.as_mut() {
@@ -192,6 +193,7 @@ fn engine() -> mpsc::Sender<Job> {
                             eprintln!("SNAPBOT-OCR {}", json!({
                                 "label": job.label, "image": v["image"], "regions": job.spec.regions.len(),
                                 "passes": v["passes"].as_array().map_or(0, Vec::len), "engine_init_ms": init,
+                                "convert_ms": v["timings"]["convert_ms"],
                                 "wall_ms": wall_ms, "cpu_ms": cpu_ms, "text_bytes": text_bytes,
                             }));
                         }
@@ -258,21 +260,22 @@ pub fn run_spec(engine: &mut Engine, g: &Gray, spec: &Spec, keywords: Option<&[S
     }))
 }
 
-fn run_job(engine: &mut Engine, png: &[u8], spec: &Spec, keywords: Option<&[String]>) -> Result<Value, String> {
+fn run_job(engine: &mut Engine, frame: &Frame, spec: &Spec, keywords: Option<&[String]>) -> Result<Value, String> {
     let t = Instant::now();
-    let g = snapbot_ocr::decode(png)?;
-    let decode_ms = t.elapsed().as_millis() as u64;
+    // The raw BGRA frame straight to the gray plane: the only conversion it gets.
+    let g = snapbot_ocr::from_bgra(frame.seg.as_slice(), frame.width, frame.height, frame.stride)?;
+    let convert_ms = t.elapsed().as_millis() as u64;
     let mut out = run_spec(engine, &g, spec, keywords)?;
-    out["timings"]["decode_ms"] = json!(decode_ms);
+    out["timings"]["convert_ms"] = json!(convert_ms);
     out["timings"]["total_ms"] = json!(t.elapsed().as_millis() as u64);
     out["image"] = json!({"width": g.w, "height": g.h});
     Ok(out)
 }
 
-/// OCR `png` in this process's engine. The bytes are shared, not copied.
-pub async fn read(png: Arc<Vec<u8>>, spec: Spec, keywords: Option<Vec<String>>, label: Value) -> Result<Value> {
+/// OCR `frame` in this process's engine. The frame is shared, not copied.
+pub async fn read(frame: Arc<Frame>, spec: Spec, keywords: Option<Vec<String>>, label: Value) -> Result<Value> {
     let (reply, rx) = oneshot::channel();
-    engine().send(Job { png, spec, keywords, label, reply }).map_err(|_| anyhow!("OCR engine thread is gone"))?;
+    engine().send(Job { frame, spec, keywords, label, reply }).map_err(|_| anyhow!("OCR engine thread is gone"))?;
     rx.await.map_err(|_| anyhow!("OCR engine thread died"))?.map_err(|e| anyhow!("ocr: {e}"))
 }
 

@@ -2,13 +2,14 @@
 //!
 //! WHY A LIBRARY (GH #4115). Owner 2026-09-29: "also avoid image transmission;
 //! do the OCR at capture point in snapbot". The snapbot handler links this crate
-//! and hands it the PNG bytes CDP just returned. One `Engine` per pool process
-//! owns one warm Tesseract instance.
+//! and hands it the raw BGRA frame CEF just painted (owner 2026-10-07: "hands
+//! over the raw pixel buffer in the same process"). One `Engine` per pool
+//! process owns one warm Tesseract instance.
 //!
-//! DECODE ONCE: the PNG is decoded exactly once into a contrast-stretched 8-bit
+//! NO CODEC: the frame is converted exactly once into a contrast-stretched 8-bit
 //! gray plane (`Gray`). Every pass, region crop and rescale reads that plane in
-//! memory and hands raw pixels to Tesseract (SetImage), so no pass re-decodes
-//! the PNG and nothing is ever re-encoded.
+//! memory and hands raw pixels to Tesseract (SetImage); nothing is decoded or
+//! encoded anywhere between the paint and the read.
 //!
 //! GENERIC BY CONSTRUCTION (owner 2026-09-29: "can you keep domain knowledge out
 //! of snapbot"): every policy choice -- segmentation mode, language, dpi, scale,
@@ -72,18 +73,17 @@ pub struct Rect {
     pub height: i64,
 }
 
-/// The decoded screenshot: one contrast-stretched 8-bit gray plane.
+/// The screenshot as OCR reads it: one contrast-stretched 8-bit gray plane.
 pub struct Gray {
     pub w: usize,
     pub h: usize,
     pub px: Vec<u8>,
 }
 
-/// PNG bytes -> gray plane, the only decode an image ever gets.
-pub fn decode(png: &[u8]) -> Result<Gray, String> {
-    let d = kstream::decode_png(png)?;
-    let (px, w, h) = kstream::transform_at(&d, 1)?;
-    Ok(Gray { w, h, px })
+/// The raw BGRA frame CEF painted -> gray plane: the only conversion a frame
+/// gets, straight from the paint buffer (no codec in between).
+pub fn from_bgra(buf: &[u8], w: usize, h: usize, stride: usize) -> Result<Gray, String> {
+    Ok(Gray { w, h, px: kstream::gray_from_bgra(buf, w, h, stride)? })
 }
 
 /// Clamp `r` to a `w` x `h` image; None when nothing of it remains.

@@ -57,12 +57,23 @@ pub async fn run_pool() -> Result<()> {
     }
     let started = Instant::now();
     let exe = std::env::current_exe()?;
+    // ONE PNG writer for the whole pool (owner 2026-10-07): every lane hands it
+    // frames, so one drain call is a barrier over all 40 lanes' screenshots.
+    let sock = std::env::temp_dir().join("snapbot-pool-writer.sock").display().to_string();
+    let mut writer_child = crate::writer::spawn(&sock)?;
+    let (writer_tx, mut writer_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    std::thread::spawn(move || {
+        let status = writer_child.wait().map(|s| s.to_string()).unwrap_or_else(|e| e.to_string());
+        let _ = writer_tx.send(status);
+    });
+    std::env::set_var("SNAPBOT_WRITER_SOCK", &sock);
     let (ready_tx, mut ready_rx) = tokio::sync::mpsc::unbounded_channel::<(usize, u32, u64)>();
     let (exit_tx, mut exit_rx) = tokio::sync::mpsc::unbounded_channel::<(usize, String)>();
     for i in 0..n {
         let mut child = tokio::process::Command::new(&exe)
             .arg("kumo-lane")
             .env("SNAPBOT_LANE", i.to_string())
+            .env("SNAPBOT_WRITER_SOCK", &sock)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -95,6 +106,7 @@ pub async fn run_pool() -> Result<()> {
         tokio::select! {
             Some(r) = ready_rx.recv() => up.push(r),
             Some((i, status)) = exit_rx.recv() => bail!("lane {i} exited before ready ({status})"),
+            Some(status) = writer_rx.recv() => bail!("png-writer exited before the pool was ready ({status})"),
             _ = tokio::time::sleep_until(deadline) => bail!("pool not ready within {}ms", POOL_STARTUP_TIMEOUT.as_millis()),
         }
     }
@@ -112,10 +124,23 @@ pub async fn run_pool() -> Result<()> {
         rss[rss.len() / 2],
         rss[rss.len() - 1],
     );
-    if let Some((i, status)) = exit_rx.recv().await {
-        bail!("snapbot pool fatal: lane {i} exited ({status}); the pool is below its {n}-process width");
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let fatal = tokio::select! {
+        Some((i, status)) = exit_rx.recv() => format!("snapbot pool fatal: lane {i} exited ({status}); the pool is below its {n}-process width"),
+        Some(status) = writer_rx.recv() => format!("snapbot pool fatal: png-writer exited ({status})"),
+        _ = term.recv() => String::new(),
+    };
+    // Shutdown and fatal exits alike wait for the writer to store every frame
+    // it holds (owner 2026-10-07: no frame is ever dropped).
+    if !fatal.contains("png-writer exited") {
+        let t = Instant::now();
+        crate::writer::drain_all().await?;
+        println!("snapbot pool: png-writer drained in {}ms", t.elapsed().as_millis());
     }
-    Ok(())
+    if fatal.is_empty() {
+        return Ok(());
+    }
+    bail!("{fatal}")
 }
 
 /// One pool lane: warm browser, readiness line, then the Runtime API loop.
@@ -126,6 +151,9 @@ pub async fn run_lane(handler: String) -> Result<()> {
         _ => serde_json::json!([]),
     };
     crate::browse::warm(&args).await?;
+    // Connect to the pool's PNG writer before polling, so a missing writer fails
+    // the lane at startup rather than at its first screenshot.
+    crate::writer::ensure();
     println!("{READY}{}", started.elapsed().as_millis());
     // A lane outliving its dispatcher would keep a browser nobody supervises.
     tokio::spawn(async {

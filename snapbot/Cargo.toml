@@ -1,4 +1,5 @@
-# snapbot -- the route66-snapbot Lambda handler, one static binary (GH #4115).
+# snapbot -- the route66-snapbot Lambda handler, one binary (GH #4115) with
+# Chromium embedded through CEF (owner 2026-10-07).
 #
 # Owner 2026-09-29: "Can you rewrite the Node.js coordinator in Rust?!". This
 # crate replaces attestor/attestor/{index,browse,kumo-runtime,kumo-lane,
@@ -21,10 +22,15 @@ snapbot-ocr = { path = "../ocrd-rust" }
 
 anyhow = "1"
 # io-std: a pool lane watches its stdin for the dispatcher's EOF (kumo.rs).
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process", "io-util", "io-std", "net", "fs"] }
-# Raw CDP over the DevTools websocket (loopback only, so no TLS feature).
-tokio-tungstenite = "0.24"
-futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+# signal: the pool drains the PNG writer on SIGTERM before it exits.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process", "io-util", "io-std", "net", "fs", "signal"] }
+# Chromium embedded in process (CEF windowless rendering, cefhost.rs). Pinned:
+# the crate version names the CEF build its bindings and download match. No
+# default features: no sandbox (the Lambda runs unsandboxed, as before), no
+# bundling tool, no resource helpers.
+cef = { version = "=154.5.0", default-features = false }
+# The one PNG encode a screenshot gets, from the raw frame (pngenc.rs).
+png = "0.18"
 serde = { version = "1", features = ["derive"] }
 # preserve_order: the signed statement, observed map and step results keep the
 # insertion order the JS handler emitted.

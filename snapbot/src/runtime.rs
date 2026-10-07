@@ -69,6 +69,13 @@ pub async fn run(handler_name: String) -> Result<()> {
             Err(e) => ("error", json!({"errorMessage": format!("{e:#}"), "errorType": "Error", "stackTrace": []})),
         };
         diagnostic_phase("dispatch-return");
+        // The managed Lambda freezes once it asks for /next, and the caller reads
+        // the PNGs as soon as this response lands, from an environment it cannot
+        // name for a drain call. So outside the pool a request's own frames are
+        // stored before its response is posted; the pool drains on request.
+        if std::env::var("SNAPBOT_LANE").is_err() && crate::writer::started() {
+            crate::writer::drain_own().await;
+        }
         let r = client.post(format!("{base}/{id}/{suffix}")).header("content-type", "application/json").body(body.to_string()).send().await?;
         if !r.status().is_success() {
             bail!("Runtime API {suffix} returned HTTP {}", r.status().as_u16());

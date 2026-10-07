@@ -3,7 +3,7 @@
 # GENERIC BY CONSTRUCTION: nothing here knows what a "market", a "brand" or a
 # "check" is. Every choice -- segmentation mode, upscale, language, budget --
 # arrives as a Pass from the caller (GH #4115: the stdio child and its base64
-# JSON protocol are deleted; the handler hands this crate the bytes it captured).
+# JSON protocol are deleted; the handler hands this crate the frame it captured).
 [package]
 name = "snapbot-ocr"
 version = "2.0.0"
@@ -16,10 +16,6 @@ path = "src/lib.rs"
 
 [dependencies]
 # The Tesseract binding. The model is loaded ONCE per pool process and stays
-# resident -- the entire reason this engine exists.
+# resident -- the entire reason this engine exists. No image codec: the input
+# is CEF's raw BGRA paint buffer (src/kstream.rs).
 leptess = "0.14"
-
-# The DECODER, not a general image library: png 0.18 + fdeflate is the decoder
-# of ../img-scaling-benchmark's overall winner ("Pure Rust KSTREAM, non-PGO").
-# src/kstream.rs carries the port.
-png = "0.18"

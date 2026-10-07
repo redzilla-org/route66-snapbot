@@ -67,20 +67,37 @@ fn diff(a: &str, b: &str) -> Value {
 }
 
 fn read(engine: &mut Engine, g: &Gray, label: &str, p: &Pass, regions: &[Rect], keywords: &[String]) -> Result<String> {
-    let t = Instant::now();
+    let (t, cpu) = (Instant::now(), thread_cpu_ms());
     let (text, timing) = engine.read(g, p, regions).map_err(|e| anyhow!("{label}: {e}"))?;
-    let wall = t.elapsed().as_millis() as u64;
+    let (wall, cpu_ms) = (t.elapsed().as_millis() as u64, thread_cpu_ms() - cpu);
     let (hit, f) = ocr::keyword_match(&text, keywords);
     println!(
         "BENCH {}",
         json!({"read": label, "upscale": p.scale, "regions": regions.len(), "pixels": timing.pixels, "resample_ms": timing.resample_ms,
-               "ocr_ms": timing.ocr_ms, "wall_ms": wall, "chars": text.len(), "keyword_fraction": f, "matched": hit.len()})
+               "ocr_ms": timing.ocr_ms, "wall_ms": wall, "cpu_ms": cpu_ms, "chars": text.len(), "keyword_fraction": f, "matched": hit.len()})
     );
     Ok(text)
 }
 
+/// This thread's CPU time in ms, so each row's cost is its own CPU.
+fn thread_cpu_ms() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: clock_gettime writes only the timespec it is handed.
+    unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    ts.tv_sec as u64 * 1000 + ts.tv_nsec as u64 / 1_000_000
+}
+
+/// This whole process's CPU time in ms (CEF's UI/compositor threads included),
+/// for the capture rows, whose work happens on threads other than the caller's.
+fn process_cpu_ms() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: as above.
+    unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) };
+    ts.tv_sec as u64 * 1000 + ts.tv_nsec as u64 / 1_000_000
+}
+
 pub async fn run(url: &str, best_dir: &str) -> Result<()> {
-    let b = Browser::launch(LaunchOptions { single_process: false, ignore_https_errors: true, extra_args: Vec::new() }).await?;
+    let b = Browser::launch(LaunchOptions { single_process: false, ignore_https_errors: true, extra_args: crate::cefhost::launch_args().to_vec() }).await?;
     let r = async {
         let page = b.new_page(None).await?;
         page.set_viewport(1366, 900).await?;
@@ -88,20 +105,28 @@ pub async fn run(url: &str, best_dir: &str) -> Result<()> {
         let keywords: Vec<String> = serde_json::from_value(page.evaluate(&format!("({KEYWORDS_FN})()")).await?.unwrap_or_default())?;
         let regions = ocr::parse_rects(&page.evaluate(&format!("({REGIONS_FN})()")).await?.unwrap_or_default(), "regions")?;
 
-        // Capture and decode, three times each: they are the fixed cost of every read.
-        let mut png = Vec::new();
+        // Capture and convert, three times each: they are the fixed cost of every
+        // read. The PNG encode is timed too, though it runs in the writer process.
+        let mut frame = None;
         for i in 0..3 {
+            let (t, cpu) = (Instant::now(), process_cpu_ms());
+            let shot = page.screenshot(true).await?;
+            let (capture_ms, capture_cpu_ms) = (t.elapsed().as_millis() as u64, process_cpu_ms() - cpu);
+            let (t, cpu) = (Instant::now(), thread_cpu_ms());
+            let g = snapbot_ocr::from_bgra(shot.frame.seg.as_slice(), shot.frame.width, shot.frame.height, shot.frame.stride).map_err(|e| anyhow!(e))?;
+            let (convert_ms, convert_cpu_ms) = (t.elapsed().as_millis() as u64, thread_cpu_ms() - cpu);
             let t = Instant::now();
-            png = page.screenshot(true).await?;
-            let capture_ms = t.elapsed().as_millis() as u64;
-            let t = Instant::now();
-            let g = snapbot_ocr::decode(&png).map_err(|e| anyhow!(e))?;
+            let png = crate::pngenc::encode(&shot.frame)?;
             println!(
                 "BENCH {}",
-                json!({"run": i, "capture_ms": capture_ms, "decode_ms": t.elapsed().as_millis() as u64, "png_bytes": png.len(), "width": g.w, "height": g.h})
+                json!({"run": i, "capture_ms": capture_ms, "capture_process_cpu_ms": capture_cpu_ms, "tiles": shot.tiles,
+                       "convert_ms": convert_ms, "convert_cpu_ms": convert_cpu_ms, "writer_encode_ms": t.elapsed().as_millis() as u64,
+                       "png_bytes": png.len(), "width": g.w, "height": g.h})
             );
+            frame = Some(shot.frame);
         }
-        let g = snapbot_ocr::decode(&png).map_err(|e| anyhow!(e))?;
+        let f = frame.ok_or_else(|| anyhow!("no capture"))?;
+        let g = snapbot_ocr::from_bgra(f.seg.as_slice(), f.width, f.height, f.stride).map_err(|e| anyhow!(e))?;
         println!("BENCH {}", json!({"cpus": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0)}));
 
         let mut fast = Engine::new();

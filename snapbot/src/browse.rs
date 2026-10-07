@@ -102,16 +102,15 @@ async fn ensure_browser(st: &mut PoolState, extra: &[String]) -> Result<()> {
     Ok(())
 }
 
-async fn build_spare(cdp: Arc<crate::cdp::Cdp>) -> Result<Spare> {
-    let context = browser::create_context(&cdp).await?;
-    let page = browser::new_page(cdp, Some(&context)).await?;
+async fn build_spare() -> Result<Spare> {
+    let context = browser::create_context().await?;
+    let page = browser::new_page(Some(&context)).await?;
     Ok(Spare { context, page })
 }
 
 fn schedule_spare(st: &mut PoolState) {
-    if let Some(b) = &st.browser {
-        let cdp = b.cdp.clone();
-        st.building = Some(tokio::spawn(build_spare(cdp)));
+    if st.browser.is_some() {
+        st.building = Some(tokio::spawn(build_spare()));
     }
 }
 
@@ -128,8 +127,8 @@ async fn take_spare(st: &mut PoolState) -> Result<Spare> {
     if let Some(s) = st.spare.take() {
         return Ok(s);
     }
-    let cdp = st.browser.as_ref().ok_or_else(|| anyhow!("no browser"))?.cdp.clone();
-    build_spare(cdp).await.map_err(|e| anyhow!("no browser context could be built for this request: {e:#}"))
+    st.browser.as_ref().ok_or_else(|| anyhow!("no browser"))?;
+    build_spare().await.map_err(|e| anyhow!("no browser context could be built for this request: {e:#}"))
 }
 
 /// Launch the browser and build the first spare before the lane polls, so no
@@ -405,39 +404,43 @@ async fn screenshot_step(step: &Step, page: &Page, ctx: &RunCtx<'_>) -> Result<O
     }
     let fns_ms = t.elapsed().as_millis() as u64;
 
+    // The location is chosen before the write (owner 2026-10-07: "choose the S3 key
+    // up front and log it"), so the response and the logs name the PNG while the
+    // writer process is still encoding it.
+    let key = store::key(ctx.event, &name)?;
+    let bucket = store::bucket()?;
+    let png_uri = format!("s3://{bucket}/{key}");
+
     let t = Instant::now();
-    let png = tokio::time::timeout(Duration::from_millis(SCREENSHOT_TIMEOUT_MS), page.screenshot(full_page))
+    let shot = tokio::time::timeout(Duration::from_millis(SCREENSHOT_TIMEOUT_MS), page.screenshot(full_page))
         .await
         .map_err(|_| anyhow!("screenshot exceeded {SCREENSHOT_TIMEOUT_MS}ms"))??;
     let capture_ms = t.elapsed().as_millis() as u64;
+    let frame = Arc::new(shot.frame);
+    // The raw frame goes to the PNG writer by memfd; encode + store run there,
+    // off this step (owner 2026-10-07: async writing "is NOT a coverup").
     let t = Instant::now();
-    let mut stored = store::put(ctx.event, &name, &png, "image/png").await?;
-    let store_ms = t.elapsed().as_millis() as u64;
-    let (w, h) = if png.len() > 24 {
-        (u32::from_be_bytes([png[16], png[17], png[18], png[19]]) as i64, u32::from_be_bytes([png[20], png[21], png[22], png[23]]) as i64)
-    } else {
-        (-1, -1)
-    };
-    stored["width"] = json!(w);
-    stored["height"] = json!(h);
-    // WHY (route66 GH #4082, owner 2026-10-07: "log the OCR timings"): png_bytes,
-    // full_page, the read's own thread CPU and its text size ride in the timings the
+    crate::writer::submit(&frame, &key)?;
+    let submit_ms = t.elapsed().as_millis() as u64;
+    let (w, h) = (frame.width as i64, frame.height as i64);
+    let mut stored = json!({"store": "s3", "bucket": bucket, "key": key, "url": png_uri, "width": w, "height": h});
+    // WHY (route66 GH #4082, owner 2026-10-07: "log the OCR timings"): capture,
+    // conversion, the read's own thread CPU and its text size ride in the timings the
     // harness already logs, so reads can be ranked by cost. Measurement only.
-    let (cdp_ms, b64_ms) = *crate::browser::LAST_CAPTURE.lock().unwrap();
     // Only unsigned numbers: route66's harness decodes timings as map[string]uint64.
-    let mut timings = json!({"fns_ms": fns_ms, "capture_ms": capture_ms, "cdp_ms": cdp_ms, "b64_ms": b64_ms, "store_ms": store_ms, "png_bytes": png.len()});
+    let mut timings = json!({"fns_ms": fns_ms, "capture_ms": capture_ms, "tiles": shot.tiles, "submit_ms": submit_ms,
+                             "frame_bytes": frame.seg.len()});
     // WHY (owner 2026-10-07: "log the PNG URL for investigation"): each shot and each read
     // names the stored PNG, so a ranked offender links to the image it read.
-    let png_uri = format!("s3://{}/{}?versionId={}", stored["bucket"].as_str().unwrap_or(""), stored["key"].as_str().unwrap_or(""), stored["version_id"].as_str().unwrap_or(""));
     eprintln!("SNAPBOT-SHOT {}", json!({"name": name, "url": page.url(), "png": png_uri, "full_page": full_page, "width": w, "height": h,
-                                        "png_bytes": png.len(), "capture_ms": capture_ms, "cdp_ms": cdp_ms, "b64_ms": b64_ms}));
+                                        "frame_bytes": frame.seg.len(), "capture_ms": capture_ms, "tiles": shot.tiles, "submit_ms": submit_ms}));
     if let Some(spec) = spec {
         let regions: Vec<Value> = spec.regions.iter().map(|r| json!({"x": r.x, "y": r.y, "width": r.width, "height": r.height})).collect();
-        // In the lane, on the bytes just captured: decoded once in memory, no
-        // re-encode, no temp file. The text rides back in the response.
+        // In the lane, on the frame just painted: converted once in memory, no
+        // codec, no temp file. The text rides back in the response.
         let label = json!({"name": name, "url": page.url(), "full_page": full_page, "png": png_uri});
-        let mut out = ocr::read(Arc::new(png), spec, keywords, label).await?;
-        for k in ["decode_ms", "resample_ms", "ocr_ms", "cpu_ms", "wall_ms", "engine_init_ms", "text_bytes"] {
+        let mut out = ocr::read(frame.clone(), spec, keywords, label).await?;
+        for k in ["convert_ms", "resample_ms", "ocr_ms", "cpu_ms", "wall_ms", "engine_init_ms", "text_bytes"] {
             timings[k] = out["timings"][k].clone();
         }
         out["regions"] = json!(regions);
@@ -644,11 +647,11 @@ where
 
     crate::runtime::diagnostic_phase("page-cleanup");
     let mut st = pool().lock().await;
-    if let Some(b) = &st.browser {
-        if let Err(e) = browser::dispose_context(&b.cdp, &spare.context).await {
+    if st.browser.is_some() {
+        // Closing the context closes its page and ends the page's event stream.
+        if let Err(e) = browser::dispose_context(&spare.context).await {
             eprintln!("[browse] context close failed: {e:#}");
         }
-        page.cdp.unsubscribe(&page.session);
     }
     if st.browser.as_ref().is_some_and(Browser::connected) {
         schedule_spare(&mut st);

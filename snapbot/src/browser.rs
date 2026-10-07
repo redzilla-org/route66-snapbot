@@ -1,261 +1,86 @@
-//! Chromium process lifecycle and one CDP page session with its event state.
+//! In-process Chromium pages (CEF windowless) and one CDP page session with its
+//! event state.
 //!
-//! The launch argv reproduces what the Node handler ran: puppeteer-core
-//! 25.9.0's default switches plus @sparticuz/chromium 149's serverless set, so
-//! screenshots render with the same flags (hidden scrollbars, sRGB, no font
-//! hinting) as the baselines route66 compares against.
+//! The rendering switches live in cefhost (they reproduce the former puppeteer +
+//! @sparticuz/chromium argv). This module keeps the page-level contract the
+//! browse ops are written against: CDP commands, lifecycle/network/console state,
+//! request interception, and the screenshot -- now a raw BGRA frame painted by
+//! CEF's off-screen renderer instead of a PNG from Page.captureScreenshot.
 
-use crate::cdp::{Cdp, Event};
+use crate::cefhost::{self, Event, PageHandle};
 use crate::js;
+use crate::shm::{Frame, Segment};
 use anyhow::{anyhow, bail, Result};
 use base64::Engine as _;
 use regex::Regex;
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::watch;
 
-/// The Chromium payload baked into the image (Dockerfile): the sparticuz
-/// binary, its swiftshader libraries beside it, fonts/ and al2023/lib.
-fn chromium_dir() -> PathBuf {
-    PathBuf::from(std::env::var("SNAPBOT_CHROMIUM_DIR").unwrap_or_else(|_| "/opt/chromium".to_string()))
-}
-
-/// @sparticuz/chromium 149 `args` (graphics mode on).
-fn sparticuz_args() -> Vec<String> {
-    [
-        "--ash-no-nudges",
-        "--disable-domain-reliability",
-        "--disable-print-preview",
-        "--disk-cache-size=33554432",
-        "--no-default-browser-check",
-        "--no-pings",
-        "--single-process",
-        "--font-render-hinting=none",
-        "--disable-features=AudioServiceOutOfProcess,IsolateOrigins,site-per-process",
-        "--enable-features=SharedArrayBuffer",
-        "--ignore-gpu-blocklist",
-        "--in-process-gpu",
-        "--use-gl=angle",
-        "--use-angle=swiftshader",
-        "--enable-unsafe-swiftshader",
-        "--allow-running-insecure-content",
-        "--disable-setuid-sandbox",
-        "--disable-site-isolation-trials",
-        "--disable-web-security",
-        "--headless='shell'",
-        "--no-sandbox",
-        "--no-zygote",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect()
-}
-
-/// Extract and remove every `<flag>=a,b` feature list from `args`.
-fn take_features(args: &mut Vec<String>, flag: &str) -> Vec<String> {
-    let prefix = format!("{flag}=");
-    let mut out = Vec::new();
-    args.retain(|a| {
-        if let Some(rest) = a.strip_prefix(&prefix) {
-            out.extend(rest.trim().split(',').map(|f| f.trim().to_string()).filter(|f| !f.is_empty()));
-            false
-        } else {
-            true
-        }
-    });
-    out
-}
-
-/// puppeteer-core 25.9.0 ChromeLauncher.defaultArgs + computeLaunchArguments,
-/// with headless "shell", over the given user args.
-fn chrome_argv(mut user: Vec<String>, user_data_dir: &str) -> Vec<String> {
-    let user_disabled = take_features(&mut user, "--disable-features");
-    let user_enabled = take_features(&mut user, "--enable-features");
-    let mut enabled = vec!["PdfOopif".to_string()];
-    enabled.extend(user_enabled);
-    let mut disabled: Vec<String> = [
-        "Translate",
-        "AcceptCHFrame",
-        "MediaRouter",
-        "OptimizationHints",
-        "WebUIReloadButton",
-        "WebUIOmniboxPopup",
-        "WebUIOmniboxAimPopup",
-        "ProcessPerSiteUpToMainFrameThreshold",
-        "IsolateSandboxedIframes",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect();
-    disabled.extend(user_disabled);
-    disabled.retain(|f| !enabled.contains(f));
-    let mut argv: Vec<String> = [
-        "--allow-pre-commit-input",
-        "--disable-background-networking",
-        "--disable-background-timer-throttling",
-        "--disable-backgrounding-occluded-windows",
-        "--disable-breakpad",
-        "--disable-client-side-phishing-detection",
-        "--disable-component-extensions-with-background-pages",
-        "--disable-crash-reporter",
-        "--disable-default-apps",
-        "--disable-dev-shm-usage",
-        "--disable-hang-monitor",
-        "--disable-infobars",
-        "--disable-ipc-flooding-protection",
-        "--disable-popup-blocking",
-        "--disable-prompt-on-repost",
-        "--disable-renderer-backgrounding",
-        "--disable-search-engine-choice-screen",
-        "--disable-sync",
-        "--enable-automation",
-        "--export-tagged-pdf",
-        "--force-color-profile=srgb",
-        "--generate-pdf-document-outline",
-        "--metrics-recording-only",
-        "--no-first-run",
-        "--password-store=basic",
-        "--use-mock-keychain",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect();
-    argv.push(format!("--disable-features={}", disabled.join(",")));
-    argv.push(format!("--enable-features={}", enabled.join(",")));
-    argv.push("--headless".to_string());
-    argv.push("--hide-scrollbars".to_string());
-    argv.push("--mute-audio".to_string());
-    argv.push("--disable-extensions".to_string());
-    if user.iter().all(|a| a.starts_with('-')) {
-        argv.push("about:blank".to_string());
-    }
-    argv.extend(user);
-    argv.push("--remote-debugging-port=0".to_string());
-    argv.push(format!("--user-data-dir={user_data_dir}"));
-    argv
-}
-
-/// One running Chromium and its DevTools connection.
+/// This process's Chromium. CEF is initialized once, at process start, with
+/// SNAPBOT_BROWSER_ARGS; it cannot be relaunched in process.
 pub struct Browser {
-    pub cdp: Arc<Cdp>,
-    child: tokio::process::Child,
-    user_data_dir: PathBuf,
+    _private: (),
 }
 
 pub struct LaunchOptions {
-    /// Keep sparticuz's --single-process (the one-shot evidence capture) or
-    /// drop it (the pool browser, which recycles browser contexts: in single
-    /// process mode a second context crashes the browser).
+    /// Kept for the callers' shape; CEF always runs its renderer out of process.
     pub single_process: bool,
-    /// Browser-wide certificate-error bypass (the pool's acceptInsecureCerts).
+    /// Browser-wide certificate-error bypass; cefhost always sets it.
     pub ignore_https_errors: bool,
     pub extra_args: Vec<String>,
 }
 
 impl Browser {
+    /// Attach to the in-process Chromium. A request asking for launch args other
+    /// than the ones CEF was initialized with fails hard: there is no second
+    /// browser to launch (the former relaunch-on-new-args has no CEF equivalent).
     pub async fn launch(opts: LaunchOptions) -> Result<Browser> {
-        let dir = chromium_dir();
-        let exe = std::env::var("SNAPBOT_CHROMIUM").map(PathBuf::from).unwrap_or_else(|_| dir.join("chromium"));
-        let mut user = sparticuz_args();
-        if !opts.single_process {
-            user.retain(|a| a != "--single-process");
+        let _ = (opts.single_process, opts.ignore_https_errors);
+        if opts.extra_args.as_slice() != cefhost::launch_args() {
+            bail!(
+                "browser_args {:?} differ from this process's Chromium launch args {:?} (SNAPBOT_BROWSER_ARGS); embedded Chromium reads its switches once, at process start",
+                opts.extra_args,
+                cefhost::launch_args()
+            );
         }
-        user.extend(opts.extra_args.iter().cloned());
-        let user_data_dir = std::env::temp_dir().join(format!("puppeteer_dev_chrome_profile-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir_all(&user_data_dir)?;
-        let argv = chrome_argv(user, &user_data_dir.to_string_lossy());
-
-        // The sparticuz payload's environment (its setupLambdaEnvironment),
-        // scoped to the browser process only.
-        let lib = dir.join("al2023").join("lib");
-        let ld = match std::env::var("LD_LIBRARY_PATH") {
-            Ok(v) if !v.is_empty() => format!("{}:{v}", lib.display()),
-            _ => lib.display().to_string(),
-        };
-        let mut cmd = tokio::process::Command::new(&exe);
-        cmd.args(&argv)
-            .env("LD_LIBRARY_PATH", ld)
-            .env("FONTCONFIG_PATH", std::env::var("FONTCONFIG_PATH").unwrap_or_else(|_| dir.join("fonts").display().to_string()))
-            .env("HOME", std::env::var("HOME").unwrap_or_else(|_| std::env::temp_dir().display().to_string()))
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-        let mut child = cmd.spawn().map_err(|e| anyhow!("launch {}: {e}", exe.display()))?;
-        let stderr = child.stderr.take().ok_or_else(|| anyhow!("chromium stderr unavailable"))?;
-        let mut lines = BufReader::new(stderr).lines();
-        let mut seen = Vec::new();
-        let ws = tokio::time::timeout(Duration::from_secs(30), async {
-            while let Ok(Some(line)) = lines.next_line().await {
-                if let Some(i) = line.find("ws://") {
-                    if line.contains("DevTools listening on") {
-                        return Some(line[i..].trim().to_string());
-                    }
-                }
-                if seen.len() < 40 {
-                    seen.push(line);
-                }
-            }
-            None
-        })
-        .await;
-        let ws = match ws {
-            Ok(Some(ws)) => ws,
-            Ok(None) => bail!("Failed to launch the browser process!\n{}", seen.join("\n")),
-            Err(_) => bail!("Timed out after 30000 ms while waiting for the WS endpoint URL to appear in stdout!"),
-        };
-        // Keep draining stderr so a chatty browser can never block on a full pipe.
-        tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
-        let cdp = Cdp::connect(&ws).await?;
-        if opts.ignore_https_errors {
-            cdp.send(None, "Security.setIgnoreCertificateErrors", json!({"ignore": true})).await?;
-        }
-        Ok(Browser { cdp, child, user_data_dir })
+        Ok(Browser { _private: () })
     }
 
+    /// The embedded browser lives as long as the process.
     pub fn connected(&self) -> bool {
-        !self.cdp.is_closed()
+        true
     }
 
-    pub async fn close(mut self) {
-        let _ = tokio::time::timeout(Duration::from_secs(5), self.cdp.send(None, "Browser.close", json!({}))).await;
-        if tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await.is_err() {
-            let _ = self.child.kill().await;
-        }
-        let _ = std::fs::remove_dir_all(&self.user_data_dir);
+    /// Close this handle's default-context pages.
+    pub async fn close(self) {
+        let _ = cefhost::dispose_context(DEFAULT_CONTEXT).await;
     }
 
     pub async fn new_page(&self, context: Option<&str>) -> Result<Page> {
-        new_page(self.cdp.clone(), context).await
+        new_page(context).await
     }
 }
 
-/// Target.createBrowserContext: a fresh cookie jar and cache per request.
-pub async fn create_context(cdp: &Cdp) -> Result<String> {
-    let r = cdp.send(None, "Target.createBrowserContext", json!({})).await?;
-    r.get("browserContextId").and_then(Value::as_str).map(str::to_string).ok_or_else(|| anyhow!("createBrowserContext returned no id"))
+/// The context pages land in when the caller names none.
+const DEFAULT_CONTEXT: &str = "default";
+
+/// A fresh cookie jar and cache per request (CEF request context).
+pub async fn create_context() -> Result<String> {
+    Ok(uuid::Uuid::new_v4().simple().to_string())
 }
 
-pub async fn dispose_context(cdp: &Cdp, id: &str) -> Result<()> {
-    cdp.send(None, "Target.disposeBrowserContext", json!({"browserContextId": id})).await?;
-    Ok(())
+pub async fn dispose_context(id: &str) -> Result<()> {
+    cefhost::dispose_context(id).await
 }
 
-/// A new about:blank page in `context` (the default context when None).
-pub async fn new_page(cdp: Arc<Cdp>, context: Option<&str>) -> Result<Page> {
-    let mut p = json!({"url": "about:blank"});
-    if let Some(c) = context {
-        p["browserContextId"] = Value::String(c.to_string());
-    }
-    let t = cdp.send(None, "Target.createTarget", p).await?;
-    let target_id = t.get("targetId").and_then(Value::as_str).unwrap_or("").to_string();
-    let a = cdp.send(None, "Target.attachToTarget", json!({"targetId": target_id, "flatten": true})).await?;
-    let session = a.get("sessionId").and_then(Value::as_str).unwrap_or("").to_string();
-    Page::attach(cdp, session, target_id).await
+/// A new about:blank page in `context` (the default context when None), at
+/// puppeteer's default 800x600 window.
+pub async fn new_page(context: Option<&str>) -> Result<Page> {
+    let (handle, rx) = cefhost::create_page(context.unwrap_or(DEFAULT_CONTEXT), 800, 600).await?;
+    Page::attach(handle, rx).await
 }
 
 /// A document response the main frame received for one loader.
@@ -302,19 +127,26 @@ pub struct PageState {
     pub crashed: bool,
 }
 
-/// WHY (route66 GH #4082): the last screenshot's (CDP round-trip ms, base64 decode ms).
-/// A lane process drives one page at a time, so the caller that just took the shot
-/// reads its own numbers. Measurement only.
-pub static LAST_CAPTURE: Mutex<(u64, u64)> = Mutex::new((0, 0));
+/// The tallest OSR view one paint covers. A taller full-page capture is painted
+/// in tiles of this height (owner 2026-10-07: "Full-page captures tile past the
+/// texture limit"); 8192 stays well inside Chromium's compositor surface limit.
+const TILE_MAX: i32 = 8192;
+
+/// One screenshot: the frame plus how many paints it took.
+pub struct Shot {
+    pub frame: Frame,
+    pub tiles: u64,
+}
 
 /// One attached page session.
 pub struct Page {
-    pub cdp: Arc<Cdp>,
+    pub handle: PageHandle,
     pub session: String,
-    pub target_id: String,
     pub state: Arc<Mutex<PageState>>,
     pub tick: watch::Receiver<u64>,
     pub intercept: Arc<Mutex<Option<Intercept>>>,
+    /// The viewport set_viewport emulates (None: the 800x600 creation window).
+    viewport: Mutex<Option<(i64, i64)>>,
 }
 
 /// JS `.slice(0, n)` over UTF-16 code units.
@@ -403,14 +235,25 @@ fn status_text(code: i64) -> &'static str {
     }
 }
 
+/// The device metrics puppeteer's setViewport emulated, plus an optional
+/// visible-area override (the tile a full-page capture paints).
+fn device_metrics(width: i64, height: i64, viewport: Option<Value>) -> Value {
+    let mut p = json!({"mobile": false, "width": width, "height": height, "deviceScaleFactor": 1,
+                       "screenOrientation": {"angle": 0, "type": "portraitPrimary"}});
+    if let Some(v) = viewport {
+        p["viewport"] = v;
+    }
+    p
+}
+
 impl Page {
-    pub async fn attach(cdp: Arc<Cdp>, session: String, target_id: String) -> Result<Page> {
-        let rx = cdp.subscribe(&session);
+    pub async fn attach(handle: PageHandle, rx: tokio::sync::mpsc::UnboundedReceiver<Event>) -> Result<Page> {
         let state = Arc::new(Mutex::new(PageState::default()));
         let (tick_tx, tick) = watch::channel(0u64);
         let intercept: Arc<Mutex<Option<Intercept>>> = Arc::new(Mutex::new(None));
-        tokio::spawn(event_loop(cdp.clone(), session.clone(), rx, state.clone(), tick_tx, intercept.clone()));
-        let page = Page { cdp, session, target_id, state, tick, intercept };
+        tokio::spawn(event_loop(handle.id, rx, state.clone(), tick_tx, intercept.clone()));
+        let session = handle.id.to_string();
+        let page = Page { handle, session, state, tick, intercept, viewport: Mutex::new(None) };
         page.send("Page.enable", json!({})).await?;
         let tree = page.send("Page.getFrameTree", json!({})).await?;
         {
@@ -431,7 +274,7 @@ impl Page {
         if self.state.lock().unwrap().crashed {
             bail!("Page crashed!");
         }
-        self.cdp.send(Some(&self.session), method, params).await
+        crate::cdp::send(self.handle.id, method, params).await
     }
 
     pub fn url(&self) -> String {
@@ -463,15 +306,13 @@ impl Page {
         }
     }
 
-    /// puppeteer setViewport (EmulationManager.emulateViewport defaults).
+    /// puppeteer setViewport (EmulationManager.emulateViewport defaults). The
+    /// OSR window is resized to the same size, since the window is what paints.
     pub async fn set_viewport(&self, width: i64, height: i64) -> Result<()> {
-        self.send(
-            "Emulation.setDeviceMetricsOverride",
-            json!({"mobile": false, "width": width, "height": height, "deviceScaleFactor": 1,
-                   "screenOrientation": {"angle": 0, "type": "portraitPrimary"}}),
-        )
-        .await?;
+        cefhost::resize(&self.handle, width as i32, height as i32).await?;
+        self.send("Emulation.setDeviceMetricsOverride", device_metrics(width, height, None)).await?;
         self.send("Emulation.setTouchEmulationEnabled", json!({"enabled": false})).await?;
+        *self.viewport.lock().unwrap() = Some((width, height));
         Ok(())
     }
 
@@ -531,30 +372,81 @@ impl Page {
         let _ = self.send("Runtime.releaseObject", json!({"objectId": object_id})).await;
     }
 
-    /// Page.captureScreenshot: png, optimizeForSpeed (owner 2026-09-29: request
-    /// the fast encoder). A full-page shot clips to the CSS content size with
-    /// captureBeyondViewport, as puppeteer does; without the clip Chromium
-    /// returns only the viewport.
-    pub async fn screenshot(&self, full_page: bool) -> Result<Vec<u8>> {
-        let mut p = json!({"format": "png", "optimizeForSpeed": true, "fromSurface": true, "captureBeyondViewport": full_page});
-        if full_page {
-            let m = self.send("Page.getLayoutMetrics", json!({})).await?;
-            let size = m.get("cssContentSize").or_else(|| m.get("contentSize")).ok_or_else(|| anyhow!("getLayoutMetrics returned no content size"))?;
-            let dim = |k: &str| size.get(k).and_then(Value::as_f64).filter(|f| *f > 0.0).ok_or_else(|| anyhow!("content size has no {k}"));
-            p["clip"] = json!({"x": 0, "y": 0, "width": dim("width")?.ceil(), "height": dim("height")?.ceil(), "scale": 1});
+    /// Let the renderer commit what the last emulation change asked for: two
+    /// animation frames, so the frame the capture forces is painted from the
+    /// new state. No userGesture: a screenshot must not grant user activation.
+    async fn settle_frames(&self) -> Result<()> {
+        let v = self
+            .send(
+                "Runtime.evaluate",
+                json!({"expression": "new Promise(r => requestAnimationFrame(() => requestAnimationFrame(() => r(true))))",
+                       "returnByValue": true, "awaitPromise": true}),
+            )
+            .await?;
+        if let Some(d) = v.get("exceptionDetails") {
+            bail!("frame settle: {}", exception_message(d));
         }
-        // WHY (route66 GH #4082, owner 2026-10-07: "is chromium spending time on compressing
-        // PNGs?"): split the CDP round trip (Chromium's raster plus PNG encode) from the
-        // base64 decode here. The caller logs them once it knows where the PNG was stored
-        // (LAST_CAPTURE). Measurement only.
-        let t = Instant::now();
-        let r = self.send("Page.captureScreenshot", p).await?;
-        let cdp_ms = t.elapsed().as_millis() as u64;
-        let data = r.get("data").and_then(Value::as_str).ok_or_else(|| anyhow!("captureScreenshot returned no data"))?;
-        let t = Instant::now();
-        let png = base64::engine::general_purpose::STANDARD.decode(data)?;
-        *LAST_CAPTURE.lock().unwrap() = (cdp_ms, t.elapsed().as_millis() as u64);
-        Ok(png)
+        Ok(())
+    }
+
+    /// The screenshot as CEF painted it, a raw BGRA frame (no PNG anywhere).
+    ///
+    /// Viewport shots capture the current window. A full-page shot reproduces
+    /// the former Page.captureScreenshot {captureBeyondViewport, clip: CSS
+    /// content size, scale 1}: the page is emulated at its full content size, so
+    /// the whole document lays out and paints from the top regardless of scroll,
+    /// and the window paints it in tiles of at most TILE_MAX rows, each tile
+    /// selected by the emulation's visible-area override. The viewport is
+    /// restored afterwards, exactly as Chromium restored it.
+    pub async fn screenshot(&self, full_page: bool) -> Result<Shot> {
+        let (vw, vh) = self.viewport.lock().unwrap().unwrap_or((800, 600));
+        if !full_page {
+            let seg = Arc::new(Segment::create(vw as usize * vh as usize * 4)?);
+            self.settle_frames().await?;
+            cefhost::capture(&self.handle, (vw as i32, vh as i32), seg.clone(), vw as usize * 4, 0).await?;
+            return Ok(Shot { frame: into_frame(seg, vw as usize, vh as usize)?, tiles: 1 });
+        }
+        let m = self.send("Page.getLayoutMetrics", json!({})).await?;
+        let size = m.get("cssContentSize").or_else(|| m.get("contentSize")).ok_or_else(|| anyhow!("getLayoutMetrics returned no content size"))?;
+        let dim = |k: &str| size.get(k).and_then(Value::as_f64).filter(|f| *f > 0.0).ok_or_else(|| anyhow!("content size has no {k}"));
+        let (cw, ch) = (dim("width")?.ceil() as i64, dim("height")?.ceil() as i64);
+        if cw > TILE_MAX as i64 {
+            bail!("full-page width {cw} exceeds the {TILE_MAX}px paint tile; tiling is vertical only");
+        }
+        let tile = ch.min(TILE_MAX as i64);
+        let seg = Arc::new(Segment::create(cw as usize * ch as usize * 4)?);
+        let mut tiles = 0u64;
+        let painted = async {
+            cefhost::resize(&self.handle, cw as i32, tile as i32).await?;
+            let mut y = 0i64;
+            while y < ch {
+                let th = (ch - y).min(tile);
+                if th != tile {
+                    cefhost::resize(&self.handle, cw as i32, th as i32).await?;
+                }
+                let vis = json!({"x": 0, "y": y, "width": cw, "height": th, "scale": 1});
+                self.send("Emulation.setDeviceMetricsOverride", device_metrics(cw, ch, Some(vis))).await?;
+                self.settle_frames().await?;
+                cefhost::capture(&self.handle, (cw as i32, th as i32), seg.clone(), cw as usize * 4, y as usize).await?;
+                tiles += 1;
+                y += th;
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        // Restore the window and the emulation the page had, painted or not.
+        let restored = async {
+            cefhost::resize(&self.handle, vw as i32, vh as i32).await?;
+            let vp = *self.viewport.lock().unwrap();
+            match vp {
+                Some((w, h)) => self.send("Emulation.setDeviceMetricsOverride", device_metrics(w, h, None)).await.map(|_| ()),
+                None => self.send("Emulation.clearDeviceMetricsOverride", json!({})).await.map(|_| ()),
+            }
+        }
+        .await;
+        painted?;
+        restored?;
+        Ok(Shot { frame: into_frame(seg, cw as usize, ch as usize)?, tiles })
     }
 
     /// The response body text as puppeteer's HTTPResponse.text() decodes it.
@@ -647,6 +539,13 @@ impl Page {
     }
 }
 
+/// The captured segment as a frame. The capture has released its clones by
+/// now; a surviving one means a paint is still writing: fail hard.
+fn into_frame(seg: Arc<Segment>, width: usize, height: usize) -> Result<Frame> {
+    let seg = Arc::try_unwrap(seg).map_err(|_| anyhow!("frame segment still shared after capture"))?;
+    Ok(Frame { seg, width, height, stride: width * 4 })
+}
+
 fn eval_result(v: &Value) -> Result<Option<Value>> {
     if let Some(d) = v.get("exceptionDetails") {
         bail!("{}", exception_message(d));
@@ -663,8 +562,7 @@ fn eval_result(v: &Value) -> Result<Option<Value>> {
 }
 
 async fn event_loop(
-    cdp: Arc<Cdp>,
-    session: String,
+    page: i32,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<Event>,
     state: Arc<Mutex<PageState>>,
     tick: watch::Sender<u64>,
@@ -674,7 +572,7 @@ async fn event_loop(
     while let Some(ev) = rx.recv().await {
         let p = &ev.params;
         match ev.method.as_str() {
-            "Fetch.requestPaused" => handle_paused(&cdp, &session, p, &state, &intercept),
+            "Fetch.requestPaused" => handle_paused(page, p, &state, &intercept),
             _ => apply_event(&mut state.lock().unwrap(), &ev.method, p),
         }
         n += 1;
@@ -771,7 +669,7 @@ fn apply_event(st: &mut PageState, method: &str, p: &Value) {
     }
 }
 
-fn handle_paused(cdp: &Arc<Cdp>, session: &str, p: &Value, state: &Arc<Mutex<PageState>>, intercept: &Arc<Mutex<Option<Intercept>>>) {
+fn handle_paused(page: i32, p: &Value, state: &Arc<Mutex<PageState>>, intercept: &Arc<Mutex<Option<Intercept>>>) {
     let request_id = p.get("requestId").and_then(Value::as_str).unwrap_or("").to_string();
     let url = p.pointer("/request/url").and_then(Value::as_str).unwrap_or("").to_string();
     let (method, params) = {
@@ -828,10 +726,8 @@ fn handle_paused(cdp: &Arc<Cdp>, session: &str, p: &Value, state: &Arc<Mutex<Pag
             }
         }
     };
-    let cdp = cdp.clone();
-    let session = session.to_string();
     // A request the page cancelled meanwhile fails this call; that is harmless.
     tokio::spawn(async move {
-        let _ = cdp.send(Some(&session), method, params).await;
+        let _ = crate::cdp::send(page, method, params).await;
     });
 }

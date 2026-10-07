@@ -10,21 +10,31 @@ use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-/// Store one artifact under the request's s3_prefix and return where it went
-/// plus its sha256. Artifact bytes never travel back in the response.
-pub async fn put(event: &Value, name: &str, bytes: &[u8], content_type: &str) -> Result<Value> {
-    let sha256 = hex::encode(Sha256::digest(bytes));
+/// The key an artifact named `name` lands at under the request's s3_prefix.
+/// Chosen before the write, so the step response and its log lines can name
+/// the PNG while the writer process is still encoding it.
+pub fn key(event: &Value, name: &str) -> Result<String> {
     let prefix = match event.get("s3_prefix") {
         Some(Value::String(s)) if !s.is_empty() => s.trim_end_matches('/').to_string(),
         _ => bail!("browse screenshot requires s3_prefix"),
     };
-    let key = format!("{prefix}/{name}");
+    Ok(format!("{prefix}/{name}"))
+}
+
+/// The bucket every browse artifact goes to.
+pub fn bucket() -> Result<String> {
+    Ok(config::cfg()?.bucket.clone())
+}
+
+/// Store one artifact at `key` and return where it went plus its sha256.
+pub async fn put_key(key: &str, bytes: &[u8], content_type: &str) -> Result<Value> {
+    let sha256 = hex::encode(Sha256::digest(bytes));
     let cfg = config::cfg()?;
     let put = config::s3()
         .await
         .put_object()
         .bucket(&cfg.bucket)
-        .key(&key)
+        .key(key)
         .body(bytes.to_vec().into())
         .content_type(content_type)
         .send()
