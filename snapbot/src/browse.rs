@@ -420,13 +420,24 @@ async fn screenshot_step(step: &Step, page: &Page, ctx: &RunCtx<'_>) -> Result<O
     };
     stored["width"] = json!(w);
     stored["height"] = json!(h);
-    let mut timings = json!({"fns_ms": fns_ms, "capture_ms": capture_ms, "store_ms": store_ms});
+    // WHY (route66 GH #4082, owner 2026-10-07: "log the OCR timings"): png_bytes,
+    // full_page, the read's own thread CPU and its text size ride in the timings the
+    // harness already logs, so reads can be ranked by cost. Measurement only.
+    let (cdp_ms, b64_ms) = *crate::browser::LAST_CAPTURE.lock().unwrap();
+    // Only unsigned numbers: route66's harness decodes timings as map[string]uint64.
+    let mut timings = json!({"fns_ms": fns_ms, "capture_ms": capture_ms, "cdp_ms": cdp_ms, "b64_ms": b64_ms, "store_ms": store_ms, "png_bytes": png.len()});
+    // WHY (owner 2026-10-07: "log the PNG URL for investigation"): each shot and each read
+    // names the stored PNG, so a ranked offender links to the image it read.
+    let png_uri = format!("s3://{}/{}?versionId={}", stored["bucket"].as_str().unwrap_or(""), stored["key"].as_str().unwrap_or(""), stored["version_id"].as_str().unwrap_or(""));
+    eprintln!("SNAPBOT-SHOT {}", json!({"name": name, "url": page.url(), "png": png_uri, "full_page": full_page, "width": w, "height": h,
+                                        "png_bytes": png.len(), "capture_ms": capture_ms, "cdp_ms": cdp_ms, "b64_ms": b64_ms}));
     if let Some(spec) = spec {
         let regions: Vec<Value> = spec.regions.iter().map(|r| json!({"x": r.x, "y": r.y, "width": r.width, "height": r.height})).collect();
         // In the lane, on the bytes just captured: decoded once in memory, no
         // re-encode, no temp file. The text rides back in the response.
-        let mut out = ocr::read(Arc::new(png), spec, keywords).await?;
-        for k in ["decode_ms", "resample_ms", "ocr_ms"] {
+        let label = json!({"name": name, "url": page.url(), "full_page": full_page, "png": png_uri});
+        let mut out = ocr::read(Arc::new(png), spec, keywords, label).await?;
+        for k in ["decode_ms", "resample_ms", "ocr_ms", "cpu_ms", "wall_ms", "engine_init_ms", "text_bytes"] {
             timings[k] = out["timings"][k].clone();
         }
         out["regions"] = json!(regions);

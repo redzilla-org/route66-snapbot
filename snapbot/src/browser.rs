@@ -302,6 +302,11 @@ pub struct PageState {
     pub crashed: bool,
 }
 
+/// WHY (route66 GH #4082): the last screenshot's (CDP round-trip ms, base64 decode ms).
+/// A lane process drives one page at a time, so the caller that just took the shot
+/// reads its own numbers. Measurement only.
+pub static LAST_CAPTURE: Mutex<(u64, u64)> = Mutex::new((0, 0));
+
 /// One attached page session.
 pub struct Page {
     pub cdp: Arc<Cdp>,
@@ -538,9 +543,18 @@ impl Page {
             let dim = |k: &str| size.get(k).and_then(Value::as_f64).filter(|f| *f > 0.0).ok_or_else(|| anyhow!("content size has no {k}"));
             p["clip"] = json!({"x": 0, "y": 0, "width": dim("width")?.ceil(), "height": dim("height")?.ceil(), "scale": 1});
         }
+        // WHY (route66 GH #4082, owner 2026-10-07: "is chromium spending time on compressing
+        // PNGs?"): split the CDP round trip (Chromium's raster plus PNG encode) from the
+        // base64 decode here. The caller logs them once it knows where the PNG was stored
+        // (LAST_CAPTURE). Measurement only.
+        let t = Instant::now();
         let r = self.send("Page.captureScreenshot", p).await?;
+        let cdp_ms = t.elapsed().as_millis() as u64;
         let data = r.get("data").and_then(Value::as_str).ok_or_else(|| anyhow!("captureScreenshot returned no data"))?;
-        Ok(base64::engine::general_purpose::STANDARD.decode(data)?)
+        let t = Instant::now();
+        let png = base64::engine::general_purpose::STANDARD.decode(data)?;
+        *LAST_CAPTURE.lock().unwrap() = (cdp_ms, t.elapsed().as_millis() as u64);
+        Ok(png)
     }
 
     /// The response body text as puppeteer's HTTPResponse.text() decodes it.

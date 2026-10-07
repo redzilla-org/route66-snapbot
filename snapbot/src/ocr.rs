@@ -146,7 +146,18 @@ struct Job {
     png: Arc<Vec<u8>>,
     spec: Spec,
     keywords: Option<Vec<String>>,
+    /// Who asked (screenshot name, page URL); only logged, never read by the engine.
+    label: Value,
     reply: oneshot::Sender<Result<Value, String>>,
+}
+
+/// This thread's CPU time in ms (CLOCK_THREAD_CPUTIME_ID), so a read's cost is its own
+/// CPU, not wall time inflated by other lanes.
+fn thread_cpu_ms() -> f64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: clock_gettime writes only the timespec it is handed.
+    unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    ts.tv_sec as f64 * 1000.0 + ts.tv_nsec as f64 / 1e6
 }
 
 static ENGINE: OnceLock<Mutex<mpsc::Sender<Job>>> = OnceLock::new();
@@ -160,9 +171,30 @@ fn engine() -> mpsc::Sender<Job> {
             std::thread::Builder::new()
                 .name("snapbot-ocr".to_string())
                 .spawn(move || {
+                    // WHY (route66 GH #4082, owner 2026-10-07: "log the OCR timings;
+                    // investigate the ones cosuming the most CPU"): each read reports its own
+                    // thread CPU and wall time, its text size, and the engine's one-time
+                    // setup, so the heaviest reads can be ranked. Measurement only.
+                    let t = Instant::now();
                     let mut engine = Engine::new();
+                    let mut engine_init_ms = Some(t.elapsed().as_millis() as u64);
                     for job in rx {
-                        let out = run_job(&mut engine, &job.png, &job.spec, job.keywords.as_deref());
+                        let (wall, cpu) = (Instant::now(), thread_cpu_ms());
+                        let mut out = run_job(&mut engine, &job.png, &job.spec, job.keywords.as_deref());
+                        let (wall_ms, cpu_ms) = (wall.elapsed().as_millis() as u64, (thread_cpu_ms() - cpu).round() as u64);
+                        let init = engine_init_ms.take().unwrap_or(0);
+                        if let Ok(v) = out.as_mut() {
+                            let text_bytes = v["text"].as_str().map_or(0, str::len);
+                            v["timings"]["cpu_ms"] = json!(cpu_ms);
+                            v["timings"]["wall_ms"] = json!(wall_ms);
+                            v["timings"]["engine_init_ms"] = json!(init);
+                            v["timings"]["text_bytes"] = json!(text_bytes);
+                            eprintln!("SNAPBOT-OCR {}", json!({
+                                "label": job.label, "image": v["image"], "regions": job.spec.regions.len(),
+                                "passes": v["passes"].as_array().map_or(0, Vec::len), "engine_init_ms": init,
+                                "wall_ms": wall_ms, "cpu_ms": cpu_ms, "text_bytes": text_bytes,
+                            }));
+                        }
                         let _ = job.reply.send(out);
                     }
                 })
@@ -238,9 +270,9 @@ fn run_job(engine: &mut Engine, png: &[u8], spec: &Spec, keywords: Option<&[Stri
 }
 
 /// OCR `png` in this process's engine. The bytes are shared, not copied.
-pub async fn read(png: Arc<Vec<u8>>, spec: Spec, keywords: Option<Vec<String>>) -> Result<Value> {
+pub async fn read(png: Arc<Vec<u8>>, spec: Spec, keywords: Option<Vec<String>>, label: Value) -> Result<Value> {
     let (reply, rx) = oneshot::channel();
-    engine().send(Job { png, spec, keywords, reply }).map_err(|_| anyhow!("OCR engine thread is gone"))?;
+    engine().send(Job { png, spec, keywords, label, reply }).map_err(|_| anyhow!("OCR engine thread is gone"))?;
     rx.await.map_err(|_| anyhow!("OCR engine thread died"))?.map_err(|e| anyhow!("ocr: {e}"))
 }
 

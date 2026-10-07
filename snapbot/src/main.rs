@@ -88,7 +88,7 @@ async fn probe() -> Result<()> {
         page.goto(&html.replace(' ', "%20"), "load", 30000).await?;
         let png = page.screenshot(true).await?;
         let (spec, _) = ocr::parse(&serde_json::json!({"passes": [{"psm": 3}]}))?;
-        let out = ocr::read(std::sync::Arc::new(png), spec, None).await?;
+        let out = ocr::read(std::sync::Arc::new(png), spec, None, serde_json::json!({"name": "smoke-probe"})).await?;
         let text = out["text"].as_str().unwrap_or("").to_string();
         anyhow::ensure!(text.contains(TEXT), "probe OCR read {text:?}, expected {TEXT:?}: {out}");
         println!("snapbot probe: chromium rendered and OCR read it back; timings {}", out["timings"]);

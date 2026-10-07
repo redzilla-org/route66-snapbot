@@ -441,6 +441,12 @@ pub async fn capture_web_ui_screenshot(event: &Value) -> Result<Value> {
     ];
     phase("s3-put", &format!("png-bytes={}", c.bytes.len()));
     let vid = attest::put_evidence(&key, c.bytes.clone(), "image/png", &metadata).await?;
+    // WHY (route66 GH #4082, owner 2026-10-07: "log the PNG URL for investigation"):
+    // the attested capture names its evidence object too. Measurement only.
+    let (cdp_ms, b64_ms) = *crate::browser::LAST_CAPTURE.lock().unwrap();
+    eprintln!("SNAPBOT-SHOT {}", json!({"name": "web-ui-screenshot.png", "url": c.final_url, "png": format!("{key}?versionId={vid}"),
+                                        "full_page": c.full_page, "width": c.width, "height": c.height, "png_bytes": c.bytes.len(),
+                                        "cdp_ms": cdp_ms, "b64_ms": b64_ms}));
     let mut o = Map::new();
     let mut put = |k: &str, v: String| {
         o.insert(k.to_string(), json!(v));
