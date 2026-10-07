@@ -333,6 +333,8 @@ pub fn initialize_or_exit() {
         locales_dir_path: CefString::from(format!("{dir}/locales").as_str()),
         root_cache_path: CefString::from(root.to_string_lossy().as_ref()),
         log_file: CefString::from(root.join("cef.log").to_string_lossy().as_ref()),
+        // Opaque white page background (see create_page).
+        background_color: 0xFFFF_FFFF,
         ..Default::default()
     };
     if initialize(Some(args.as_main_args()), Some(&settings), Some(&mut app), std::ptr::null_mut()) != 1 {
@@ -356,13 +358,12 @@ pub fn quit() {
             quit_message_loop();
             return;
         }
-        UI.with(|u| {
-            for b in u.borrow().browsers.values() {
-                if let Some(h) = b.browser.host() {
-                    h.close_browser(1);
-                }
-            }
-        });
+        // Collect first: close_browser runs OnBeforeClose re-entrantly, which
+        // edits the same registry.
+        let hosts: Vec<BrowserHost> = UI.with(|u| u.borrow().browsers.values().filter_map(|b| b.browser.host()).collect());
+        for h in hosts {
+            h.close_browser(1);
+        }
     });
 }
 
@@ -549,7 +550,9 @@ pub async fn create_page(context: &str, width: i32, height: i32) -> Result<(Page
         });
         let rc = rc.as_mut().ok_or_else(|| format!("CEF refused to create request context {ctx}"))?;
         let window = WindowInfo { windowless_rendering_enabled: 1, ..Default::default() };
-        let settings = BrowserSettings { windowless_frame_rate: 30, ..Default::default() };
+        // Opaque white behind the page, as headless Chromium painted it; CEF's
+        // windowless default is transparent (black once alpha is dropped).
+        let settings = BrowserSettings { windowless_frame_rate: 30, background_color: 0xFFFF_FFFF, ..Default::default() };
         let mut client = PageClient::new(PageRender::new(s.clone()), PageLife::new(s.clone()));
         let browser = browser_host_create_browser_sync(
             Some(&window),
@@ -584,20 +587,25 @@ pub async fn dispose_context(context: &str) -> Result<()> {
     let ctx = context.to_string();
     let waits = ui_call(move || {
         let mut waits = Vec::new();
-        UI.with(|u| {
+        // Collect first: close_browser may run OnBeforeClose re-entrantly,
+        // which edits the same registry.
+        let hosts: Vec<BrowserHost> = UI.with(|u| {
             let mut u = u.borrow_mut();
+            let mut hosts = Vec::new();
             for (id, b) in &u.browsers {
                 if b.context == ctx {
                     let (tx, rx) = oneshot::channel();
                     hub().closed.lock().unwrap().insert(*id, tx);
-                    if let Some(h) = b.browser.host() {
-                        h.close_browser(1);
-                    }
+                    hosts.extend(b.browser.host());
                     waits.push(rx);
                 }
             }
             u.contexts.remove(&ctx);
+            hosts
         });
+        for h in hosts {
+            h.close_browser(1);
+        }
         waits
     })
     .await?;
@@ -619,9 +627,7 @@ pub async fn send(id: i32, method: &str, params: Value) -> std::result::Result<V
     let (tx, rx) = oneshot::channel();
     hub().pending.lock().unwrap().insert(msg_id, tx);
     on_ui(move || {
-        let sent = UI.with(|u| {
-            u.borrow().browsers.get(&id).and_then(|b| b.browser.host()).map(|h| h.send_dev_tools_message(Some(&body[..])) == 1).unwrap_or(false)
-        });
+        let sent = host_of(id).map(|h| h.send_dev_tools_message(Some(&body[..])) == 1).unwrap_or(false);
         if !sent {
             if let Some(tx) = hub().pending.lock().unwrap().remove(&msg_id) {
                 let _ = tx.send(Err("Target closed".to_string()));
@@ -636,13 +642,17 @@ pub async fn resize(page: &PageHandle, width: i32, height: i32) -> Result<()> {
     *page.slot.view.lock().unwrap() = (width, height);
     let id = page.id;
     ui_call(move || {
-        UI.with(|u| {
-            if let Some(h) = u.borrow().browsers.get(&id).and_then(|b| b.browser.host()) {
-                h.was_resized();
-            }
-        })
+        if let Some(h) = host_of(id) {
+            h.was_resized();
+        }
     })
     .await
+}
+
+/// Page `id`'s host, with the registry borrow released before the caller
+/// touches CEF (its calls can re-enter our handlers synchronously).
+fn host_of(id: i32) -> Option<BrowserHost> {
+    UI.with(|u| u.borrow().browsers.get(&id).and_then(|b| b.browser.host()))
 }
 
 /// Copy the next painted `want`-sized view frame of `page` into rows
@@ -657,11 +667,9 @@ pub async fn capture(page: &PageHandle, want: (i32, i32), dest: Arc<Segment>, de
     *page.slot.capture.lock().unwrap() = Some(Capture { want, dest, dest_stride, dest_row, done: tx });
     let id = page.id;
     on_ui(move || {
-        UI.with(|u| {
-            if let Some(h) = u.borrow().browsers.get(&id).and_then(|b| b.browser.host()) {
-                h.invalidate(PaintElementType::VIEW);
-            }
-        })
+        if let Some(h) = host_of(id) {
+            h.invalidate(PaintElementType::VIEW);
+        }
     });
     match tokio::time::timeout(Duration::from_secs(10), rx).await {
         Ok(Ok(())) => Ok(()),

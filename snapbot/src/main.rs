@@ -98,13 +98,24 @@ async fn probe() -> Result<()> {
     );
     let r = async {
         page.goto(&html.replace(' ', "%20"), "load", 30000).await?;
+        // The viewport first: the plain paint path, no emulation change.
+        let (spec, _) = ocr::parse(&serde_json::json!({"passes": [{"psm": 3}]}))?;
+        let view = page.screenshot(false).await?;
+        anyhow::ensure!((view.frame.width, view.frame.height) == (1366, 900), "viewport shot is {}x{}", view.frame.width, view.frame.height);
+        let bands = ink_bands(&view.frame);
+        let out = ocr::read(std::sync::Arc::new(view.frame), spec, None, serde_json::json!({"name": "smoke-probe-view"})).await?;
+        anyhow::ensure!(out["text"].as_str().unwrap_or("").contains(TOP), "viewport probe OCR read {} (dark pixels per 1000 rows {bands:?})", out["text"]);
         let (spec, _) = ocr::parse(&serde_json::json!({"passes": [{"psm": 3}]}))?;
         let shot = page.screenshot(true).await?;
         anyhow::ensure!(shot.tiles >= 2, "probe page did not need tiling ({}x{})", shot.frame.width, shot.frame.height);
+        let bands = ink_bands(&shot.frame);
         let frame = std::sync::Arc::new(shot.frame);
         let out = ocr::read(frame.clone(), spec, None, serde_json::json!({"name": "smoke-probe"})).await?;
         let text = out["text"].as_str().unwrap_or("").to_string();
-        anyhow::ensure!(text.contains(TOP) && text.contains(BOTTOM), "probe OCR read {text:?}, expected {TOP:?} and {BOTTOM:?}: {out}");
+        anyhow::ensure!(
+            text.contains(TOP) && text.contains(BOTTOM),
+            "probe OCR read {text:?}, expected {TOP:?} and {BOTTOM:?} (dark pixels per 1000 rows {bands:?}): {out}"
+        );
         // The PNG the writer and the evidence path store: same pixels, encoded once.
         let png = pngenc::encode(&frame)?;
         println!(
@@ -115,16 +126,26 @@ async fn probe() -> Result<()> {
             png.len(),
             out["timings"]
         );
-        let (spec, _) = ocr::parse(&serde_json::json!({"passes": [{"psm": 3}]}))?;
-        let view = page.screenshot(false).await?;
-        anyhow::ensure!((view.frame.width, view.frame.height) == (1366, 900), "viewport shot is {}x{}", view.frame.width, view.frame.height);
-        let out = ocr::read(std::sync::Arc::new(view.frame), spec, None, serde_json::json!({"name": "smoke-probe-view"})).await?;
-        anyhow::ensure!(out["text"].as_str().unwrap_or("").contains(TOP), "viewport probe OCR read {}", out["text"]);
         Ok(())
     }
     .await;
     b.close().await;
     r
+}
+
+/// Dark pixels per 1000-row band: what a failed probe reports, so a blank,
+/// black or half-painted frame is told apart at a glance.
+fn ink_bands(f: &shm::Frame) -> Vec<u64> {
+    let px = f.seg.as_slice();
+    let mut bands = vec![0u64; f.height.div_ceil(1000)];
+    for y in 0..f.height {
+        for p in px[y * f.stride..][..f.width * 4].chunks_exact(4) {
+            if (p[0] as u32 + p[1] as u32 + p[2] as u32) < 384 {
+                bands[y / 1000] += 1;
+            }
+        }
+    }
+    bands
 }
 
 /// Commands that drive pages initialize CEF on the main thread; the rest never
