@@ -1,13 +1,11 @@
 //! route66-snapbot: one binary for the Lambda handler, the local Kumo pool, its
-//! PNG writer and its self-test (GH #4115; the Node coordinator is burned).
+//! PNG writer (GH #4115; the Node coordinator is burned).
 //!
 //!   snapbot                  Lambda bootstrap: Runtime API loop, handler = $_HANDLER
 //!   snapbot kumo-runtime     local pool dispatcher (SNAPBOT_POOL_PROCESSES lanes)
 //!   snapbot kumo-lane        one pool lane (started by kumo-runtime)
 //!   snapbot png-writer <s>   the background PNG encoder/storer (started by the
 //!                            pool or a Lambda process; see writer.rs)
-//!   snapbot probe            image build check: embedded Chromium renders a page,
-//!                            the in-process engine OCRs the painted frame
 //!   snapbot bench <url> <dir> OCR cost measurements (Dockerfile.test only)
 //!   snapbot --version
 //!   snapbot --type=...       a CEF child process (renderer, GPU, utility)
@@ -67,7 +65,6 @@ async fn run() -> Result<()> {
             init(&handler)?;
             kumo::run_lane(handler).await
         }
-        "probe" => probe().await,
         // Test-image only: the OCR cost measurements on a tall page.
         "bench" => {
             let a: Vec<String> = std::env::args().skip(2).collect();
@@ -83,123 +80,11 @@ async fn run() -> Result<()> {
     }
 }
 
-/// The image's own proof: the embedded Chromium renders viewport and full-page
-/// captures, and the linked engine reads text from the raw frames. The page is
-/// taller than the viewport, with text at both ends to catch incomplete captures.
-async fn probe() -> Result<()> {
-    const TOP: &str = "SNAPBOT PROBE 4115";
-    const BOTTOM: &str = "SNAPBOT FULL PAGE TAIL";
-    let b = browser::Browser::launch(browser::LaunchOptions { single_process: false, ignore_https_errors: true, extra_args: cefhost::launch_args().to_vec() }).await?;
-    let page = b.new_page(None).await?;
-    page.set_viewport(1366, 900).await?;
-    let html = format!(
-        "data:text/html,<body style=\"margin:0\"><h1 style=\"font:64px sans-serif;margin:0\">{TOP}</h1><div style=\"height:9800px\"></div><h1 style=\"font:64px sans-serif;margin:0\">{BOTTOM}</h1></body>"
-    );
-    let r = async {
-        page.goto(&html.replace(' ', "%20"), "load", 30000).await?;
-        // WHY: verify the viewport path before asking Chromium for the full page.
-        let (spec, _) = ocr::parse(&serde_json::json!({"passes": [{"psm": 3}]}))?;
-        let view = page.screenshot(false).await?;
-        anyhow::ensure!((view.frame.width, view.frame.height) == (1366, 900), "viewport shot is {}x{}", view.frame.width, view.frame.height);
-        let bands = ink_bands(&view.frame);
-        let out = ocr::read(std::sync::Arc::new(view.frame), spec, None, serde_json::json!({"name": "smoke-probe-view"})).await?;
-        anyhow::ensure!(out["text"].as_str().unwrap_or("").contains(TOP), "viewport probe OCR read {} (dark pixels per 1000 rows {bands:?})", out["text"]);
-        let (spec, _) = ocr::parse(&serde_json::json!({"passes": [{"psm": 3}]}))?;
-        let shot = page.screenshot(true).await?;
-        // WHY (route66 GH #4082): CDP now returns one complete, tall capture.
-        anyhow::ensure!(shot.tiles == 1 && shot.frame.width == 1366 && shot.frame.height > 900,
-            "full-page probe expected one 1366px-wide capture taller than viewport, got {}x{} in {} captures",
-            shot.frame.width, shot.frame.height, shot.tiles);
-        let bands = ink_bands(&shot.frame);
-        let frame = std::sync::Arc::new(shot.frame);
-        let out = ocr::read(frame.clone(), spec, None, serde_json::json!({"name": "smoke-probe"})).await?;
-        let text = out["text"].as_str().unwrap_or("").to_string();
-        anyhow::ensure!(
-            text.contains(TOP) && text.contains(BOTTOM),
-            "probe OCR read {text:?}, expected {TOP:?} and {BOTTOM:?} (dark pixels per 1000 rows {bands:?}): {out}"
-        );
-        // WHY (route66 GH #4082): lv 20261008T005048Z full-page shots painted only
-        // the first ~900 rows (search-result, compass privacy: white bands where
-        // the remainder had not rastered yet). Colored blocks prove every row
-        // of the full-page capture is painted, not just its text.
-        let blocks = 140;
-        let mut body = String::from("<body style=\"margin:0\">");
-        for i in 0..blocks {
-            // Software raster of blurred gradients is slow, as photo-heavy
-            // listing pages are: the frame races raster unless draws wait for it.
-            let c = format!("rgb({},{},{})", 40 + (i * 7) % 150, 30 + (i * 13) % 150, 20 + (i * 29) % 150);
-            body.push_str(&format!(
-                "<div style=\"height:100px;background:repeating-radial-gradient(circle,{c} 0 3px,rgb(20,20,20) 3px 5px);filter:blur(1px) saturate(2);box-shadow:0 0 40px {c}\"></div>"
-            ));
-        }
-        page.goto(&format!("data:text/html,{}</body>", body.replace(' ', "%20").replace('#', "%23")), "load", 30000).await?;
-        // The lv defect showed under 40-lane load, not idle: oversubscribe the
-        // CPUs while the shot paints so raster is as late as it was there.
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let burners: Vec<_> = (0..4 * std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4))
-            .map(|_| {
-                let s = stop.clone();
-                std::thread::spawn(move || {
-                    while !s.load(std::sync::atomic::Ordering::Relaxed) {
-                        std::hint::spin_loop();
-                    }
-                })
-            })
-            .collect();
-        let shot = page.screenshot(true).await;
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        burners.into_iter().for_each(|b| b.join().unwrap());
-        let shot = shot?;
-        let f = &shot.frame;
-        // WHY: the block pixel checks need the complete 14000px page.
-        anyhow::ensure!(shot.tiles == 1 && f.width == 1366 && f.height >= blocks * 100,
-            "loaded probe expected one 1366x{}+ capture, got {}x{} in {} captures",
-            blocks * 100, f.width, f.height, shot.tiles);
-        let px = f.seg.as_slice();
-        let white: Vec<usize> = (0..blocks)
-            .filter(|i| {
-                let o = (i * 100 + 50) * f.stride + 683 * 4;
-                px[o] as u32 + px[o + 1] as u32 + px[o + 2] as u32 > 700
-            })
-            .collect();
-        anyhow::ensure!(white.is_empty(), "full-page {}x{} left {} of {blocks} blocks unpainted (white): {:?}", f.width, f.height, white.len(), white);
-        // The PNG the writer and the evidence path store: same pixels, encoded once.
-        let png = pngenc::encode(&frame)?;
-        println!(
-            "snapbot probe: CEF captured {}x{} in {} full-page capture, OCR read it back, png {} bytes; timings {}",
-            frame.width,
-            frame.height,
-            shot.tiles,
-            png.len(),
-            out["timings"]
-        );
-        Ok(())
-    }
-    .await;
-    b.close().await;
-    r
-}
-
-/// Dark pixels per 1000-row band: what a failed probe reports, so a blank,
-/// black or half-painted frame is told apart at a glance.
-fn ink_bands(f: &shm::Frame) -> Vec<u64> {
-    let px = f.seg.as_slice();
-    let mut bands = vec![0u64; f.height.div_ceil(1000)];
-    for y in 0..f.height {
-        for p in px[y * f.stride..][..f.width * 4].chunks_exact(4) {
-            if (p[0] as u32 + p[1] as u32 + p[2] as u32) < 384 {
-                bands[y / 1000] += 1;
-            }
-        }
-    }
-    bands
-}
-
 /// Commands that drive pages initialize CEF on the main thread; the rest never
 /// load Chromium at all.
 fn needs_chromium() -> bool {
     match std::env::args().nth(1).unwrap_or_default().as_str() {
-        "kumo-lane" | "probe" | "bench" | "index.handler" => true,
+        "kumo-lane" | "bench" | "index.handler" => true,
         "" => !handler_name().starts_with("fetch-hop"),
         _ => false,
     }

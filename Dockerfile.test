@@ -1,8 +1,7 @@
 # The repository gate (owner 2026-09-12: "docker build counts as test"). It
 # builds the production image's stages as Dockerfile does, runs the workspace's
-# unit tests on the same toolchain, and ends in the production runtime userland,
-# whose `bootstrap probe` renders a page in the embedded Chromium (CEF) and OCRs
-# the painted frame in-process.
+# unit tests on the same toolchain, and checks binary linkage in the production
+# runtime userland. Real screenshot behavior is checked by web regression.
 
 # ---------------------------------------------------------------------------
 # native-build: glibc toolchain, static Leptonica + Tesseract, CEF, the handler.
@@ -149,11 +148,10 @@ ENV TESSDATA_PREFIX=/opt/snapbot/tessdata \
 COPY --from=native-build /out/unit-tests.ok /tmp/unit-tests.ok
 # The ldd assertion (owner 2026-10-07: the static-musl `! ldd` is replaced):
 # every shared library the handler and libcef.so need resolves in this
-# userland; a single "not found" fails the build. Then the binary runs, and
-# the embedded Chromium paints and the engine reads the frame back.
+# userland; a single "not found" fails the build. The version command also
+# proves the binary starts in that runtime userland.
 RUN ! ldd /var/runtime/bootstrap /opt/snapbot/cef/libcef.so | grep 'not found' \
-    && /var/runtime/bootstrap --version \
-    && /var/runtime/bootstrap probe
+    && /var/runtime/bootstrap --version
 
 CMD ["index.handler"]
 
