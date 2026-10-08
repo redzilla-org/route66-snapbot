@@ -188,6 +188,15 @@ fn base_switches() -> Vec<String> {
         "--use-gl=angle",
         "--use-angle=swiftshader",
         "--enable-unsafe-swiftshader",
+        // WHY (route66 GH #4082): a CEF OSR frame is whatever the compositor
+        // drew, and cc draws before raster finishes (unrastered tiles paint as
+        // the white background; lv 20261008T005048Z full-page shots were white
+        // below row ~900). Page.captureScreenshot waited for raster; OnPaint
+        // does not. Headless deterministic mode's pair makes every draw wait
+        // for all tiles and decode images synchronously, so the first frame
+        // of the wanted size is a complete one.
+        "--run-all-compositor-stages-before-draw",
+        "--disable-checker-imaging",
     ]
     .iter()
     .map(|s| s.to_string())

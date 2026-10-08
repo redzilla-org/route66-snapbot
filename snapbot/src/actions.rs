@@ -49,7 +49,10 @@ impl Page {
     pub async fn goto(&self, url: &str, wait_until: &str, timeout_ms: u64) -> Result<Option<NavResponse>> {
         let event = lifecycle_name(wait_until)?;
         let dl = deadline(timeout_ms);
-        let frame = self.state.lock().unwrap().main_frame.clone();
+        let (frame, before) = {
+            let st = self.state.lock().unwrap();
+            (st.main_frame.clone(), st.loader.clone())
+        };
         let nav = self.send("Page.navigate", json!({"url": url, "frameId": frame}));
         let r = match dl {
             Some(d) => tokio::time::timeout_at(d.into(), nav)
@@ -66,8 +69,18 @@ impl Page {
             // Same-document navigation: no new document, no response.
             return Ok(None);
         };
+        // WHY (route66 GH #4082, /content/privacy goto 8000ms timeouts in every
+        // brand): puppeteer's LifecycleWatcher follows the frame's CURRENT
+        // document, so a client-side redirect (the privacy stub's
+        // window.location to compass.com) is waited through. Waiting on the
+        // navigate's own loader alone hangs once the redirect replaces it
+        // before that loader reached `event`. Either loader reaching it is done.
         let done = self
-            .wait_state(dl, |st| st.lifecycle.get(&loader).filter(|s| s.contains(event)).map(|_| ()))
+            .wait_state(dl, |st| {
+                let own = st.lifecycle.get(&loader).is_some_and(|s| s.contains(event));
+                let current = st.loader != before && st.loader != loader && st.lifecycle.get(&st.loader).is_some_and(|s| s.contains(event));
+                (own || current).then_some(())
+            })
             .await;
         if done.is_none() {
             bail!("Navigation timeout of {timeout_ms} ms exceeded");

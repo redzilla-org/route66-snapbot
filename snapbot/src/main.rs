@@ -116,6 +116,47 @@ async fn probe() -> Result<()> {
             text.contains(TOP) && text.contains(BOTTOM),
             "probe OCR read {text:?}, expected {TOP:?} and {BOTTOM:?} (dark pixels per 1000 rows {bands:?}): {out}"
         );
+        // WHY (route66 GH #4082): lv 20261008T005048Z full-page shots painted only
+        // the first ~900 rows (search-result, compass privacy: white bands where
+        // tiles had not rastered yet). A page of solid colored blocks proves every
+        // row of every tile is painted, not just its text.
+        let blocks = 140;
+        let mut body = String::from("<body style=\"margin:0\">");
+        for i in 0..blocks {
+            // Software raster of blurred gradients is slow, as photo-heavy
+            // listing pages are: the frame races raster unless draws wait for it.
+            let c = format!("rgb({},{},{})", 40 + (i * 7) % 150, 30 + (i * 13) % 150, 20 + (i * 29) % 150);
+            body.push_str(&format!(
+                "<div style=\"height:100px;background:repeating-radial-gradient(circle,{c} 0 3px,rgb(20,20,20) 3px 5px);filter:blur(1px) saturate(2);box-shadow:0 0 40px {c}\"></div>"
+            ));
+        }
+        page.goto(&format!("data:text/html,{}</body>", body.replace(' ', "%20").replace('#', "%23")), "load", 30000).await?;
+        // The lv defect showed under 40-lane load, not idle: oversubscribe the
+        // CPUs while the shot paints so raster is as late as it was there.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let burners: Vec<_> = (0..4 * std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4))
+            .map(|_| {
+                let s = stop.clone();
+                std::thread::spawn(move || {
+                    while !s.load(std::sync::atomic::Ordering::Relaxed) {
+                        std::hint::spin_loop();
+                    }
+                })
+            })
+            .collect();
+        let shot = page.screenshot(true).await;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        burners.into_iter().for_each(|b| b.join().unwrap());
+        let shot = shot?;
+        let f = &shot.frame;
+        let px = f.seg.as_slice();
+        let white: Vec<usize> = (0..blocks)
+            .filter(|i| {
+                let o = (i * 100 + 50) * f.stride + 683 * 4;
+                px[o] as u32 + px[o + 1] as u32 + px[o + 2] as u32 > 700
+            })
+            .collect();
+        anyhow::ensure!(white.is_empty(), "full-page {}x{} in {} tiles left {} of {blocks} blocks unpainted (white): {:?}", f.width, f.height, shot.tiles, white.len(), white);
         // The PNG the writer and the evidence path store: same pixels, encoded once.
         let png = pngenc::encode(&frame)?;
         println!(
