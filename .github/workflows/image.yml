@@ -42,6 +42,12 @@ jobs:
           fi
           image="ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}"
           docker build --platform linux/amd64 -t "$image" .
+          # A workstation release can appear during the build. Check again
+          # before push so CI does not replace that release's image bytes.
+          if gh release view "snapbot-$GITHUB_SHA" > /dev/null 2>&1; then
+            echo "snapbot-$GITHUB_SHA published during build; nothing to push"
+            exit 0
+          fi
           docker push "$image"
           docker save "$image" | gzip -1 > route66-snapbot-linux-amd64.tar.gz
           # GitHub rejects tag names made solely from a 40-character commit

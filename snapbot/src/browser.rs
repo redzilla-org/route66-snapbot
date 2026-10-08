@@ -387,11 +387,17 @@ impl Page {
 
     /// Capture the compositor's finished visible surface through CDP, then
     /// decode it into the BGRA frame consumed by OCR and the PNG writer.
-    async fn capture_frame(&self, width: usize, height: usize) -> Result<Frame> {
+    async fn capture_frame(&self, width: usize, height: usize, y: Option<usize>) -> Result<Frame> {
         self.settle_frames().await?;
+        let mut params = json!({"format": "png", "fromSurface": true,
+                                "captureBeyondViewport": false, "optimizeForSpeed": true});
+        // CDP's clip bounds the PNG to the painted OSR tile and selects its
+        // document offset without scrolling fixed elements into every tile.
+        if let Some(y) = y {
+            params["clip"] = json!({"x": 0, "y": y, "width": width, "height": height, "scale": 1});
+        }
         let reply = self
-            .send("Page.captureScreenshot", json!({"format": "png", "fromSurface": true,
-                                                 "captureBeyondViewport": false, "optimizeForSpeed": true}))
+            .send("Page.captureScreenshot", params)
             .await?;
         let encoded = reply.get("data").and_then(Value::as_str).ok_or_else(|| anyhow!("captureScreenshot returned no PNG data"))?;
         let png = base64::engine::general_purpose::STANDARD.decode(encoded)?;
@@ -404,7 +410,7 @@ impl Page {
     pub async fn screenshot(&self, full_page: bool) -> Result<Shot> {
         let (vw, vh) = self.viewport.lock().unwrap().unwrap_or((800, 600));
         if !full_page {
-            return Ok(Shot { frame: self.capture_frame(vw as usize, vh as usize).await?, tiles: 1 });
+            return Ok(Shot { frame: self.capture_frame(vw as usize, vh as usize, None).await?, tiles: 1 });
         }
         let m = self.send("Page.getLayoutMetrics", json!({})).await?;
         let size = m.get("cssContentSize").or_else(|| m.get("contentSize")).ok_or_else(|| anyhow!("getLayoutMetrics returned no content size"))?;
@@ -423,7 +429,7 @@ impl Page {
                 cefhost::resize(&self.handle, width as i32, th as i32).await?;
                 let visible = json!({"x": 0, "y": y, "width": width, "height": th, "scale": 1});
                 self.send("Emulation.setDeviceMetricsOverride", device_metrics(width as i64, height as i64, Some(visible))).await?;
-                let tile = self.capture_frame(width, th).await?;
+                let tile = self.capture_frame(width, th, Some(y)).await?;
                 let start = y * stride;
                 seg.as_mut_slice()[start..start + tile.seg.len()].copy_from_slice(tile.seg.as_slice());
                 tiles += 1;
