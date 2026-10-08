@@ -47,9 +47,12 @@ one frame before OCR and the stored PNG write.
   px at device scale 1); each rect is cropped before rescaling, so a read costs
   its own area.
 
-The step value carries the stored PNG (`bucket`, `key`, `version_id`, `sha256`,
-`width`, `height`), `timings` (`fns_ms`, `capture_ms`, `decode_ms`,
-`resample_ms`, `ocr_ms`, `store_ms`) and `ocr`:
+The step value carries only a link to the shared SHA-1 image object, scalar
+`inspect` facts requested by the caller, timings, and optional OCR text. The
+caller never receives image bytes or retrieves the object for scoring. Each
+screenshot step may send `inspect` thresholds and named page-region functions;
+Snapbot measures them on the captured frame before discarding it. Reports link
+to `snapbot/sha1/<first-two-hex>/<sha1>.png` in the central test-results bucket.
 
 ```json
 {

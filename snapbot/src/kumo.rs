@@ -3,7 +3,7 @@
 //! Kumo exposes the standard Lambda Runtime API and hands each invocation to
 //! whichever poller is waiting on /next, so this needs no scheduler: it starts
 //! SNAPBOT_POOL_PROCESSES lane processes (this binary, `kumo-lane`), each one
-//! warm browser plus one poller. Owner 2026-09-26, verbatim: "snapbot's lambda
+//! warm browser plus one poller and in-process image writer. Owner 2026-09-26, verbatim: "snapbot's lambda
 //! pool should be at least 40 processes"; fewer is refused. Any lane exit after
 //! startup is fatal: the pool is either full width or down, and the container's
 //! restart policy brings it back warm.
@@ -57,23 +57,14 @@ pub async fn run_pool() -> Result<()> {
     }
     let started = Instant::now();
     let exe = std::env::current_exe()?;
-    // ONE PNG writer for the whole pool (owner 2026-10-07): every lane hands it
-    // frames, so one drain call is a barrier over all 40 lanes' screenshots.
-    let sock = std::env::temp_dir().join("snapbot-pool-writer.sock").display().to_string();
-    let mut writer_child = crate::writer::spawn(&sock)?;
-    let (writer_tx, mut writer_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    std::thread::spawn(move || {
-        let status = writer_child.wait().map(|s| s.to_string()).unwrap_or_else(|e| e.to_string());
-        let _ = writer_tx.send(status);
-    });
-    std::env::set_var("SNAPBOT_WRITER_SOCK", &sock);
+    // Each warm lane now encodes and stores its own frames in background tasks,
+    // so the dispatcher does not launch or coordinate a shared PNG process.
     let (ready_tx, mut ready_rx) = tokio::sync::mpsc::unbounded_channel::<(usize, u32, u64)>();
     let (exit_tx, mut exit_rx) = tokio::sync::mpsc::unbounded_channel::<(usize, String)>();
     for i in 0..n {
         let mut child = tokio::process::Command::new(&exe)
             .arg("kumo-lane")
             .env("SNAPBOT_LANE", i.to_string())
-            .env("SNAPBOT_WRITER_SOCK", &sock)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -106,7 +97,6 @@ pub async fn run_pool() -> Result<()> {
         tokio::select! {
             Some(r) = ready_rx.recv() => up.push(r),
             Some((i, status)) = exit_rx.recv() => bail!("lane {i} exited before ready ({status})"),
-            Some(status) = writer_rx.recv() => bail!("png-writer exited before the pool was ready ({status})"),
             _ = tokio::time::sleep_until(deadline) => bail!("pool not ready within {}ms", POOL_STARTUP_TIMEOUT.as_millis()),
         }
     }
@@ -127,16 +117,10 @@ pub async fn run_pool() -> Result<()> {
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let fatal = tokio::select! {
         Some((i, status)) = exit_rx.recv() => format!("snapbot pool fatal: lane {i} exited ({status}); the pool is below its {n}-process width"),
-        Some(status) = writer_rx.recv() => format!("snapbot pool fatal: png-writer exited ({status})"),
         _ = term.recv() => String::new(),
     };
-    // Shutdown and fatal exits alike wait for the writer to store every frame
-    // it holds (owner 2026-10-07: no frame is ever dropped).
-    if !fatal.contains("png-writer exited") {
-        let t = Instant::now();
-        crate::writer::drain_all().await?;
-        println!("snapbot pool: png-writer drained in {}ms", t.elapsed().as_millis());
-    }
+    // Every browse joins its own writes before replying, so shutdown has no
+    // shared writer queue to drain.
     if fatal.is_empty() {
         return Ok(());
     }
@@ -151,9 +135,8 @@ pub async fn run_lane(handler: String) -> Result<()> {
         _ => serde_json::json!([]),
     };
     crate::browse::warm(&args).await?;
-    // Connect to the pool's PNG writer before polling, so a missing writer fails
-    // the lane at startup rather than at its first screenshot.
-    crate::writer::ensure();
+    // No writer handshake is needed: the lane's first screenshot schedules a
+    // local Rust task and the browse joins it before returning.
     println!("{READY}{}", started.elapsed().as_millis());
     // A lane outliving its dispatcher would keep a browser nobody supervises.
     tokio::spawn(async {

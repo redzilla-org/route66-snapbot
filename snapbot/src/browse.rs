@@ -17,7 +17,7 @@
 
 use crate::actions::nav_json;
 use crate::browser::{self, Browser, Fulfill, Intercept, LaunchOptions, Page};
-use crate::{js, ocr, store};
+use crate::{js, ocr};
 use anyhow::{anyhow, bail, Result};
 use base64::Engine as _;
 use regex::Regex;
@@ -336,8 +336,7 @@ fn safe_name(v: Option<&Value>) -> Result<String> {
     }
 }
 
-struct RunCtx<'a> {
-    event: &'a Value,
+struct RunCtx {
     clocks: HashMap<String, i64>,
     default_timeout: u64,
     navigation_timeout: u64,
@@ -378,7 +377,7 @@ async fn page_fn(page: &Page, src: &str, what: &str) -> Result<Value> {
     page.evaluate(&expr).await?.ok_or_else(|| anyhow!("{what} returned undefined"))
 }
 
-async fn screenshot_step(step: &Step, page: &Page, ctx: &RunCtx<'_>) -> Result<Option<Value>> {
+async fn screenshot_step(step: &Step, page: &Page) -> Result<Option<Value>> {
     let name = safe_name(step.raw.get("name"))?;
     let full_page = step.raw.get("full_page") != Some(&Value::Bool(false));
     let ocr_spec = match step.get("ocr") {
@@ -404,54 +403,79 @@ async fn screenshot_step(step: &Step, page: &Page, ctx: &RunCtx<'_>) -> Result<O
     }
     let fns_ms = t.elapsed().as_millis() as u64;
 
-    // The location is chosen before the write (owner 2026-10-07: "choose the S3 key
-    // up front and log it"), so the response and the logs name the PNG while the
-    // writer process is still encoding it.
-    let key = store::key(ctx.event, &name)?;
-    let bucket = store::bucket()?;
-    let png_uri = format!("s3://{bucket}/{key}");
+    // Element regions are located in the painted document at capture time.
+    // Snapbot reports measurements for them; callers never fetch the PNG.
+    let mut inspect_spec = step.get("inspect").cloned().unwrap_or_else(|| json!({}));
+    let mut resolved = Vec::new();
+    if let Some(regions) = inspect_spec.get("regions").and_then(Value::as_array) {
+        for region in regions {
+            let name = region.get("name").and_then(Value::as_str).ok_or_else(|| anyhow!("inspect region needs name"))?;
+            let source = region.get("rect_fn").and_then(Value::as_str).ok_or_else(|| anyhow!("inspect region {name} needs rect_fn"))?;
+            let expr = call_expr(Some(&Value::String(source.to_string())), region.get("arg"))?;
+            let rect = page.evaluate(&expr).await?.ok_or_else(|| anyhow!("inspect region {name} has no rect"))?;
+            resolved.push(json!({"name": name, "kind": region.get("kind"), "rect": rect}));
+        }
+    }
+    inspect_spec["resolved_regions"] = json!(resolved);
 
+    // The encoded bytes determine the shared object key after compression;
+    // no caller-supplied test or run prefix participates in storage.
     let t = Instant::now();
     let shot = tokio::time::timeout(Duration::from_millis(SCREENSHOT_TIMEOUT_MS), page.screenshot(full_page))
         .await
         .map_err(|_| anyhow!("screenshot exceeded {SCREENSHOT_TIMEOUT_MS}ms"))??;
     let capture_ms = t.elapsed().as_millis() as u64;
     let frame = Arc::new(shot.frame);
-    // The raw frame goes to the PNG writer by memfd; encode + store run there,
-    // off this step (owner 2026-10-07: async writing "is NOT a coverup").
+    // The caller supplies per-capture thresholds. Analyze the live BGRA frame
+    // while OCR and PNG storage run; no process later downloads the PNG.
+    let inspect_frame = frame.clone();
+    let inspection = tokio::task::spawn_blocking(move || crate::inspect::analyze(&inspect_frame, &inspect_spec));
+    // The lane's background task encodes and stores from this OCR frame; no
+    // extra process or pixel transport is involved.
     let t = Instant::now();
-    crate::writer::submit(&frame, &key)?;
+    let write = crate::writer::submit(&frame);
     let submit_ms = t.elapsed().as_millis() as u64;
     let (w, h) = (frame.width as i64, frame.height as i64);
-    let mut stored = json!({"store": "s3", "bucket": bucket, "key": key, "url": png_uri, "width": w, "height": h});
     // WHY (route66 GH #4082, owner 2026-10-07: "log the OCR timings"): capture,
     // conversion, the read's own thread CPU and its text size ride in the timings the
     // harness already logs, so reads can be ranked by cost. Measurement only.
     // Only unsigned numbers: route66's harness decodes timings as map[string]uint64.
     let mut timings = json!({"fns_ms": fns_ms, "capture_ms": capture_ms, "tiles": shot.tiles, "submit_ms": submit_ms,
                              "frame_bytes": frame.seg.len()});
-    // WHY (owner 2026-10-07: "log the PNG URL for investigation"): each shot and each read
-    // names the stored PNG, so a ranked offender links to the image it read.
-    eprintln!("SNAPBOT-SHOT {}", json!({"name": name, "url": page.url(), "png": png_uri, "full_page": full_page, "width": w, "height": h,
-                                        "frame_bytes": frame.seg.len(), "capture_ms": capture_ms, "tiles": shot.tiles, "submit_ms": submit_ms}));
+    let mut ocr_result = None;
+    let mut ocr_error = None;
     if let Some(spec) = spec {
         let regions: Vec<Value> = spec.regions.iter().map(|r| json!({"x": r.x, "y": r.y, "width": r.width, "height": r.height})).collect();
         // In the lane, on the frame just painted: converted once in memory, no
-        // codec, no temp file. The text rides back in the response.
-        let label = json!({"name": name, "url": page.url(), "full_page": full_page, "png": png_uri});
-        let mut out = ocr::read(frame.clone(), spec, keywords, label).await?;
-        for k in ["convert_ms", "resample_ms", "ocr_ms", "cpu_ms", "wall_ms", "engine_init_ms", "text_bytes"] {
-            timings[k] = out["timings"][k].clone();
+        // codec or temp file. The write continues even if OCR fails.
+        let label = json!({"name": name, "url": page.url(), "full_page": full_page});
+        match ocr::read(frame.clone(), spec, keywords, label).await {
+            Ok(mut out) => {
+                for k in ["convert_ms", "resample_ms", "ocr_ms", "cpu_ms", "wall_ms", "engine_init_ms", "text_bytes"] {
+                    timings[k] = out["timings"][k].clone();
+                }
+                out["regions"] = json!(regions);
+                ocr_result = Some(out);
+            }
+            Err(e) => ocr_error = Some(e),
         }
-        out["regions"] = json!(regions);
-        stored["ocr"] = out;
     }
+    let mut stored = crate::writer::finish(write).await?;
+    stored["inspect"] = inspection.await.map_err(|e| anyhow!("screenshot inspector exited: {e}"))?;
+    if let Some(e) = ocr_error { return Err(e); }
+    stored["width"] = json!(w);
+    stored["height"] = json!(h);
+    if let Some(out) = ocr_result { stored["ocr"] = out; }
+    // The log and response use the final SHA-1 address, not a temporary name.
+    eprintln!("SNAPBOT-SHOT {}", json!({"name": name, "url": page.url(), "png": stored["url"], "full_page": full_page,
+                                        "width": w, "height": h, "frame_bytes": frame.seg.len(), "capture_ms": capture_ms,
+                                        "tiles": shot.tiles, "submit_ms": submit_ms}));
     stored["timings"] = timings;
     Ok(Some(stored))
 }
 
 /// One step against the page. Ok(None) is a JS `undefined` value.
-async fn run_step(step: &Step, page: &Page, ctx: &mut RunCtx<'_>) -> Result<Option<Value>> {
+async fn run_step(step: &Step, page: &Page, ctx: &mut RunCtx) -> Result<Option<Value>> {
     let t = match step_timeout(step, &ctx.clocks)? {
         Timeout::Exhausted => bail!("clock {} exhausted before {} began", js_arg(step, "clock"), step.op),
         Timeout::Ms(t) => t,
@@ -572,7 +596,7 @@ async fn run_step(step: &Step, page: &Page, ctx: &mut RunCtx<'_>) -> Result<Opti
             ctx.clocks.insert(name.to_string(), js::now_ms() + ms as i64);
             Ok(Some(Value::Null))
         }
-        "screenshot" => screenshot_step(step, page, ctx).await,
+        "screenshot" => screenshot_step(step, page).await,
         other => bail!("unreachable op {other}"),
     }
 }
@@ -601,7 +625,7 @@ pub async fn browse(event: &Value) -> Result<Value> {
     let mut c = parse_context(event.get("context"))?;
     let steps = parse_steps(event.get("steps"))?;
     let (out, worker) = with_page(&browser_args, |page, acquire_ms| async move {
-        run_request(event, &page, &mut c, &steps, started, acquire_ms).await
+        run_request(&page, &mut c, &steps, started, acquire_ms).await
     })
     .await?;
     let mut out = out;
@@ -671,13 +695,12 @@ where
     Ok((result?, worker))
 }
 
-async fn run_request(event: &Value, page: &Page, c: &mut Ctx, steps: &[Step], started: Instant, acquire_ms: u64) -> Result<Value> {
+async fn run_request(page: &Page, c: &mut Ctx, steps: &[Step], started: Instant, acquire_ms: u64) -> Result<Value> {
     let setup_start = Instant::now();
     crate::runtime::diagnostic_phase("context-setup");
     install_context(page, c).await?;
     let setup_ms = setup_start.elapsed().as_millis() as u64;
     let mut ctx = RunCtx {
-        event,
         clocks: HashMap::new(),
         default_timeout: c.default_timeout.unwrap_or(30000),
         navigation_timeout: c.navigation_timeout.or(c.default_timeout).unwrap_or(30000),
@@ -732,6 +755,8 @@ async fn run_request(event: &Value, page: &Page, c: &mut Ctx, steps: &[Step], st
         by_id.insert(step.id.clone(), (false, ok));
         results.push(Value::Object(r));
     }
+    // Every screenshot step joined its own content-addressed write before
+    // returning its reference, so the browse has no pending writer queue.
     let st = page.state.lock().unwrap();
     Ok(json!({
         "ok": all_ok,
@@ -740,6 +765,7 @@ async fn run_request(event: &Value, page: &Page, c: &mut Ctx, steps: &[Step], st
         "console_errors": st.console_errors,
         "failed_requests": st.failed_requests,
         "http_errors": st.http_errors,
+        "writer_drained": true,
         "timings": {"total_ms": started.elapsed().as_millis() as u64, "acquire_ms": acquire_ms, "setup_ms": setup_ms},
     }))
 }

@@ -178,13 +178,10 @@ pub async fn handle(event: Value) -> Result<Value> {
     if action == "browse" {
         return browse::browse(&event).await;
     }
-    // The end-of-run barrier (owner 2026-10-07): screenshots are stored by the
-    // PNG writer after their step returns, so a caller about to read them waits
-    // here until the writer's whole queue is stored.
+    // Legacy clients may still invoke this action. A browse now joins its own
+    // writes before replying, so there is no pool-wide queue left to drain.
     if action == "drain-writer" {
-        let t = std::time::Instant::now();
-        crate::writer::drain_all().await?;
-        return Ok(json!({"drained": true, "wait_ms": t.elapsed().as_millis() as u64}));
+        return Ok(json!({"drained": true, "wait_ms": 0}));
     }
     crate::config::cfg()?;
     if action == "attest-run-manifest" {

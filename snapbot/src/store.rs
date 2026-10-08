@@ -1,44 +1,86 @@
-//! The browse artifact store: S3, everywhere.
+//! One durable screenshot store for local and managed Snapbot.
 //!
-//! The local pool writes through Kumo's S3 (AWS_ENDPOINT_URL) with the very
-//! PutObject the Lambda makes in AWS, so a local run exercises the production
-//! path. The former SNAPBOT_STORE=local directory switch is deleted (owner
-//! 2026-09-29: "why local is not S3 thru Kumo?").
+//! Kumo still serves the local Runtime API, but screenshots go directly to the
+//! command-center test-results bucket. The shared SHA-1 key is independent of
+//! the test, run, and environment, so reports link to the same object.
 
 use crate::config;
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
+use sha1::{Digest, Sha1};
+use tokio::sync::OnceCell;
 
-/// The key an artifact named `name` lands at under the request's s3_prefix.
-/// Chosen before the write, so the step response and its log lines can name
-/// the PNG while the writer process is still encoding it.
-pub fn key(event: &Value, name: &str) -> Result<String> {
-    let prefix = match event.get("s3_prefix") {
-        Some(Value::String(s)) if !s.is_empty() => s.trim_end_matches('/').to_string(),
-        _ => bail!("browse screenshot requires s3_prefix"),
-    };
-    Ok(format!("{prefix}/{name}"))
+static IMAGE_S3: OnceCell<aws_sdk_s3::Client> = OnceCell::const_new();
+
+// The local pool carries emulator credentials for Lambda invocation. Override
+// them only for image writes, using its mounted read-only command-center profile.
+async fn image_s3() -> &'static aws_sdk_s3::Client {
+    IMAGE_S3.get_or_init(|| async {
+        let mut sdk = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .region(aws_config::Region::new("us-east-1"));
+        if let Ok(profile) = std::env::var("SNAPBOT_IMAGE_AWS_PROFILE") {
+            let provider = aws_config::profile::ProfileFileCredentialsProvider::builder()
+                .profile_name(profile)
+                .build();
+            sdk = sdk.credentials_provider(provider);
+        }
+        let sdk = sdk.load().await;
+        // AWS_ENDPOINT_URL points at Kumo for the Runtime API; never let it
+        // redirect image traffic away from the one central S3 bucket.
+        let conf = aws_sdk_s3::config::Builder::from(&sdk)
+            .endpoint_url("https://s3.us-east-1.amazonaws.com")
+            .request_checksum_calculation(aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired)
+            .build();
+        aws_sdk_s3::Client::from_conf(conf)
+    }).await
 }
 
 /// The bucket every browse artifact goes to.
 pub fn bucket() -> Result<String> {
-    Ok(config::cfg()?.bucket.clone())
+    match std::env::var("SNAPBOT_IMAGE_BUCKET") {
+        Ok(bucket) if !bucket.is_empty() => Ok(bucket),
+        _ => Ok(config::cfg()?.bucket.clone()),
+    }
 }
 
-/// Store one artifact at `key` and return where it went plus its sha256.
-pub async fn put_key(key: &str, bytes: &[u8], content_type: &str) -> Result<Value> {
-    let sha256 = hex::encode(Sha256::digest(bytes));
-    let cfg = config::cfg()?;
-    let put = config::s3()
-        .await
+/// SHA-1 names the encoded bytes, so identical screenshots have one stable key.
+pub async fn put_content(bytes: Vec<u8>, content_type: &str) -> Result<Value> {
+    let sha1 = hex::encode(Sha1::digest(&bytes));
+    let key = format!("snapbot/sha1/{}/{}.png", &sha1[..2], sha1);
+    let size = bytes.len();
+    let bucket = bucket()?;
+    let url = format!("https://{bucket}.s3.us-east-1.amazonaws.com/{key}");
+    // Avoid a second write when another run already captured identical bytes.
+    match image_s3().await.head_object().bucket(&bucket).key(&key).send().await {
+        Ok(head) => return Ok(json!({"store": "s3", "bucket": bucket, "key": key,
+            "url": url, "version_id": head.version_id().unwrap_or(""), "sha1": sha1,
+            "bytes": size, "deduplicated": true})),
+        Err(e) if e.as_service_error().is_some_and(|s| s.is_not_found()) => {},
+        Err(e) => return Err(anyhow!("S3 HeadObject {key}: {}", aws_sdk_s3::error::DisplayErrorContext(&e))),
+    }
+    // The conditional write closes the race between concurrent captures of
+    // identical pixels, including in a versioned bucket.
+    let put = image_s3().await
         .put_object()
-        .bucket(&cfg.bucket)
-        .key(key)
-        .body(bytes.to_vec().into())
+        .bucket(&bucket)
+        .key(&key)
+        .if_none_match("*")
+        .body(bytes.into())
         .content_type(content_type)
         .send()
-        .await
-        .map_err(|e| anyhow!("S3 PutObject {key}: {}", aws_sdk_s3::error::DisplayErrorContext(&e)))?;
-    Ok(json!({"store": "s3", "bucket": cfg.bucket, "key": key, "version_id": put.version_id().unwrap_or(""), "sha256": sha256, "bytes": bytes.len()}))
+        .await;
+    let put = match put {
+        Ok(put) => put,
+        Err(e) if e.as_service_error().is_some_and(|s| s.code() == Some("PreconditionFailed")) => {
+            let head = image_s3().await.head_object().bucket(&bucket).key(&key).send().await
+                .map_err(|head| anyhow!("S3 HeadObject after duplicate {key}: {}", aws_sdk_s3::error::DisplayErrorContext(&head)))?;
+            return Ok(json!({"store": "s3", "bucket": bucket, "key": key,
+                "url": url, "version_id": head.version_id().unwrap_or(""), "sha1": sha1,
+                "bytes": size, "deduplicated": true}));
+        }
+        Err(e) => return Err(anyhow!("S3 PutObject {key}: {}", aws_sdk_s3::error::DisplayErrorContext(&e))),
+    };
+    Ok(json!({"store": "s3", "bucket": bucket, "key": key, "url": url,
+              "version_id": put.version_id().unwrap_or(""), "sha1": sha1, "bytes": size}))
 }

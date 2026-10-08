@@ -1,11 +1,9 @@
 //! route66-snapbot: one binary for the Lambda handler, the local Kumo pool, its
-//! PNG writer (GH #4115; the Node coordinator is burned).
+//! in-process image writer (GH #4115; the Node coordinator is burned).
 //!
 //!   snapbot                  Lambda bootstrap: Runtime API loop, handler = $_HANDLER
 //!   snapbot kumo-runtime     local pool dispatcher (SNAPBOT_POOL_PROCESSES lanes)
 //!   snapbot kumo-lane        one pool lane (started by kumo-runtime)
-//!   snapbot png-writer <s>   the background PNG encoder/storer (started by the
-//!                            pool or a Lambda process; see writer.rs)
 //!   snapbot bench <url> <dir> OCR cost measurements (Dockerfile.test only)
 //!   snapbot --version
 //!   snapbot --type=...       a CEF child process (renderer, GPU, utility)
@@ -31,6 +29,7 @@ mod ocr;
 mod pngenc;
 mod runtime;
 mod shm;
+mod inspect;
 mod store;
 mod writer;
 
@@ -95,15 +94,7 @@ fn main() {
     if let Some(code) = cefhost::run_subprocess_if_child() {
         std::process::exit(code);
     }
-    // The PNG writer is its own process with its own runtime (writer.rs).
-    if std::env::args().nth(1).as_deref() == Some("png-writer") {
-        let path = std::env::args().nth(2).unwrap_or_default();
-        if let Err(e) = writer::serve(&path) {
-            eprintln!("snapbot png-writer fatal: {e:#}");
-            std::process::exit(1);
-        }
-        return;
-    }
+    // Screenshot writes run inside each lane; there is no writer subprocess.
     let tokio_main = || -> i32 {
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
         match rt.block_on(run()) {
