@@ -83,13 +83,12 @@ async fn run() -> Result<()> {
     }
 }
 
-/// The image's own proof: the embedded Chromium renders, a viewport and a tiled
-/// full-page capture paint, and the linked engine reads the text back from the
-/// raw frame. The page is taller than one paint tile, with text at its top and
-/// at its bottom, so a full-page capture that lost a tile cannot pass.
+/// The image's own proof: the embedded Chromium renders viewport and full-page
+/// captures, and the linked engine reads text from the raw frames. The page is
+/// taller than the viewport, with text at both ends to catch incomplete captures.
 async fn probe() -> Result<()> {
     const TOP: &str = "SNAPBOT PROBE 4115";
-    const BOTTOM: &str = "SNAPBOT TILE TAIL";
+    const BOTTOM: &str = "SNAPBOT FULL PAGE TAIL";
     let b = browser::Browser::launch(browser::LaunchOptions { single_process: false, ignore_https_errors: true, extra_args: cefhost::launch_args().to_vec() }).await?;
     let page = b.new_page(None).await?;
     page.set_viewport(1366, 900).await?;
@@ -98,7 +97,7 @@ async fn probe() -> Result<()> {
     );
     let r = async {
         page.goto(&html.replace(' ', "%20"), "load", 30000).await?;
-        // The viewport first: the plain paint path, no emulation change.
+        // WHY: verify the viewport path before asking Chromium for the full page.
         let (spec, _) = ocr::parse(&serde_json::json!({"passes": [{"psm": 3}]}))?;
         let view = page.screenshot(false).await?;
         anyhow::ensure!((view.frame.width, view.frame.height) == (1366, 900), "viewport shot is {}x{}", view.frame.width, view.frame.height);
@@ -107,7 +106,10 @@ async fn probe() -> Result<()> {
         anyhow::ensure!(out["text"].as_str().unwrap_or("").contains(TOP), "viewport probe OCR read {} (dark pixels per 1000 rows {bands:?})", out["text"]);
         let (spec, _) = ocr::parse(&serde_json::json!({"passes": [{"psm": 3}]}))?;
         let shot = page.screenshot(true).await?;
-        anyhow::ensure!(shot.tiles >= 2, "probe page did not need tiling ({}x{})", shot.frame.width, shot.frame.height);
+        // WHY (route66 GH #4082): CDP now returns one complete, tall capture.
+        anyhow::ensure!(shot.tiles == 1 && shot.frame.width == 1366 && shot.frame.height > 900,
+            "full-page probe expected one 1366px-wide capture taller than viewport, got {}x{} in {} captures",
+            shot.frame.width, shot.frame.height, shot.tiles);
         let bands = ink_bands(&shot.frame);
         let frame = std::sync::Arc::new(shot.frame);
         let out = ocr::read(frame.clone(), spec, None, serde_json::json!({"name": "smoke-probe"})).await?;
@@ -118,8 +120,8 @@ async fn probe() -> Result<()> {
         );
         // WHY (route66 GH #4082): lv 20261008T005048Z full-page shots painted only
         // the first ~900 rows (search-result, compass privacy: white bands where
-        // tiles had not rastered yet). A page of solid colored blocks proves every
-        // row of every tile is painted, not just its text.
+        // the remainder had not rastered yet). Colored blocks prove every row
+        // of the full-page capture is painted, not just its text.
         let blocks = 140;
         let mut body = String::from("<body style=\"margin:0\">");
         for i in 0..blocks {
@@ -149,6 +151,10 @@ async fn probe() -> Result<()> {
         burners.into_iter().for_each(|b| b.join().unwrap());
         let shot = shot?;
         let f = &shot.frame;
+        // WHY: the block pixel checks need the complete 14000px page.
+        anyhow::ensure!(shot.tiles == 1 && f.width == 1366 && f.height >= blocks * 100,
+            "loaded probe expected one 1366x{}+ capture, got {}x{} in {} captures",
+            blocks * 100, f.width, f.height, shot.tiles);
         let px = f.seg.as_slice();
         let white: Vec<usize> = (0..blocks)
             .filter(|i| {
@@ -156,11 +162,11 @@ async fn probe() -> Result<()> {
                 px[o] as u32 + px[o + 1] as u32 + px[o + 2] as u32 > 700
             })
             .collect();
-        anyhow::ensure!(white.is_empty(), "full-page {}x{} in {} tiles left {} of {blocks} blocks unpainted (white): {:?}", f.width, f.height, shot.tiles, white.len(), white);
+        anyhow::ensure!(white.is_empty(), "full-page {}x{} left {} of {blocks} blocks unpainted (white): {:?}", f.width, f.height, white.len(), white);
         // The PNG the writer and the evidence path store: same pixels, encoded once.
         let png = pngenc::encode(&frame)?;
         println!(
-            "snapbot probe: CEF painted {}x{} in {} tiles, OCR read it back, png {} bytes; timings {}",
+            "snapbot probe: CEF captured {}x{} in {} full-page capture, OCR read it back, png {} bytes; timings {}",
             frame.width,
             frame.height,
             shot.tiles,
