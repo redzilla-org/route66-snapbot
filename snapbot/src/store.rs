@@ -1,8 +1,7 @@
 //! One durable screenshot store for local and managed Snapbot.
 //!
-//! Kumo still serves the local Runtime API, but screenshots go directly to the
-//! command-center test-results bucket. The shared SHA-1 key is independent of
-//! the test, run, and environment, so reports link to the same object.
+//! Local runs use one Kumo bucket; CI uses one AWS bucket. The shared SHA-1 key
+//! is independent of the test and run, so reports link to the stored object.
 
 use crate::config;
 use anyhow::{anyhow, Result};
@@ -13,8 +12,8 @@ use tokio::sync::OnceCell;
 
 static IMAGE_S3: OnceCell<aws_sdk_s3::Client> = OnceCell::const_new();
 
-// The local pool carries emulator credentials for Lambda invocation. Override
-// them only for image writes, using its mounted read-only command-center profile.
+// An explicit endpoint keeps all local image traffic inside Kumo. CI omits it
+// and writes to the real AWS bucket with its normal task credentials.
 async fn image_s3() -> &'static aws_sdk_s3::Client {
     IMAGE_S3.get_or_init(|| async {
         let mut sdk = aws_config::defaults(aws_config::BehaviorVersion::latest())
@@ -26,10 +25,11 @@ async fn image_s3() -> &'static aws_sdk_s3::Client {
             sdk = sdk.credentials_provider(provider);
         }
         let sdk = sdk.load().await;
-        // AWS_ENDPOINT_URL points at Kumo for the Runtime API; never let it
-        // redirect image traffic away from the one central S3 bucket.
+        let endpoint = std::env::var("SNAPBOT_IMAGE_S3_ENDPOINT")
+            .unwrap_or_else(|_| "https://s3.us-east-1.amazonaws.com".to_owned());
         let conf = aws_sdk_s3::config::Builder::from(&sdk)
-            .endpoint_url("https://s3.us-east-1.amazonaws.com")
+            .endpoint_url(endpoint)
+            .force_path_style(true)
             .request_checksum_calculation(aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired)
             .build();
         aws_sdk_s3::Client::from_conf(conf)
@@ -50,7 +50,11 @@ pub async fn put_content(bytes: Vec<u8>, content_type: &str) -> Result<Value> {
     let key = format!("snapbot/sha1/{}/{}.png", &sha1[..2], sha1);
     let size = bytes.len();
     let bucket = bucket()?;
-    let url = format!("https://{bucket}.s3.us-east-1.amazonaws.com/{key}");
+    // Local reports point at Kumo's host-reachable endpoint; CI links to AWS.
+    let url = match std::env::var("SNAPBOT_IMAGE_S3_ENDPOINT") {
+        Ok(endpoint) => format!("{}/{bucket}/{key}", endpoint.trim_end_matches('/')),
+        Err(_) => format!("https://{bucket}.s3.us-east-1.amazonaws.com/{key}"),
+    };
     // A conditional write deduplicates even concurrent captures in a versioned
     // bucket. It also avoids a missing-key HEAD probe, which needs ListBucket.
     let put = image_s3().await

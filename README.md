@@ -52,7 +52,8 @@ The step value carries only a link to the shared SHA-1 image object, scalar
 caller never receives image bytes or retrieves the object for scoring. Each
 screenshot step may send `inspect` thresholds and named page-region functions;
 Snapbot measures them on the captured frame before discarding it. Reports link
-to `snapbot/sha1/<first-two-hex>/<sha1>.png` in the central test-results bucket.
+to `snapbot/sha1/<first-two-hex>/<sha1>.png` in one shared bucket: Kumo locally,
+the test-results bucket in CI.
 
 ```json
 {
