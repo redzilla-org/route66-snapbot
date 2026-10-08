@@ -51,16 +51,8 @@ pub async fn put_content(bytes: Vec<u8>, content_type: &str) -> Result<Value> {
     let size = bytes.len();
     let bucket = bucket()?;
     let url = format!("https://{bucket}.s3.us-east-1.amazonaws.com/{key}");
-    // Avoid a second write when another run already captured identical bytes.
-    match image_s3().await.head_object().bucket(&bucket).key(&key).send().await {
-        Ok(head) => return Ok(json!({"store": "s3", "bucket": bucket, "key": key,
-            "url": url, "version_id": head.version_id().unwrap_or(""), "sha1": sha1,
-            "bytes": size, "deduplicated": true})),
-        Err(e) if e.as_service_error().is_some_and(|s| s.is_not_found()) => {},
-        Err(e) => return Err(anyhow!("S3 HeadObject {key}: {}", aws_sdk_s3::error::DisplayErrorContext(&e))),
-    }
-    // The conditional write closes the race between concurrent captures of
-    // identical pixels, including in a versioned bucket.
+    // A conditional write deduplicates even concurrent captures in a versioned
+    // bucket. It also avoids a missing-key HEAD probe, which needs ListBucket.
     let put = image_s3().await
         .put_object()
         .bucket(&bucket)
@@ -73,10 +65,8 @@ pub async fn put_content(bytes: Vec<u8>, content_type: &str) -> Result<Value> {
     let put = match put {
         Ok(put) => put,
         Err(e) if e.as_service_error().is_some_and(|s| s.code() == Some("PreconditionFailed")) => {
-            let head = image_s3().await.head_object().bucket(&bucket).key(&key).send().await
-                .map_err(|head| anyhow!("S3 HeadObject after duplicate {key}: {}", aws_sdk_s3::error::DisplayErrorContext(&head)))?;
             return Ok(json!({"store": "s3", "bucket": bucket, "key": key,
-                "url": url, "version_id": head.version_id().unwrap_or(""), "sha1": sha1,
+                "url": url, "sha1": sha1,
                 "bytes": size, "deduplicated": true}));
         }
         Err(e) => return Err(anyhow!("S3 PutObject {key}: {}", aws_sdk_s3::error::DisplayErrorContext(&e))),
