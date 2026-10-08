@@ -29,7 +29,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"
 # default features: no sandbox (the Lambda runs unsandboxed, as before), no
 # bundling tool, no resource helpers.
 cef = { version = "=154.5.0", default-features = false }
-# The one PNG encode a screenshot gets, from the raw frame (pngenc.rs).
+# Encode the captured BGRA frame for storage (pngenc.rs); CDP also sends PNG.
 png = "0.18"
 serde = { version = "1", features = ["derive"] }
 # preserve_order: the signed statement, observed map and step results keep the

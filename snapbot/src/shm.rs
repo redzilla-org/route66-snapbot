@@ -2,8 +2,8 @@
 //!
 //! WHY (owner 2026-10-07: "pass the raw frame byte buffers to the writer process
 //! via shared memory, not a pipe", then "Allocate one memfd segment per frame on
-//! demand and free it after the write"). CEF's paint buffer is copied ONCE, into
-//! this segment; OCR reads it in place and the PNG writer process maps the same
+//! demand and free it after the write"). Chromium's screenshot PNG is decoded
+//! into this segment; OCR reads it in place and the PNG writer process maps the same
 //! pages through the passed fd. memfd is anonymous memory, so /dev/shm's size
 //! (Docker's 64 MB default) never bounds it.
 
@@ -75,8 +75,8 @@ impl Segment {
     /// Writable view. Only the capture side writes, before the segment is shared.
     #[allow(clippy::mut_from_ref)]
     pub fn as_mut_slice(&self) -> &mut [u8] {
-        // SAFETY: as above; the single writer is the paint callback filling a
-        // segment nothing else reads yet (capture completes before any reader).
+        // SAFETY: as above; screenshot decoding fills the segment before either
+        // OCR or the background writer reads it.
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
     }
 }

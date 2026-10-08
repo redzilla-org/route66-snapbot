@@ -1,8 +1,8 @@
-//! The one PNG encode a screenshot gets: BGRA frame -> RGB8 PNG.
+//! Encode the captured BGRA frame as an RGB8 PNG for storage.
 //!
 //! WHY (owner 2026-10-07): the stored screenshot and the attested evidence stay
 //! PNG with the same width/height, and snapbot encodes it itself from the BGRA
-//! buffer, once. RGB8 matches the opaque PNGs Page.captureScreenshot produced;
+//! buffer for storage. RGB8 matches Chromium's opaque screenshot pixels;
 //! the fast zlib level was the owner's order for the writer.
 
 use crate::shm::Frame;

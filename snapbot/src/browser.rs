@@ -4,8 +4,8 @@
 //! The rendering switches live in cefhost (they reproduce the former puppeteer +
 //! @sparticuz/chromium argv). This module keeps the page-level contract the
 //! browse ops are written against: CDP commands, lifecycle/network/console state,
-//! request interception, and the screenshot -- now a raw BGRA frame painted by
-//! CEF's off-screen renderer instead of a PNG from Page.captureScreenshot.
+//! request interception, and a CDP screenshot decoded into the raw BGRA frame
+//! OCR and the PNG writer share.
 
 use crate::cefhost::{self, Event, PageHandle};
 use crate::js;
@@ -127,12 +127,7 @@ pub struct PageState {
     pub crashed: bool,
 }
 
-/// The tallest OSR view one paint covers. A taller full-page capture is painted
-/// in tiles of this height (owner 2026-10-07: "Full-page captures tile past the
-/// texture limit"); 8192 stays well inside Chromium's compositor surface limit.
-const TILE_MAX: i32 = 8192;
-
-/// One screenshot: the frame plus how many paints it took.
+/// One screenshot: the frame plus how many CDP captures it took.
 pub struct Shot {
     pub frame: Frame,
     pub tiles: u64,
@@ -370,9 +365,8 @@ impl Page {
         let _ = self.send("Runtime.releaseObject", json!({"objectId": object_id})).await;
     }
 
-    /// Let the renderer commit what the last emulation change asked for: two
-    /// animation frames, so the frame the capture forces is painted from the
-    /// new state. No userGesture: a screenshot must not grant user activation.
+    /// Let the renderer commit the preceding page change before capture.
+    /// No userGesture: a screenshot must not grant user activation.
     async fn settle_frames(&self) -> Result<()> {
         let v = self
             .send(
@@ -387,64 +381,29 @@ impl Page {
         Ok(())
     }
 
-    /// The screenshot as CEF painted it, a raw BGRA frame (no PNG anywhere).
-    ///
-    /// Viewport shots capture the current window. A full-page shot reproduces
-    /// the former Page.captureScreenshot {captureBeyondViewport, clip: CSS
-    /// content size, scale 1}: the page is emulated at its full content size, so
-    /// the whole document lays out and paints from the top regardless of scroll,
-    /// and the window paints it in tiles of at most TILE_MAX rows, each tile
-    /// selected by the emulation's visible-area override. The viewport is
-    /// restored afterwards, exactly as Chromium restored it.
+    /// Capture the compositor's finished image through CDP, then decode it once
+    /// into the BGRA frame consumed by OCR and the background PNG writer.
+    /// Full-page capture uses the CSS content clip without resizing the page.
     pub async fn screenshot(&self, full_page: bool) -> Result<Shot> {
         let (vw, vh) = self.viewport.lock().unwrap().unwrap_or((800, 600));
-        if !full_page {
-            let seg = Arc::new(Segment::create(vw as usize * vh as usize * 4)?);
-            self.settle_frames().await?;
-            cefhost::capture(&self.handle, (vw as i32, vh as i32), seg.clone(), vw as usize * 4, 0).await?;
-            return Ok(Shot { frame: into_frame(seg, vw as usize, vh as usize)?, tiles: 1 });
+        let (width, height) = if full_page {
+            let m = self.send("Page.getLayoutMetrics", json!({})).await?;
+            let size = m.get("cssContentSize").or_else(|| m.get("contentSize")).ok_or_else(|| anyhow!("getLayoutMetrics returned no content size"))?;
+            let dim = |k: &str| size.get(k).and_then(Value::as_f64).filter(|f| *f > 0.0).ok_or_else(|| anyhow!("content size has no {k}"));
+            (dim("width")?.ceil() as usize, dim("height")?.ceil() as usize)
+        } else {
+            (vw as usize, vh as usize)
+        };
+        self.settle_frames().await?;
+        let mut params = json!({"format": "png", "fromSurface": true, "captureBeyondViewport": full_page,
+                                "optimizeForSpeed": true});
+        if full_page {
+            params["clip"] = json!({"x": 0, "y": 0, "width": width, "height": height, "scale": 1});
         }
-        let m = self.send("Page.getLayoutMetrics", json!({})).await?;
-        let size = m.get("cssContentSize").or_else(|| m.get("contentSize")).ok_or_else(|| anyhow!("getLayoutMetrics returned no content size"))?;
-        let dim = |k: &str| size.get(k).and_then(Value::as_f64).filter(|f| *f > 0.0).ok_or_else(|| anyhow!("content size has no {k}"));
-        let (cw, ch) = (dim("width")?.ceil() as i64, dim("height")?.ceil() as i64);
-        if cw > TILE_MAX as i64 {
-            bail!("full-page width {cw} exceeds the {TILE_MAX}px paint tile; tiling is vertical only");
-        }
-        let tile = ch.min(TILE_MAX as i64);
-        let seg = Arc::new(Segment::create(cw as usize * ch as usize * 4)?);
-        let mut tiles = 0u64;
-        let painted = async {
-            cefhost::resize(&self.handle, cw as i32, tile as i32).await?;
-            let mut y = 0i64;
-            while y < ch {
-                let th = (ch - y).min(tile);
-                if th != tile {
-                    cefhost::resize(&self.handle, cw as i32, th as i32).await?;
-                }
-                let vis = json!({"x": 0, "y": y, "width": cw, "height": th, "scale": 1});
-                self.send("Emulation.setDeviceMetricsOverride", device_metrics(cw, ch, Some(vis))).await?;
-                self.settle_frames().await?;
-                cefhost::capture(&self.handle, (cw as i32, th as i32), seg.clone(), cw as usize * 4, y as usize).await?;
-                tiles += 1;
-                y += th;
-            }
-            Ok::<(), anyhow::Error>(())
-        }
-        .await;
-        // Restore the window and the emulation the page had, painted or not.
-        let restored = async {
-            cefhost::resize(&self.handle, vw as i32, vh as i32).await?;
-            let vp = *self.viewport.lock().unwrap();
-            match vp {
-                Some((w, h)) => self.send("Emulation.setDeviceMetricsOverride", device_metrics(w, h, None)).await.map(|_| ()),
-                None => self.send("Emulation.clearDeviceMetricsOverride", json!({})).await.map(|_| ()),
-            }
-        }
-        .await;
-        painted?;
-        restored?;
-        Ok(Shot { frame: into_frame(seg, cw as usize, ch as usize)?, tiles })
+        let reply = self.send("Page.captureScreenshot", params).await?;
+        let encoded = reply.get("data").and_then(Value::as_str).ok_or_else(|| anyhow!("captureScreenshot returned no PNG data"))?;
+        let png = base64::engine::general_purpose::STANDARD.decode(encoded)?;
+        Ok(Shot { frame: decode_screenshot(&png, width, height)?, tiles: 1 })
     }
 
     /// The response body text as puppeteer's HTTPResponse.text() decodes it.
@@ -537,11 +496,37 @@ impl Page {
     }
 }
 
-/// The captured segment as a frame. The capture has released its clones by
-/// now; a surviving one means a paint is still writing: fail hard.
-fn into_frame(seg: Arc<Segment>, width: usize, height: usize) -> Result<Frame> {
-    let seg = Arc::try_unwrap(seg).map_err(|_| anyhow!("frame segment still shared after capture"))?;
-    Ok(Frame { seg, width, height, stride: width * 4 })
+/// Decode Chromium's PNG once; preserve the existing BGRA memfd contract.
+fn decode_screenshot(bytes: &[u8], width: usize, height: usize) -> Result<Frame> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let header = decoder.read_header_info()?;
+    if (header.width as usize, header.height as usize) != (width, height) {
+        bail!("captureScreenshot returned {}x{}, expected {width}x{height}", header.width, header.height);
+    }
+    // The default decoder limit is 64 MiB; the requested CSS clip can exceed it.
+    decoder.set_limits(png::Limits { bytes: usize::MAX });
+    let mut reader = decoder.read_info()?;
+    let mut pixels = vec![0; reader.output_buffer_size().ok_or_else(|| anyhow!("PNG output size overflow"))?];
+    let info = reader.next_frame(&mut pixels)?;
+    let stride = width.checked_mul(4).ok_or_else(|| anyhow!("BGRA row size overflow"))?;
+    let len = stride.checked_mul(height).ok_or_else(|| anyhow!("BGRA frame size overflow"))?;
+    let seg = Segment::create(len)?;
+    let out = seg.as_mut_slice();
+    match info.color_type {
+        png::ColorType::Rgb => {
+            for (dst, src) in out.chunks_exact_mut(4).zip(pixels[..info.buffer_size()].chunks_exact(3)) {
+                dst.copy_from_slice(&[src[2], src[1], src[0], 255]);
+            }
+        }
+        png::ColorType::Rgba => {
+            for (dst, src) in out.chunks_exact_mut(4).zip(pixels[..info.buffer_size()].chunks_exact(4)) {
+                dst.copy_from_slice(&[src[2], src[1], src[0], src[3]]);
+            }
+        }
+        other => bail!("captureScreenshot returned unsupported PNG color type {other:?}"),
+    }
+    Ok(Frame { seg, width, height, stride })
 }
 
 fn eval_result(v: &Value) -> Result<Option<Value>> {

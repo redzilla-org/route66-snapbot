@@ -2,11 +2,9 @@
 //!
 //! WHY (owner 2026-10-07, verbatim: "this sounds perfect: Embed Chromium in
 //! snapbot ... hands over the raw pixel buffer in the same process"). The page
-//! paints into CEF's OnPaint BGRA buffer inside this process, so a screenshot is
-//! a memcpy into a memfd segment: no Chromium PNG encode, no base64 over a
-//! websocket, no PNG decode before OCR. Every other browse op is the same CDP it
-//! always was, delivered in process through CefBrowserHost::SendDevToolsMessage
-//! and observed through a DevToolsMessageObserver.
+//! uses CEF's off-screen view for layout and CDP's compositor screenshot for
+//! complete rasterization. CDP commands stay in process through
+//! CefBrowserHost::SendDevToolsMessage and a DevToolsMessageObserver.
 //!
 //! WHY THE `cef` CRATE (tauri-apps/cef-rs): it ships pre-generated Rust bindings
 //! for the C API plus safe ref-counted wrappers and the `wrap_*!` handler macros,
@@ -18,8 +16,7 @@
 //! object lives only on the UI thread (thread-local `UI`); tokio code reaches it
 //! by posting closures (`on_ui`) and gets answers through channels.
 
-use crate::shm::Segment;
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 use cef::*;
 use serde_json::{json, Value};
 use std::cell::RefCell;
@@ -36,21 +33,10 @@ pub struct Event {
     pub params: Value,
 }
 
-/// A pending full- or part-frame copy, armed by `capture` and filled by OnPaint.
-struct Capture {
-    want: (i32, i32),
-    dest: Arc<Segment>,
-    dest_stride: usize,
-    dest_row: usize,
-    done: oneshot::Sender<()>,
-}
-
-/// The per-page state OnPaint and GetViewRect read: the OSR view size (the
-/// "window" the page lays out in) and an armed capture, if any.
+/// The per-page OSR view size GetViewRect reads for layout.
 pub struct Slot {
     id: AtomicI32,
     view: Mutex<(i32, i32)>,
-    capture: Mutex<Option<Capture>>,
 }
 
 /// Cross-thread routing: CDP replies by message id, events by browser id.
@@ -188,15 +174,6 @@ fn base_switches() -> Vec<String> {
         "--use-gl=angle",
         "--use-angle=swiftshader",
         "--enable-unsafe-swiftshader",
-        // WHY (route66 GH #4082): a CEF OSR frame is whatever the compositor
-        // drew, and cc draws before raster finishes (unrastered tiles paint as
-        // the white background; lv 20261008T005048Z full-page shots were white
-        // below row ~900). Page.captureScreenshot waited for raster; OnPaint
-        // does not. Headless deterministic mode's pair makes every draw wait
-        // for all tiles and decode images synchronously, so the first frame
-        // of the wanted size is a complete one.
-        "--run-all-compositor-stages-before-draw",
-        "--disable-checker-imaging",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -408,40 +385,17 @@ wrap_render_handler! {
             }
         }
 
+        // CEF needs the OSR callback even though screenshot pixels now come
+        // from Page.captureScreenshot after Chromium completes rasterization.
         fn on_paint(
             &self,
-            browser: Option<&mut Browser>,
-            type_: PaintElementType,
+            _browser: Option<&mut Browser>,
+            _type_: PaintElementType,
             _dirty_rects: Option<&[Rect]>,
-            buffer: *const u8,
-            width: ::std::os::raw::c_int,
-            height: ::std::os::raw::c_int,
-        ) {
-            // Popups (select dropdowns) paint separately and are not page pixels.
-            if type_.get_raw() != PaintElementType::VIEW.get_raw() || buffer.is_null() {
-                return;
-            }
-            if browser.map(|b| b.identifier()) != Some(self.slot.id.load(Ordering::SeqCst)) {
-                return;
-            }
-            let mut armed = self.slot.capture.lock().unwrap();
-            let matches = armed.as_ref().is_some_and(|c| c.want == (width, height));
-            if !matches {
-                return;
-            }
-            let c = armed.take().unwrap();
-            // The buffer is valid only during this call: one copy, row by row,
-            // into the frame's memfd segment.
-            let row = width as usize * 4;
-            // SAFETY: CEF hands a width*height*4 BGRA buffer for the duration of OnPaint.
-            let src = unsafe { std::slice::from_raw_parts(buffer, row * height as usize) };
-            let dst = c.dest.as_mut_slice();
-            for y in 0..height as usize {
-                let off = (c.dest_row + y) * c.dest_stride;
-                dst[off..off + row].copy_from_slice(&src[y * row..(y + 1) * row]);
-            }
-            let _ = c.done.send(());
-        }
+            _buffer: *const u8,
+            _width: ::std::os::raw::c_int,
+            _height: ::std::os::raw::c_int,
+        ) {}
     }
 }
 
@@ -542,7 +496,7 @@ pub struct PageHandle {
 /// A new about:blank windowless page in `context` (a fresh in-memory cookie
 /// jar and cache per context id), its event stream, and its paint slot.
 pub async fn create_page(context: &str, width: i32, height: i32) -> Result<(PageHandle, mpsc::UnboundedReceiver<Event>)> {
-    let slot = Arc::new(Slot { id: AtomicI32::new(-1), view: Mutex::new((width, height)), capture: Mutex::new(None) });
+    let slot = Arc::new(Slot { id: AtomicI32::new(-1), view: Mutex::new((width, height)) });
     let (tx, rx) = mpsc::unbounded_channel();
     let ctx = context.to_string();
     let s = slot.clone();
@@ -662,29 +616,4 @@ pub async fn resize(page: &PageHandle, width: i32, height: i32) -> Result<()> {
 /// touches CEF (its calls can re-enter our handlers synchronously).
 fn host_of(id: i32) -> Option<BrowserHost> {
     UI.with(|u| u.borrow().browsers.get(&id).and_then(|b| b.browser.host()))
-}
-
-/// Copy the next painted `want`-sized view frame of `page` into rows
-/// `dest_row..` of `dest` (`dest_stride` bytes per row). The caller has already
-/// made the renderer commit the state it wants painted; this forces a repaint
-/// (Invalidate) and takes the first frame of the right size.
-pub async fn capture(page: &PageHandle, want: (i32, i32), dest: Arc<Segment>, dest_stride: usize, dest_row: usize) -> Result<()> {
-    if want.0 <= 0 || want.1 <= 0 || (dest_row + want.1 as usize) * dest_stride > dest.len() || (want.0 as usize) * 4 > dest_stride {
-        bail!("capture of {}x{} does not fit the {}-byte frame at row {dest_row}", want.0, want.1, dest.len());
-    }
-    let (tx, rx) = oneshot::channel();
-    *page.slot.capture.lock().unwrap() = Some(Capture { want, dest, dest_stride, dest_row, done: tx });
-    let id = page.id;
-    on_ui(move || {
-        if let Some(h) = host_of(id) {
-            h.invalidate(PaintElementType::VIEW);
-        }
-    });
-    match tokio::time::timeout(Duration::from_secs(10), rx).await {
-        Ok(Ok(())) => Ok(()),
-        _ => {
-            page.slot.capture.lock().unwrap().take();
-            bail!("no {}x{} paint arrived within 10s", want.0, want.1)
-        }
-    }
 }
