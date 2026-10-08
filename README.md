@@ -76,9 +76,8 @@ docker build -f Dockerfile.test .
 ```
 
 `Dockerfile.test` builds the production stages, runs the workspace unit tests,
-and ends in a `bench` stage that measures per-read OCR cost on
-the tall listing page `fixtures/big.png` (scales, region crops, tessdata fast vs
-best). The route66 web-regression gate checks real rendered pages.
+and checks shared-library linkage and binary startup in the runtime image.
+The route66 web-regression gate checks real rendered pages.
 `Dockerfile` is the production image.
 
 ## Deployment
