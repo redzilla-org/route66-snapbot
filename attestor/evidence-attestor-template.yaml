@@ -125,7 +125,9 @@ Resources:
       # this action allows, not for one click, and an unused ceiling costs
       # nothing: Lambda bills duration, never the timeout.
       Timeout: 180
-      MemorySize: 1536
+      # 2026-10-08 California DEV reached 1526/1536 MB; a 50 MB CEF frame
+      # disconnected the writer. Give CEF and the writer CPU with 2 vCPUs.
+      MemorySize: 3538
       EphemeralStorage:
         Size: 1024
       Architectures: [x86_64]
