@@ -233,15 +233,10 @@ fn status_text(code: i64) -> &'static str {
     }
 }
 
-/// The device metrics puppeteer's setViewport emulated, plus an optional
-/// visible-area override (the tile a full-page capture paints).
-fn device_metrics(width: i64, height: i64, viewport: Option<Value>) -> Value {
-    let mut p = json!({"mobile": false, "width": width, "height": height, "deviceScaleFactor": 1,
-                       "screenOrientation": {"angle": 0, "type": "portraitPrimary"}});
-    if let Some(v) = viewport {
-        p["viewport"] = v;
-    }
-    p
+/// Keep CSS viewport units and media queries tied to the requested viewport.
+fn device_metrics(width: i64, height: i64) -> Value {
+    json!({"mobile": false, "width": width, "height": height, "deviceScaleFactor": 1,
+           "screenOrientation": {"angle": 0, "type": "portraitPrimary"}})
 }
 
 impl Page {
@@ -307,7 +302,7 @@ impl Page {
     /// OSR window is resized to the same size, since the window is what paints.
     pub async fn set_viewport(&self, width: i64, height: i64) -> Result<()> {
         cefhost::resize(&self.handle, width as i32, height as i32).await?;
-        self.send("Emulation.setDeviceMetricsOverride", device_metrics(width, height, None)).await?;
+        self.send("Emulation.setDeviceMetricsOverride", device_metrics(width, height)).await?;
         self.send("Emulation.setTouchEmulationEnabled", json!({"enabled": false})).await?;
         *self.viewport.lock().unwrap() = Some((width, height));
         Ok(())
@@ -390,9 +385,9 @@ impl Page {
     async fn capture_frame(&self, width: usize, height: usize, y: Option<usize>) -> Result<Frame> {
         self.settle_frames().await?;
         let mut params = json!({"format": "png", "fromSurface": true,
-                                "captureBeyondViewport": false, "optimizeForSpeed": true});
+                                "captureBeyondViewport": y.is_some(), "optimizeForSpeed": true});
         // CDP's clip bounds the PNG to the painted OSR tile and selects its
-        // document offset without scrolling fixed elements into every tile.
+        // document offset; beyond-viewport painting preserves the CSS viewport.
         if let Some(y) = y {
             params["clip"] = json!({"x": 0, "y": y, "width": width, "height": height, "scale": 1});
         }
@@ -405,8 +400,8 @@ impl Page {
     }
 
     /// CEF's off-screen CDP capture repeats the physical viewport when asked
-    /// for a single full-content clip. Resize that physical view and select each
-    /// visible-area slice before capturing; stitch its BGRA rows into one frame.
+    /// for a single full-content clip. Paint each clip in a tile-sized OSR view
+    /// while preserving the CSS viewport, then stitch its BGRA rows.
     pub async fn screenshot(&self, full_page: bool) -> Result<Shot> {
         let (vw, vh) = self.viewport.lock().unwrap().unwrap_or((800, 600));
         if !full_page {
@@ -427,8 +422,9 @@ impl Page {
             for y in (0..height).step_by(TILE_MAX) {
                 let th = (height - y).min(TILE_MAX);
                 cefhost::resize(&self.handle, width as i32, th as i32).await?;
-                let visible = json!({"x": 0, "y": y, "width": width, "height": th, "scale": 1});
-                self.send("Emulation.setDeviceMetricsOverride", device_metrics(width as i64, height as i64, Some(visible))).await?;
+                // Layout must keep the requested viewport: vh-sized content
+                // changes height if emulation uses the full document instead.
+                self.send("Emulation.setDeviceMetricsOverride", device_metrics(vw, vh)).await?;
                 let tile = self.capture_frame(width, th, Some(y)).await?;
                 let start = y * stride;
                 seg.as_mut_slice()[start..start + tile.seg.len()].copy_from_slice(tile.seg.as_slice());
@@ -442,7 +438,7 @@ impl Page {
             cefhost::resize(&self.handle, vw as i32, vh as i32).await?;
             let vp = *self.viewport.lock().unwrap();
             match vp {
-                Some((w, h)) => self.send("Emulation.setDeviceMetricsOverride", device_metrics(w, h, None)).await.map(|_| ()),
+                Some((w, h)) => self.send("Emulation.setDeviceMetricsOverride", device_metrics(w, h)).await.map(|_| ()),
                 None => self.send("Emulation.clearDeviceMetricsOverride", json!({})).await.map(|_| ()),
             }
         }
