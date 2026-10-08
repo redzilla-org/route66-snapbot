@@ -137,9 +137,9 @@ ENV TESSDATA_PREFIX=/opt/snapbot/tessdata \
 # The ldd assertion (owner 2026-10-07: the static-musl `! ldd` is replaced):
 # every shared library the handler and libcef.so need resolves in this
 # userland; a single "not found" fails the build. Then the binary runs, and
-# the embedded Chromium paints and the engine reads the frame back.
+# the binary starts. Rendered-page behavior is checked against live pages by
+# the route66 regression gate, not by a synthetic image-build probe.
 RUN ! ldd /var/runtime/bootstrap /opt/snapbot/cef/libcef.so | grep 'not found' \
-    && /var/runtime/bootstrap --version \
-    && /var/runtime/bootstrap probe
+    && /var/runtime/bootstrap --version
 
 CMD ["index.handler"]

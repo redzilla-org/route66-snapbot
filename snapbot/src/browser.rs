@@ -127,6 +127,10 @@ pub struct PageState {
     pub crashed: bool,
 }
 
+/// The tallest CEF view a single CDP screenshot captures. A taller document
+/// needs vertically offset OSR views before their compositor screenshots.
+const TILE_MAX: usize = 8192;
+
 /// One screenshot: the frame plus how many CDP captures it took.
 pub struct Shot {
     pub frame: Frame,
@@ -381,29 +385,65 @@ impl Page {
         Ok(())
     }
 
-    /// Capture the compositor's finished image through CDP, then decode it once
-    /// into the BGRA frame consumed by OCR and the background PNG writer.
-    /// Full-page capture uses the CSS content clip without resizing the page.
-    pub async fn screenshot(&self, full_page: bool) -> Result<Shot> {
-        let (vw, vh) = self.viewport.lock().unwrap().unwrap_or((800, 600));
-        let (width, height) = if full_page {
-            let m = self.send("Page.getLayoutMetrics", json!({})).await?;
-            let size = m.get("cssContentSize").or_else(|| m.get("contentSize")).ok_or_else(|| anyhow!("getLayoutMetrics returned no content size"))?;
-            let dim = |k: &str| size.get(k).and_then(Value::as_f64).filter(|f| *f > 0.0).ok_or_else(|| anyhow!("content size has no {k}"));
-            (dim("width")?.ceil() as usize, dim("height")?.ceil() as usize)
-        } else {
-            (vw as usize, vh as usize)
-        };
+    /// Capture the compositor's finished visible surface through CDP, then
+    /// decode it into the BGRA frame consumed by OCR and the PNG writer.
+    async fn capture_frame(&self, width: usize, height: usize) -> Result<Frame> {
         self.settle_frames().await?;
-        let mut params = json!({"format": "png", "fromSurface": true, "captureBeyondViewport": full_page,
-                                "optimizeForSpeed": true});
-        if full_page {
-            params["clip"] = json!({"x": 0, "y": 0, "width": width, "height": height, "scale": 1});
-        }
-        let reply = self.send("Page.captureScreenshot", params).await?;
+        let reply = self
+            .send("Page.captureScreenshot", json!({"format": "png", "fromSurface": true,
+                                                 "captureBeyondViewport": false, "optimizeForSpeed": true}))
+            .await?;
         let encoded = reply.get("data").and_then(Value::as_str).ok_or_else(|| anyhow!("captureScreenshot returned no PNG data"))?;
         let png = base64::engine::general_purpose::STANDARD.decode(encoded)?;
-        Ok(Shot { frame: decode_screenshot(&png, width, height)?, tiles: 1 })
+        decode_screenshot(&png, width, height)
+    }
+
+    /// CEF's off-screen CDP capture repeats the physical viewport when asked
+    /// for a single full-content clip. Resize that physical view and select each
+    /// visible-area slice before capturing; stitch its BGRA rows into one frame.
+    pub async fn screenshot(&self, full_page: bool) -> Result<Shot> {
+        let (vw, vh) = self.viewport.lock().unwrap().unwrap_or((800, 600));
+        if !full_page {
+            return Ok(Shot { frame: self.capture_frame(vw as usize, vh as usize).await?, tiles: 1 });
+        }
+        let m = self.send("Page.getLayoutMetrics", json!({})).await?;
+        let size = m.get("cssContentSize").or_else(|| m.get("contentSize")).ok_or_else(|| anyhow!("getLayoutMetrics returned no content size"))?;
+        let dim = |k: &str| size.get(k).and_then(Value::as_f64).filter(|f| *f > 0.0).ok_or_else(|| anyhow!("content size has no {k}"));
+        let (width, height) = (dim("width")?.ceil() as usize, dim("height")?.ceil() as usize);
+        if width > TILE_MAX {
+            bail!("full-page width {width} exceeds the {TILE_MAX}px compositor view; tiling is vertical only");
+        }
+        let stride = width.checked_mul(4).ok_or_else(|| anyhow!("BGRA row size overflow"))?;
+        let len = stride.checked_mul(height).ok_or_else(|| anyhow!("BGRA frame size overflow"))?;
+        let seg = Segment::create(len)?;
+        let mut tiles = 0u64;
+        let captured = async {
+            for y in (0..height).step_by(TILE_MAX) {
+                let th = (height - y).min(TILE_MAX);
+                cefhost::resize(&self.handle, width as i32, th as i32).await?;
+                let visible = json!({"x": 0, "y": y, "width": width, "height": th, "scale": 1});
+                self.send("Emulation.setDeviceMetricsOverride", device_metrics(width as i64, height as i64, Some(visible))).await?;
+                let tile = self.capture_frame(width, th).await?;
+                let start = y * stride;
+                seg.as_mut_slice()[start..start + tile.seg.len()].copy_from_slice(tile.seg.as_slice());
+                tiles += 1;
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        // Restore the page's original layout even when one tile fails.
+        let restored = async {
+            cefhost::resize(&self.handle, vw as i32, vh as i32).await?;
+            let vp = *self.viewport.lock().unwrap();
+            match vp {
+                Some((w, h)) => self.send("Emulation.setDeviceMetricsOverride", device_metrics(w, h, None)).await.map(|_| ()),
+                None => self.send("Emulation.clearDeviceMetricsOverride", json!({})).await.map(|_| ()),
+            }
+        }
+        .await;
+        captured?;
+        restored?;
+        Ok(Shot { frame: Frame { seg, width, height, stride }, tiles })
     }
 
     /// The response body text as puppeteer's HTTPResponse.text() decodes it.

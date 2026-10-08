@@ -19,10 +19,12 @@ statements continue to verify against the committed public keys in route66.
 
 No request carries image bytes. A `browse` step `{"op": "screenshot", "name":
 ..., "full_page": true, "ocr": {...}}` captures with CDP
-`Page.captureScreenshot` (png, `optimizeForSpeed`), decodes the PNG once in
-memory to a gray plane, and reads it with the lane's resident Tesseract
+`Page.captureScreenshot` (png, `optimizeForSpeed`), decodes visible CEF surfaces
+to BGRA shared memory, and reads them with the lane's resident Tesseract
 (tessdata_fast). Snapbot holds no caller domain knowledge: keywords and regions
 arrive as JavaScript evaluated in the page at the capture instant.
+Full-page shots capture vertically offset visible surfaces and stitch them into
+one frame before OCR and the stored PNG write.
 
 ```json
 {
@@ -74,10 +76,10 @@ docker build -f Dockerfile.test .
 ```
 
 `Dockerfile.test` builds the production stages, runs the workspace unit tests,
-runs `bootstrap probe` (Chromium renders a page, the engine reads it back) in the
-Lambda userland, and ends in a `bench` stage that measures per-read OCR cost on
+and ends in a `bench` stage that measures per-read OCR cost on
 the tall listing page `fixtures/big.png` (scales, region crops, tessdata fast vs
-best). `Dockerfile` is the production image.
+best). The route66 web-regression gate checks real rendered pages.
+`Dockerfile` is the production image.
 
 ## Deployment
 
