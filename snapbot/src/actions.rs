@@ -260,7 +260,7 @@ impl Page {
         r.map(|_| ())
     }
 
-    /// The locator preconditions: attached, in the viewport (scrolled if not),
+    /// The locator preconditions: attached, visible, in the viewport (scrolled if not),
     /// a stable bounding box across two host-clock samples, and enabled.
     async fn locator_ready(
         &self,
@@ -275,6 +275,8 @@ impl Page {
         // Two CDP reads separated by the host clock retain the stability check.
         let snapshot = "function() {
             if (!this.isConnected) return null;
+            // Native actions subsume the caller's existing visible-selector wait.
+            if (getComputedStyle(this).visibility === 'hidden') return null;
             let r = this.getBoundingClientRect();
             if (r.width <= 0 || r.height <= 0) return null;
             if (r.right <= 0 || r.bottom <= 0 || r.left >= innerWidth || r.top >= innerHeight) {
