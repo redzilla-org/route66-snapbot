@@ -262,7 +262,7 @@ fn parse_steps(raw: Option<&Value>) -> Result<Vec<Step>> {
             bail!("steps[{i}].id {id} is duplicated");
         }
         ids.insert(id.clone());
-        for r in ["if_ok", "if_failed"] {
+        for r in ["if_ok", "if_failed", "if_html_incomplete"] {
             if let Some(v) = raw.get(r) {
                 if !ids.contains(&js::js_string(v)) {
                     bail!("steps[{i}].{r} names {}, which is not an EARLIER step id", js::js_string(v));
@@ -340,6 +340,25 @@ struct RunCtx {
     clocks: HashMap<String, i64>,
     default_timeout: u64,
     navigation_timeout: u64,
+}
+
+// Match the harness's captured-HTML oracle without changing the capture result:
+// only an incomplete first DOM needs another wait and content read.
+fn captured_html_complete(html: &str) -> bool {
+    let html = html.trim();
+    if html.is_empty() {
+        return false;
+    }
+    let lower = html.to_lowercase();
+    if !lower.contains("<html") || !lower.contains("<body") || !lower.contains("</body>") || !lower.contains("</html>") {
+        return false;
+    }
+    if lower.find("<body").unwrap() > lower.rfind("</body>").unwrap()
+        || lower.find("<html").unwrap() > lower.rfind("</html>").unwrap()
+    {
+        return false;
+    }
+    !lower.rfind('<').is_some_and(|left| lower.rfind('>').map_or(true, |right| right < left))
 }
 
 enum Timeout {
@@ -712,7 +731,14 @@ async fn run_request(page: &Page, c: &mut Ctx, steps: &[Step], started: Instant,
     for step in steps {
         let gate_ok = step.raw.get("if_ok").is_some_and(|g| !by_id.get(&js::js_string(g)).is_some_and(|r| !r.0 && r.1));
         let gate_failed = step.raw.get("if_failed").is_some_and(|g| !by_id.get(&js::js_string(g)).is_some_and(|r| !r.0 && !r.1));
-        if stopped || gate_ok || gate_failed {
+        // Keep the first HTML bytes and transport outcome intact; a skipped
+        // optional wait must not prevent an independently gated recapture.
+        let gate_html_complete = step.raw.get("if_html_incomplete").is_some_and(|g| {
+            let id = js::js_string(g);
+            results.iter().find(|r| r.get("id").and_then(Value::as_str) == Some(id.as_str()))
+                .and_then(|r| r.get("value")).and_then(Value::as_str).is_some_and(captured_html_complete)
+        });
+        if stopped || gate_ok || gate_failed || gate_html_complete {
             results.push(json!({"id": step.id, "op": step.op, "skipped": true}));
             by_id.insert(step.id.clone(), (true, false));
             continue;
