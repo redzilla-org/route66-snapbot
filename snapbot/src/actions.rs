@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 pub struct NavResponse {
     pub resp: DocResponse,
     pub headers: Value,
+    // WHY: elapsed native command and lifecycle phases attribute slow goto requests without changing their waits.
+    pub navigation_timing: Option<Value>,
 }
 
 fn lifecycle_name(wait_until: &str) -> Result<&'static str> {
@@ -42,7 +44,7 @@ impl Page {
     fn nav_result(&self, loader: &str) -> Option<NavResponse> {
         let resp = self.state.lock().unwrap().doc_resp.get(loader).cloned()?;
         let headers = self.response_headers(&resp);
-        Some(NavResponse { resp, headers })
+        Some(NavResponse { resp, headers, navigation_timing: None })
     }
 
     /// page.goto(url, {waitUntil, timeout}).
@@ -53,6 +55,7 @@ impl Page {
             let st = self.state.lock().unwrap();
             (st.main_frame.clone(), st.loader.clone())
         };
+        let navigate_started = Instant::now();
         let nav = self.send("Page.navigate", json!({"url": url, "frameId": frame}));
         let r = match dl {
             Some(d) => tokio::time::timeout_at(d.into(), nav)
@@ -60,6 +63,7 @@ impl Page {
                 .map_err(|_| anyhow!("Navigation timeout of {timeout_ms} ms exceeded"))??,
             None => nav.await?,
         };
+        let navigate_ack_ms = navigate_started.elapsed().as_secs_f64() * 1000.0;
         if let Some(err) = r.get("errorText").and_then(Value::as_str).filter(|e| !e.is_empty()) {
             if err != "net::ERR_HTTP_RESPONSE_CODE_FAILURE" {
                 bail!("{err} at {url}");
@@ -75,6 +79,7 @@ impl Page {
         // window.location to compass.com) is waited through. Waiting on the
         // navigate's own loader alone hangs once the redirect replaces it
         // before that loader reached `event`. Either loader reaching it is done.
+        let lifecycle_started = Instant::now();
         let done = self
             .wait_state(dl, |st| {
                 let own = st.lifecycle.get(&loader).is_some_and(|s| s.contains(event));
@@ -82,10 +87,19 @@ impl Page {
                 (own || current).then_some(())
             })
             .await;
+        let lifecycle_wait_ms = lifecycle_started.elapsed().as_secs_f64() * 1000.0;
         if done.is_none() {
             bail!("Navigation timeout of {timeout_ms} ms exceeded");
         }
-        Ok(self.nav_result(&loader))
+        let mut response = self.nav_result(&loader);
+        if let Some(response) = &mut response {
+            response.navigation_timing = Some(json!({
+                "navigate_ack_ms": navigate_ack_ms,
+                "lifecycle_wait_ms": lifecycle_wait_ms,
+                "wait_until": wait_until,
+            }));
+        }
+        Ok(response)
     }
 
     /// page.waitForNavigation({waitUntil, timeout}).
@@ -559,7 +573,14 @@ impl Page {
 
 pub fn nav_json(r: &Option<NavResponse>, url_fallback: &str) -> Value {
     match r {
-        Some(n) => json!({"status": n.resp.status, "url": n.resp.url, "headers": n.headers}),
+        Some(n) => {
+            let mut result = json!({"status": n.resp.status, "url": n.resp.url, "headers": n.headers});
+            if let Some(timing) = &n.navigation_timing {
+                result["navigation_timing"] = timing.clone();
+                result["network_timing"] = n.resp.network_timing.clone();
+            }
+            result
+        }
         None => json!({"status": 0, "url": url_fallback}),
     }
 }

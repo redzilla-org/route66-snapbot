@@ -90,6 +90,8 @@ pub struct DocResponse {
     pub status: i64,
     pub url: String,
     pub headers: Value,
+    // WHY: native document timings distinguish server/network latency from lifecycle waiting without another CDP call.
+    pub network_timing: Value,
 }
 
 /// Request interception rules; the event loop applies them to Fetch.requestPaused.
@@ -649,7 +651,13 @@ fn apply_event(st: &mut PageState, method: &str, p: &Value) {
             if s(p, "type") == "Document" && s(p, "frameId") == st.main_frame {
                 st.doc_resp.insert(
                     s(p, "loaderId"),
-                    DocResponse { request_id: s(p, "requestId"), status, url: s(r, "url"), headers: r.get("headers").cloned().unwrap_or(json!({})) },
+                    DocResponse {
+                        request_id: s(p, "requestId"), status, url: s(r, "url"), headers: r.get("headers").cloned().unwrap_or(json!({})),
+                        network_timing: r.get("timing").and_then(Value::as_object)
+                            .map(|timing| Value::Object(timing.iter().filter(|(_, value)| value.is_number())
+                                .map(|(key, value)| (key.clone(), value.clone())).collect()))
+                            .unwrap_or(Value::Null),
+                    },
                 );
             }
         }
