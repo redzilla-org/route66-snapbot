@@ -4,13 +4,35 @@
 //! is independent of the test and run, so reports link to the stored object.
 
 use crate::config;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
+use std::sync::OnceLock;
+use std::time::Duration;
 use tokio::sync::OnceCell;
 
 static IMAGE_S3: OnceCell<aws_sdk_s3::Client> = OnceCell::const_new();
+
+/// A caller-owned private capability preserves one browse outcome when Lambda's response is lost.
+pub async fn put_browse_result(url: &str, payload: &Value, failed: bool, deadline_ms: Option<i64>) -> Result<()> {
+    // Never follow a redirect with the private capability, and never include its URL in errors.
+    static HTTP: OnceLock<reqwest::Client> = OnceLock::new();
+    let client = HTTP.get_or_init(|| reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none()).build().expect("browse result HTTP client"));
+    let bytes = serde_json::to_vec(&json!({"payload": payload, "function_error": if failed { "Unhandled" } else { "" }}))?;
+    let remaining = deadline_ms.ok_or_else(|| anyhow!("browse result delivery requires the invocation deadline"))? - crate::js::now_ms();
+    if remaining <= 0 {
+        bail!("browse result delivery exceeded the invocation deadline");
+    }
+    let response = client.put(url).header("content-type", "application/json")
+        .timeout(Duration::from_millis(remaining as u64)).body(bytes).send().await
+        .map_err(|e| anyhow!("browse result delivery failed: {}", if e.is_timeout() { "timeout" } else { "transport" }))?;
+    if !response.status().is_success() {
+        bail!("browse result delivery returned HTTP {}", response.status().as_u16());
+    }
+    Ok(())
+}
 
 // An explicit endpoint keeps all local image traffic inside Kumo. CI omits it
 // and writes to the real AWS bucket with its normal task credentials.

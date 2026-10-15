@@ -59,16 +59,37 @@ pub async fn run(handler_name: String) -> Result<()> {
             .and_then(|v| v.to_str().ok())
             .map(str::to_string)
             .ok_or_else(|| anyhow!("Runtime API next omitted request id on lane {lane}"))?;
+        // A durable browse reply must finish inside this invocation's existing budget.
+        let deadline_ms = next.headers().get("lambda-runtime-deadline-ms")
+            .and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<i64>().ok());
         let event: Value = next.json().await.unwrap_or(Value::Null);
+        // Only opt-in browse calls get a private recovery object; other actions stay unchanged.
+        let result_put_url = if !handler_name.starts_with("fetch-hop") && event.get("action").and_then(Value::as_str) == Some("browse") {
+            match event.get("result_put_url") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(url)) if !url.is_empty() => Some(url.clone()),
+                Some(_) => bail!("browse result_put_url must be a nonempty string"),
+            }
+        } else {
+            None
+        };
         if diagnostic_enabled() {
             *diagnostic_request().lock().unwrap() = id.clone();
             diagnostic_phase("dispatch-start");
         }
-        let (suffix, body) = match crate::handler::dispatch(&handler_name, event).await {
+        let (mut suffix, mut body) = match crate::handler::dispatch(&handler_name, event).await {
             Ok(v) => ("response", v),
             Err(e) => ("error", json!({"errorMessage": format!("{e:#}"), "errorType": "Error", "stackTrace": []})),
         };
         diagnostic_phase("dispatch-return");
+        // Persist this single execution's exact outcome before the response can be lost in transit.
+        if let Some(url) = result_put_url {
+            let delivery = crate::store::put_browse_result(&url, &body, suffix == "error", deadline_ms).await;
+            if let Err(e) = delivery {
+                suffix = "error";
+                body = json!({"errorMessage": format!("{e:#}"), "errorType": "Error", "stackTrace": []});
+            }
+        }
         // Browse joined its own writes before dispatch returned; another
         // process-wide drain here would repeat the same wait.
         let r = client.post(format!("{base}/{id}/{suffix}")).header("content-type", "application/json").body(body.to_string()).send().await?;
