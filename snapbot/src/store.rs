@@ -21,18 +21,44 @@ pub async fn put_browse_result(url: &str, payload: &Value, failed: bool, deadlin
     let client = HTTP.get_or_init(|| reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none()).build().expect("browse result HTTP client"));
     let bytes = serde_json::to_vec(&json!({"payload": payload, "function_error": if failed { "Unhandled" } else { "" }}))?;
-    let remaining = deadline_ms.ok_or_else(|| anyhow!("browse result delivery requires the invocation deadline"))? - crate::js::now_ms();
-    if remaining <= 0 {
-        bail!("browse result delivery exceeded the invocation deadline");
+    let deadline = deadline_ms.ok_or_else(|| anyhow!("browse result delivery requires the invocation deadline"))?;
+    // A lost PUT response may follow a successful write; repeat only these same outcome bytes, never the browse.
+    for attempt in 1..=3 {
+        let remaining = deadline - crate::js::now_ms();
+        if remaining <= 0 {
+            bail!("browse result delivery exceeded the invocation deadline");
+        }
+        let response = client.put(url).header("content-type", "application/json")
+            .timeout(Duration::from_millis(remaining as u64)).body(bytes.clone()).send().await;
+        match response {
+            Ok(response) => {
+                if !response.status().is_success() {
+                    bail!("browse result delivery returned HTTP {}", response.status().as_u16());
+                }
+                return Ok(());
+            }
+            Err(error) => {
+                let transport = error.is_connect() || error.is_timeout() || error.is_request() || error.is_body();
+                if !transport || attempt == 3 {
+                    let kind = if error.is_timeout() { "timeout" } else if error.is_connect() { "connect" } else { "transport" };
+                    bail!("browse result delivery failed after {attempt} attempt(s): {kind}: {}", error.without_url());
+                }
+                // Backoff consumes the original invocation budget rather than extending it.
+                let remaining = deadline - crate::js::now_ms();
+                if remaining <= 0 {
+                    bail!("browse result delivery exceeded the invocation deadline");
+                }
+                tokio::time::sleep(Duration::from_millis(100.min(remaining as u64))).await;
+            }
+        }
     }
-    let response = client.put(url).header("content-type", "application/json")
-        .timeout(Duration::from_millis(remaining as u64)).body(bytes).send().await
-        .map_err(|e| anyhow!("browse result delivery failed: {}", if e.is_timeout() { "timeout" } else { "transport" }))?;
-    if !response.status().is_success() {
-        bail!("browse result delivery returned HTTP {}", response.status().as_u16());
-    }
-    Ok(())
+    unreachable!("each result delivery attempt returns or advances within the fixed limit")
 }
+
+// The observed lost PUT response must recover the original envelope without rerunning its workflow.
+#[cfg(test)]
+#[path = "store_result_test.rs"]
+mod result_tests;
 
 // An explicit endpoint keeps all local image traffic inside Kumo. CI omits it
 // and writes to the real AWS bucket with its normal task credentials.
