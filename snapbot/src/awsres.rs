@@ -6,7 +6,7 @@
 //! The Node handler dispatched `new Client(...).send(new <Op>Command(params))`
 //! dynamically. The Rust SDK has no dynamic dispatch, so this module speaks
 //! the services' wire protocols directly (awsJson1_0/1_1, awsQuery, restXml
-//! for the S3 reads) and signs with SigV4 -- the same pinned service set.
+//! for S3 and restJson for S3 Tables) and signs with SigV4.
 //! A failed call is REFUSED (route66#4039): nothing stored, signed or posted.
 
 use crate::attest;
@@ -32,6 +32,7 @@ enum Proto {
     /// awsQuery API version
     Query(&'static str),
     S3,
+    S3Tables,
 }
 
 /// (signing name, endpoint host prefix, protocol) for the pinned service set.
@@ -45,6 +46,10 @@ fn service(name: &str) -> Result<(&'static str, &'static str, Proto)> {
         "cloudformation" => ("cloudformation", "cloudformation", Proto::Query("2010-05-15")),
         "cloudwatch" => ("monitoring", "monitoring", Proto::Query("2010-08-01")),
         "s3" => ("s3", "s3", Proto::S3),
+        // GH #4188: lake acceptance needs catalog and table metadata, under the same caller read credentials.
+        "s3tables" => ("s3tables", "s3tables", Proto::S3Tables),
+        "glue" => ("glue", "glue", Proto::Json("1.1", "AWSGlue")),
+        "athena" => ("athena", "athena", Proto::Json("1.1", "AmazonAthena")),
         other => bail!("service {other} is not in the attestor's pinned AWS SDK client set"),
     })
 }
@@ -276,6 +281,14 @@ async fn call(svc: &str, op: &str, region: &str, params: &Value, c: &Creds) -> R
             let v = s3_result(op, &r);
             (r, false, v)
         }
+        Proto::S3Tables => {
+            // S3 Tables uses resource paths and query parameters rather than an AWS JSON target.
+            let url = s3tables_request(op, region, params)?;
+            let r = signed("GET", &url, Vec::new(), Vec::new(), signing, region, c).await?;
+            let mut v = if r.body.is_empty() { json!({}) } else { serde_json::from_slice(&r.body)? };
+            js_dates(&mut v);
+            (r, true, v)
+        }
     };
     if !(200..300).contains(&reply.status) {
         let (name, msg) = error_of(is_json, &reply);
@@ -289,6 +302,36 @@ async fn call(svc: &str, op: &str, region: &str, params: &Value, c: &Creds) -> R
         }
     }
     Ok(Ok(Value::Object(out)))
+}
+
+/// GH #4188: only the S3 Tables reads needed to inspect buckets, namespaces and Iceberg metadata.
+fn s3tables_request(op: &str, region: &str, p: &Value) -> Result<String> {
+    let segment = |field: &str| -> Result<String> {
+        let value = p[field].as_str().filter(|v| !v.is_empty()).ok_or_else(|| anyhow!("{op} requires {field}"))?;
+        Ok(js::encode_uri_component(value))
+    };
+    let (path, fields): (String, &[&str]) = match op {
+        "GetTable" => ("/get-table".into(), &["tableBucketARN", "namespace", "name", "tableArn"]),
+        "GetTableMetadataLocation" => (
+            format!("/tables/{}/{}/{}/metadata-location", segment("tableBucketARN")?, segment("namespace")?, segment("name")?),
+            &[],
+        ),
+        "GetTableBucket" => (format!("/buckets/{}", segment("tableBucketARN")?), &[]),
+        "GetNamespace" => (format!("/namespaces/{}/{}", segment("tableBucketARN")?, segment("namespace")?), &[]),
+        "ListTableBuckets" => ("/buckets".into(), &["prefix", "continuationToken", "maxBuckets", "type"]),
+        "ListNamespaces" => (format!("/namespaces/{}", segment("tableBucketARN")?), &["prefix", "continuationToken", "maxNamespaces"]),
+        "ListTables" => (format!("/tables/{}", segment("tableBucketARN")?), &["namespace", "prefix", "continuationToken", "maxTables"]),
+        _ => bail!("service s3tables has no operation {op}"),
+    };
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    for field in fields {
+        if let Some(value) = p.get(*field).filter(|v| !v.is_null()) {
+            query.append_pair(field, &js::js_string(value));
+        }
+    }
+    let query = query.finish();
+    let url = format!("https://s3tables.{region}.amazonaws.com{path}");
+    Ok(if query.is_empty() { url } else { format!("{url}?{query}") })
 }
 
 /// The S3 reads: object and bucket GET/HEAD subresources.
