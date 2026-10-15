@@ -42,3 +42,14 @@ workstation release landed first. `publish` now exits 0 when `snapbot-<sha>`
 already exists, so CI never pushes a second build under a published pin.
 The Lambda moves to a new image through route66
 `scripts/deployment/deploy_snapbot.py`.
+
+Deployment resolves an already-published ECR SHA tag to its immutable digest;
+it never packages or rebuilds an image. Keep the tested build identity explicit
+when a later deployment-tool-only commit advances HEAD:
+
+```
+python D:/git/route66/scripts/deployment/deploy_snapbot.py deploy --sha <built-full-commit-sha>
+```
+
+Without `--sha`, deploy selects current HEAD. Missing publication fails before
+stack mutation. The explicit `package` mode remains a separate build/push action.

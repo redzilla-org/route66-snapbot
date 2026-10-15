@@ -25,6 +25,7 @@ deploy_dev_ci_read_roles.py derives the same set from the same source.
 
 Modes:  preflight | package | deploy
 """
+import argparse
 import base64
 import json
 import os
@@ -322,13 +323,32 @@ def preflight():
     print("dev CI targets: %s" % json.dumps(dev_ci_targets(), sort_keys=True))
 
 
-def deploy():
+def published_image(sess, sha):
+    """Resolve an already-published build once; deployment never rebuilds its tag."""
+    if sha is None:
+        sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True, timeout=15).strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        sys.exit("REFUSING: deployment requires a full 40-hex source SHA")
+    ecr = sess.client("ecr")
+    try:
+        images = ecr.describe_images(repositoryName=ECR_REPOSITORY, imageIds=[{"imageTag": sha}])["imageDetails"]
+    except ecr.exceptions.ImageNotFoundException:
+        sys.exit("REFUSING: publish the tested snapbot image %s before deployment" % sha)
+    if len(images) != 1 or not re.fullmatch(r"sha256:[0-9a-f]{64}", images[0].get("imageDigest", "")):
+        sys.exit("REFUSING: ECR did not resolve one immutable snapbot image digest")
+    image = "%s.dkr.ecr.%s.amazonaws.com/%s@%s" % (COMMAND_CENTER_ACCOUNT, REGION, ECR_REPOSITORY, images[0]["imageDigest"])
+    print("deploying published snapbot source %s as %s" % (sha, image))
+    return image
+
+
+def deploy(sha=None):
     sess = session()
     assert_command_center(sess)
     value, create = ssm_string_value(sess)
     validate_seed_matches_public(value)
+    # Resolve before any write: missing publication must not trigger a new build or partial deployment.
+    image_uri = published_image(sess, sha)
     ensure_private_key_parameter(sess, value, create)
-    image_uri = package(sess)
     params = [
         {"ParameterKey": "ImageUri", "ParameterValue": image_uri},
         {"ParameterKey": "TestResultsBucketName", "ParameterValue": STORE_BUCKET},
@@ -341,13 +361,20 @@ def deploy():
 
 
 def main():
-    mode = sys.argv[1] if len(sys.argv) > 1 else ""
+    # Tool-only commits can deploy an earlier tested build without rebuilding it under a new SHA.
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("mode", choices=("preflight", "package", "deploy"))
+    parser.add_argument("--sha", help="full source SHA of an already-published image (deploy only; default HEAD)")
+    args = parser.parse_args()
+    if args.sha is not None and args.mode != "deploy":
+        parser.error("--sha is supported only by deploy")
+    mode = args.mode
     if mode == "preflight":
         preflight()
     elif mode == "package":
         package()
     elif mode == "deploy":
-        deploy()
+        deploy(args.sha)
     else:
         sys.exit(__doc__)
 
