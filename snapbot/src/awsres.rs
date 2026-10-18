@@ -6,7 +6,7 @@
 //! The Node handler dispatched `new Client(...).send(new <Op>Command(params))`
 //! dynamically. The Rust SDK has no dynamic dispatch, so this module speaks
 //! the services' wire protocols directly (awsJson1_0/1_1, awsQuery, restXml
-//! for S3 and restJson for S3 Tables) and signs with SigV4.
+//! for S3 and restJson for S3 Tables and Lambda) and signs with SigV4.
 //! A failed call is REFUSED (route66#4039): nothing stored, signed or posted.
 
 use crate::attest;
@@ -33,6 +33,17 @@ enum Proto {
     Query(&'static str),
     S3,
     S3Tables,
+    /// restJson: Lambda reads address the function by URL path.
+    Lambda,
+}
+
+/// IAM has one global endpoint and signs for us-east-1 whatever region the
+/// caller names; every other service is regional.
+fn endpoint(svc: &str, host: &str, region: &str) -> (String, String) {
+    match svc {
+        "iam" => ("iam.amazonaws.com".into(), "us-east-1".into()),
+        _ => (format!("{host}.{region}.amazonaws.com"), region.into()),
+    }
 }
 
 /// (signing name, endpoint host prefix, protocol) for the pinned service set.
@@ -50,6 +61,13 @@ fn service(name: &str) -> Result<(&'static str, &'static str, Proto)> {
         "s3tables" => ("s3tables", "s3tables", Proto::S3Tables),
         "glue" => ("glue", "glue", Proto::Json("1.1", "AWSGlue")),
         "athena" => ("athena", "athena", Proto::Json("1.1", "AmazonAthena")),
+        // route66#4254: #4163 needs the inbound Lambda and its SES receipt rules,
+        // #4188 the IAM role grant and the Athena DML timeout quota.
+        "lambda" => ("lambda", "lambda", Proto::Lambda),
+        // SES v1: receipt rules have no SESv2 API; its endpoint host is email.<region>.
+        "ses" => ("ses", "email", Proto::Query("2010-12-01")),
+        "iam" => ("iam", "iam", Proto::Query("2010-05-08")),
+        "service-quotas" => ("servicequotas", "servicequotas", Proto::Json("1.1", "ServiceQuotasV20190624")),
         other => bail!("service {other} is not in the attestor's pinned AWS SDK client set"),
     })
 }
@@ -220,7 +238,10 @@ fn js_dates(v: &mut Value) {
 fn error_of(proto_json: bool, r: &Reply) -> (String, String) {
     if proto_json {
         let v: Value = serde_json::from_slice(&r.body).unwrap_or(Value::Null);
-        let ty = v["__type"].as_str().unwrap_or("").rsplit('#').next().unwrap_or("").to_string();
+        // restJson services (Lambda) name the error in a header, awsJson in __type.
+        let header = r.headers.get("x-amzn-errortype").and_then(|h| h.to_str().ok()).unwrap_or("");
+        let raw = v["__type"].as_str().filter(|t| !t.is_empty()).unwrap_or(header);
+        let ty = raw.split(':').next().unwrap_or("").rsplit('#').next().unwrap_or("").to_string();
         let msg = v["message"].as_str().or_else(|| v["Message"].as_str()).unwrap_or("").to_string();
         return (if ty.is_empty() { "UnknownError".into() } else { ty }, msg);
     }
@@ -237,7 +258,7 @@ fn error_of(proto_json: bool, r: &Reply) -> (String, String) {
 /// One read-only call. Ok(result JSON with $metadata first) or Err((name, message, status)).
 async fn call(svc: &str, op: &str, region: &str, params: &Value, c: &Creds) -> Result<std::result::Result<Value, (String, String, u16)>> {
     let (signing, host, proto) = service(svc)?;
-    let host = format!("{host}.{region}.amazonaws.com");
+    let (host, sign_region) = endpoint(svc, host, region);
     let (reply, is_json, parsed) = match proto {
         Proto::Json(ver, target) => {
             // A non-object params sends {}; the binding outlives the borrow.
@@ -249,7 +270,7 @@ async fn call(svc: &str, op: &str, region: &str, params: &Value, c: &Creds) -> R
                 vec![("content-type".into(), format!("application/x-amz-json-{ver}")), ("x-amz-target".into(), format!("{target}.{op}"))],
                 body,
                 signing,
-                region,
+                &sign_region,
                 c,
             )
             .await?;
@@ -267,7 +288,7 @@ async fn call(svc: &str, op: &str, region: &str, params: &Value, c: &Creds) -> R
                 vec![("content-type".into(), "application/x-www-form-urlencoded; charset=utf-8".into())],
                 body.into_bytes(),
                 signing,
-                region,
+                &sign_region,
                 c,
             )
             .await?;
@@ -287,6 +308,13 @@ async fn call(svc: &str, op: &str, region: &str, params: &Value, c: &Creds) -> R
             let r = signed("GET", &url, Vec::new(), Vec::new(), signing, region, c).await?;
             let mut v = if r.body.is_empty() { json!({}) } else { serde_json::from_slice(&r.body)? };
             js_dates(&mut v);
+            (r, true, v)
+        }
+        Proto::Lambda => {
+            let url = lambda_request(op, &host, params)?;
+            let r = signed("GET", &url, Vec::new(), Vec::new(), signing, &sign_region, c).await?;
+            let mut v = if r.body.is_empty() { json!({}) } else { serde_json::from_slice(&r.body).unwrap_or(json!({})) };
+            redact_lambda_environment(&mut v);
             (r, true, v)
         }
     };
@@ -332,6 +360,34 @@ fn s3tables_request(op: &str, region: &str, p: &Value) -> Result<String> {
     let query = query.finish();
     let url = format!("https://s3tables.{region}.amazonaws.com{path}");
     Ok(if query.is_empty() { url } else { format!("{url}?{query}") })
+}
+
+/// route66#4254: the Lambda reads #4163 needs, its configuration and the
+/// resource policy that lets SES invoke it. GetFunction is deliberately absent:
+/// its Code.Location is a presigned download URL for the package.
+fn lambda_request(op: &str, host: &str, p: &Value) -> Result<String> {
+    let resource = match op {
+        "GetFunctionConfiguration" => "configuration",
+        "GetPolicy" => "policy",
+        _ => bail!("service lambda has no operation {op}"),
+    };
+    let name = p["FunctionName"].as_str().filter(|v| !v.is_empty()).ok_or_else(|| anyhow!("{op} requires FunctionName"))?;
+    let url = format!("https://{host}/2015-03-31/functions/{}/{resource}", js::encode_uri_component(name));
+    Ok(match p.get("Qualifier").filter(|v| !v.is_null()) {
+        Some(q) => format!("{url}?{}", url::form_urlencoded::Serializer::new(String::new()).append_pair("Qualifier", &js::js_string(q)).finish()),
+        None => url,
+    })
+}
+
+/// The evidence store is anonymously readable, so a function's environment
+/// values are published only as sha256 digests: the variable names stay
+/// visible, and a reader who holds a value can still confirm it.
+fn redact_lambda_environment(v: &mut Value) {
+    if let Some(vars) = v.pointer_mut("/Environment/Variables").and_then(Value::as_object_mut) {
+        for x in vars.values_mut() {
+            *x = json!(format!("sha256:{}", attest::sha256_hex(js::js_string(x).as_bytes())));
+        }
+    }
 }
 
 /// The S3 reads: object and bucket GET/HEAD subresources.
