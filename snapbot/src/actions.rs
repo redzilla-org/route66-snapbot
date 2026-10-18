@@ -391,7 +391,8 @@ impl Page {
         self.with_locator(selector, timeout_ms, |obj| async move { self.click_handle(&obj).await }).await
     }
 
-    /// page.locator(selector).setTimeout(t).fill(value).
+    /// page.locator(selector).setTimeout(t).fill(value), with Playwright's
+    /// one-step text insertion (fill_handle).
     pub async fn locator_fill(&self, selector: &str, value: &str, timeout_ms: u64) -> Result<()> {
         let value = value.to_string();
         self.with_locator(selector, timeout_ms, |obj| {
@@ -453,33 +454,48 @@ impl Page {
                 .await?;
                 Ok(())
             }
-            "typeable-input" | "contenteditable" if value.encode_utf16().count() < 100 => {
-                let to_type = self
+            // WHY ONE INSERTION (route66 GH #4234, owner q207 "fix it properly"):
+            // puppeteer typed values under 100 UTF-16 units key by key, ~2.5s for
+            // a 59-character email under 40-lane load, which broke an unchanged
+            // browse budget. Playwright's fill instead selects the current
+            // contents and replaces them with ONE Input.insertText, which runs
+            // the browser's native editing path: beforeinput/input fire once
+            // (inputType insertText) exactly as typed text does, and change fires
+            // natively on blur. An empty value deletes the selection with a real
+            // Delete key press, so clearing fires its native input event too.
+            // The locator actionability checks in with_locator are unchanged.
+            "typeable-input" | "contenteditable" => {
+                let needs_input = self
                     .call_on(
                         obj,
                         "function(newValue) {
-                            const valString = String(newValue);
                             const currentValue = this.isContentEditable ? this.innerText : this.value;
-                            if (currentValue === valString) return '';
-                            if (!valString.startsWith(currentValue) || !currentValue) {
-                                if (this.isContentEditable) this.innerText = ''; else this.value = '';
-                                return valString;
+                            if (currentValue === String(newValue)) return false;
+                            if (this instanceof HTMLInputElement) { this.select(); this.focus(); return true; }
+                            if (this instanceof HTMLTextAreaElement) {
+                                this.selectionStart = 0; this.selectionEnd = this.value.length; this.focus(); return true;
                             }
-                            if (this.isContentEditable) { this.innerText = ''; this.innerText = currentValue; }
-                            else { this.value = ''; this.value = currentValue; }
-                            return valString.substring(currentValue.length);
+                            const range = this.ownerDocument.createRange();
+                            range.selectNodeContents(this);
+                            const selection = this.ownerDocument.defaultView.getSelection();
+                            selection.removeAllRanges();
+                            selection.addRange(range);
+                            this.focus();
+                            return true;
                         }",
                         vec![json!(value)],
                     )
                     .await?;
-                let text = to_type.and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
-                if !text.is_empty() {
-                    self.call_on(obj, "function() { this.focus(); }", vec![]).await?;
-                    self.type_text(&text, 0).await?;
+                if needs_input == Some(json!(true)) {
+                    if value.is_empty() {
+                        self.key_press("Delete", 0).await?;
+                    } else {
+                        self.send("Input.insertText", json!({"text": value})).await?;
+                    }
                 }
                 Ok(())
             }
-            "typeable-input" | "contenteditable" | "other-input" => {
+            "other-input" => {
                 self.call_on(obj, "function() { this.focus(); }", vec![]).await?;
                 self.call_on(
                     obj,
