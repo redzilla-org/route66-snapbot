@@ -98,13 +98,16 @@ fn parse_click_selectors(raw: Option<&Value>) -> Result<Vec<String>> {
 enum Interaction {
     Click(String),
     Wait(i64),
+    // route66#4277: pick a <select> option (selector, value) and resize the viewport mid-capture.
+    Select(String, String),
+    Resize(i64, i64),
 }
 
 fn parse_steps(raw: Option<&Value>) -> Result<Option<Vec<Interaction>>> {
     let arr = match raw {
         None | Some(Value::Null) => return Ok(None),
         Some(Value::Array(a)) if !a.is_empty() => a,
-        _ => bail!("steps must be a non-empty array of {{click: selector}} / {{wait_ms: N}} objects"),
+        _ => bail!("steps must be a non-empty array of {{click: selector}} / {{wait_ms: N}} / {{select: {{selector, value}}}} / {{resize: {{width, height}}}} objects"),
     };
     if arr.len() > MAX_STEPS {
         bail!("steps accepts at most {MAX_STEPS} entries; got {}", arr.len());
@@ -112,7 +115,7 @@ fn parse_steps(raw: Option<&Value>) -> Result<Option<Vec<Interaction>>> {
     let mut out = Vec::new();
     for (i, s) in arr.iter().enumerate() {
         let o = s.as_object().filter(|o| o.len() == 1);
-        let Some(o) = o else { bail!("steps[{i}] must be an object with exactly one of click, wait_ms") };
+        let Some(o) = o else { bail!("steps[{i}] must be an object with exactly one of click, wait_ms, select, resize") };
         let (k, v) = o.iter().next().expect("one key");
         match k.as_str() {
             "click" => {
@@ -128,7 +131,26 @@ fn parse_steps(raw: Option<&Value>) -> Result<Option<Vec<Interaction>>> {
                 let Some(n) = n else { bail!("steps[{i}].wait_ms must be an integer 0..{MAX_STEP_WAIT_MS}") };
                 out.push(Interaction::Wait(n as i64));
             }
-            other => bail!("steps[{i}] has unsupported key {}; allowed: click, wait_ms", js::json_stringify(Some(&json!(other)))),
+            // route66#4277: {select: {selector, value}}; '|' is barred because it separates capture.steps.
+            "select" => {
+                let o = v.as_object();
+                let sel = o.and_then(|o| o.get("selector")).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+                let val = o.and_then(|o| o.get("value")).and_then(Value::as_str);
+                let (Some(sel), Some(val)) = (sel, val) else { bail!("steps[{i}].select must be {{selector: css, value: string}}") };
+                if sel.contains('|') || val.contains('|') {
+                    bail!("steps[{i}].select must not contain '|' (capture.steps separator)");
+                }
+                out.push(Interaction::Select(js::metadata_str(sel, 256), js::metadata_str(val, 256)));
+            }
+            // route66#4277: {resize: {width, height}} within the same bounds as the starting viewport.
+            "resize" => {
+                let dim = |k: &str, lo: i64, hi: i64| v.get(k).and_then(Value::as_i64).filter(|n| (lo..=hi).contains(n));
+                let (Some(w), Some(h)) = (dim("width", 320, 3840), dim("height", 320, 3000)) else {
+                    bail!("steps[{i}].resize must be {{width: 320..3840, height: 320..3000}}")
+                };
+                out.push(Interaction::Resize(w, h));
+            }
+            other => bail!("steps[{i}] has unsupported key {}; allowed: click, wait_ms, select, resize", js::json_stringify(Some(&json!(other)))),
         }
     }
     Ok(Some(out))
@@ -341,6 +363,32 @@ async fn capture_with(
                 phase("step-wait", &format!("wait-ms={ms}"));
                 continue;
             }
+            // route66#4277: set the option and fire input+change (map_picker.js renders only on change);
+            // fail hard when the element is not a <select> or lacks the option.
+            Interaction::Select(sel, val) => {
+                page.wait_for_selector(sel, "visible", 5000).await?;
+                let expr = format!(
+                    "(() => {{ const el = document.querySelector({s}); if (!el || el.tagName !== 'SELECT') return 'not-a-select'; \
+                     if (![...el.options].some(o => o.value === {v})) return 'no-option'; el.value = {v}; \
+                     el.dispatchEvent(new Event('input', {{bubbles: true}})); el.dispatchEvent(new Event('change', {{bubbles: true}})); return 'ok'; }})()",
+                    s = serde_json::to_string(sel)?,
+                    v = serde_json::to_string(val)?
+                );
+                let r = page.evaluate(&expr).await?;
+                if r.as_ref().and_then(Value::as_str) != Some("ok") {
+                    bail!("select step {sel}={val} failed: {}", js::json_stringify(r.as_ref()));
+                }
+                let _ = page.wait_for_network_idle(500, 5000).await;
+                phase("step-select", &format!("{sel}={val}"));
+                continue;
+            }
+            // route66#4277: CEF window resize plus the device-metrics override; the page gets a real resize event.
+            Interaction::Resize(w, h) => {
+                page.set_viewport(*w, *h).await?;
+                let _ = page.wait_for_network_idle(500, 5000).await;
+                phase("step-resize", &format!("{w}x{h}"));
+                continue;
+            }
             Interaction::Click(sel) => sel.clone(),
         };
         page.wait_for_selector(&sel, "visible", 5000).await?;
@@ -472,6 +520,9 @@ pub async fn capture_web_ui_screenshot(event: &Value) -> Result<Value> {
         .map(|s| match s {
             Interaction::Wait(ms) => format!("wait_ms:{ms}"),
             Interaction::Click(sel) => format!("click:{sel}"),
+            // route66#4277: capture.viewport keeps the starting size; the resize entry records the change.
+            Interaction::Select(sel, val) => format!("select:{sel}={val}"),
+            Interaction::Resize(w, h) => format!("resize:{w}x{h}"),
         })
         .collect();
     put("capture.steps", if steps.is_empty() { "none".into() } else { steps.join("|") });
