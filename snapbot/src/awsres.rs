@@ -37,11 +37,12 @@ enum Proto {
     Lambda,
 }
 
-/// IAM has one global endpoint and signs for us-east-1 whatever region the
+/// IAM and Cost Explorer are global and sign for us-east-1 whatever region the
 /// caller names; every other service is regional.
 fn endpoint(svc: &str, host: &str, region: &str) -> (String, String) {
     match svc {
         "iam" => ("iam.amazonaws.com".into(), "us-east-1".into()),
+        "ce" => ("ce.us-east-1.amazonaws.com".into(), "us-east-1".into()),
         _ => (format!("{host}.{region}.amazonaws.com"), region.into()),
     }
 }
@@ -68,6 +69,9 @@ fn service(name: &str) -> Result<(&'static str, &'static str, Proto)> {
         "ses" => ("ses", "email", Proto::Query("2010-12-01")),
         "iam" => ("iam", "iam", Proto::Query("2010-05-08")),
         "service-quotas" => ("servicequotas", "servicequotas", Proto::Json("1.1", "ServiceQuotasV20190624")),
+        // route66#4224: cost-report evidence, Cost Explorer GetCostAndUsage
+        // for the caller's own account (owner: "Add cost report as an evidence type").
+        "ce" => ("ce", "ce", Proto::Json("1.1", "AWSInsightsIndexService")),
         other => bail!("service {other} is not in the attestor's pinned AWS SDK client set"),
     })
 }
