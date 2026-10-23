@@ -15,6 +15,18 @@ unchanged. v4 dropped the derived `ci.sha-match` and `ci.true-green` fields
 block records raw state and the reader decides greenness. Existing v3
 statements continue to verify against the committed public keys in route66.
 
+### Public form input in attested screenshots
+
+For `capture-web-ui-screenshot`, `steps` accepts
+`{"fill":{"selector":"#address","value":"1388 Kettner Blvd"}}` before
+the existing click, wait, select and resize steps. Fill replaces a visible
+text/search/number input or textarea through the browser's native editing path,
+so input handlers and the real form submission run normally. Selector and value
+are limited to 256 UTF-16 units each and cannot contain `|`; at most 12 steps
+are accepted. Use public property facts only: the exact value is published in
+signed `capture.steps` as `fill:<selector>=<value>`. Password and other input
+types are rejected, and fill values are not written to phase logs.
+
 ## OCR: in-lane, inside a browse screenshot step
 
 No request carries image bytes. A `browse` step `{"op": "screenshot", "name":

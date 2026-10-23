@@ -98,6 +98,8 @@ fn parse_click_selectors(raw: Option<&Value>) -> Result<Vec<String>> {
 enum Interaction {
     Click(String),
     Wait(i64),
+    // route66#3999: enter public form facts through the browser's native editing path.
+    Fill(String, String),
     // route66#4277: pick a <select> option (selector, value) and resize the viewport mid-capture.
     Select(String, String),
     Resize(i64, i64),
@@ -107,7 +109,7 @@ fn parse_steps(raw: Option<&Value>) -> Result<Option<Vec<Interaction>>> {
     let arr = match raw {
         None | Some(Value::Null) => return Ok(None),
         Some(Value::Array(a)) if !a.is_empty() => a,
-        _ => bail!("steps must be a non-empty array of {{click: selector}} / {{wait_ms: N}} / {{select: {{selector, value}}}} / {{resize: {{width, height}}}} objects"),
+        _ => bail!("steps must be a non-empty array of {{click: selector}} / {{wait_ms: N}} / {{fill: {{selector, value}}}} / {{select: {{selector, value}}}} / {{resize: {{width, height}}}} objects"),
     };
     if arr.len() > MAX_STEPS {
         bail!("steps accepts at most {MAX_STEPS} entries; got {}", arr.len());
@@ -115,7 +117,7 @@ fn parse_steps(raw: Option<&Value>) -> Result<Option<Vec<Interaction>>> {
     let mut out = Vec::new();
     for (i, s) in arr.iter().enumerate() {
         let o = s.as_object().filter(|o| o.len() == 1);
-        let Some(o) = o else { bail!("steps[{i}] must be an object with exactly one of click, wait_ms, select, resize") };
+        let Some(o) = o else { bail!("steps[{i}] must be an object with exactly one of click, wait_ms, fill, select, resize") };
         let (k, v) = o.iter().next().expect("one key");
         match k.as_str() {
             "click" => {
@@ -130,6 +132,17 @@ fn parse_steps(raw: Option<&Value>) -> Result<Option<Vec<Interaction>>> {
                 let n = v.as_f64().filter(|f| f.fract() == 0.0 && *f >= 0.0 && *f <= MAX_STEP_WAIT_MS as f64);
                 let Some(n) = n else { bail!("steps[{i}].wait_ms must be an integer 0..{MAX_STEP_WAIT_MS}") };
                 out.push(Interaction::Wait(n as i64));
+            }
+            // route66#3999: preserve the exact bounded public text in the signed step, never truncate it.
+            "fill" => {
+                let o = v.as_object();
+                let sel = o.and_then(|o| o.get("selector")).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+                let val = o.and_then(|o| o.get("value")).and_then(Value::as_str);
+                let (Some(sel), Some(val)) = (sel, val) else { bail!("steps[{i}].fill must be {{selector: css, value: string}}") };
+                if sel.encode_utf16().count() > 256 || val.encode_utf16().count() > 256 || sel.contains('|') || val.contains('|') {
+                    bail!("steps[{i}].fill selector/value must be at most 256 UTF-16 units and must not contain '|'");
+                }
+                out.push(Interaction::Fill(sel.to_string(), val.to_string()));
             }
             // route66#4277: {select: {selector, value}}; '|' is barred because it separates capture.steps.
             "select" => {
@@ -150,7 +163,7 @@ fn parse_steps(raw: Option<&Value>) -> Result<Option<Vec<Interaction>>> {
                 };
                 out.push(Interaction::Resize(w, h));
             }
-            other => bail!("steps[{i}] has unsupported key {}; allowed: click, wait_ms, select, resize", js::json_stringify(Some(&json!(other)))),
+            other => bail!("steps[{i}] has unsupported key {}; allowed: click, wait_ms, fill, select, resize", js::json_stringify(Some(&json!(other)))),
         }
     }
     Ok(Some(out))
@@ -363,6 +376,22 @@ async fn capture_with(
                 phase("step-wait", &format!("wait-ms={ms}"));
                 continue;
             }
+            // route66#3999: only public text fields may become signed input; credentials never enter this path.
+            Interaction::Fill(sel, val) => {
+                page.wait_for_selector(sel, "visible", 5000).await?;
+                let expr = format!(
+                    "(() => {{ const el = document.querySelector({s}); return el instanceof HTMLTextAreaElement || \
+                     (el instanceof HTMLInputElement && ['text', 'search', 'number'].includes(el.type)); }})()",
+                    s = serde_json::to_string(sel)?
+                );
+                if page.evaluate(&expr).await? != Some(json!(true)) {
+                    bail!("fill step requires a public text, search, number or textarea field");
+                }
+                page.locator_fill(sel, val, 5000).await?;
+                let _ = page.wait_for_network_idle(500, 5000).await;
+                phase("step-fill", sel);
+                continue;
+            }
             // route66#4277: set the option and fire input+change (map_picker.js renders only on change);
             // fail hard when the element is not a <select> or lacks the option.
             Interaction::Select(sel, val) => {
@@ -520,6 +549,8 @@ pub async fn capture_web_ui_screenshot(event: &Value) -> Result<Value> {
         .map(|s| match s {
             Interaction::Wait(ms) => format!("wait_ms:{ms}"),
             Interaction::Click(sel) => format!("click:{sel}"),
+            // route66#3999: the requested public text is evidence of the exact form state induced.
+            Interaction::Fill(sel, val) => format!("fill:{sel}={val}"),
             // route66#4277: capture.viewport keeps the starting size; the resize entry records the change.
             Interaction::Select(sel, val) => format!("select:{sel}={val}"),
             Interaction::Resize(w, h) => format!("resize:{w}x{h}"),
