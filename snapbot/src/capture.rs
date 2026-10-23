@@ -571,3 +571,42 @@ pub async fn capture_web_ui_screenshot(event: &Value) -> Result<Value> {
     phase("attest-and-sign", &format!("key={key}"));
     attest::attest(&key, &vid, o).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // GH #3999: the attested form journey previously rejected native text entry
+    // before address resolution; clearing and replacing facts must stay ordered.
+    #[test]
+    fn capture_accepts_exact_public_form_fills_before_submit() {
+        let requested = json!([
+            {"fill": {"selector": "#address", "value": "1388 Kettner Blvd"}},
+            {"fill": {"selector": "#unit", "value": ""}},
+            {"fill": {"selector": "#unit", "value": "1502"}},
+            {"fill": {"selector": "#living-area", "value": "1241"}},
+            {"click": "#resolve"}
+        ]);
+        let steps = parse_steps(Some(&requested))
+            .expect("public form fills must be admitted by the capture interface")
+            .expect("declared capture steps must remain present");
+        let [
+            Interaction::Fill(address, address_value),
+            Interaction::Fill(clear_unit, empty),
+            Interaction::Fill(unit, unit_value),
+            Interaction::Fill(area, area_value),
+            Interaction::Click(submit),
+        ] = steps.as_slice() else {
+            panic!("form edits and normal submit were lost or reordered");
+        };
+        assert_eq!(address, "#address");
+        assert_eq!(address_value, "1388 Kettner Blvd");
+        assert_eq!(clear_unit, "#unit");
+        assert_eq!(empty, "");
+        assert_eq!(unit, "#unit");
+        assert_eq!(unit_value, "1502");
+        assert_eq!(area, "#living-area");
+        assert_eq!(area_value, "1241");
+        assert_eq!(submit, "#resolve");
+    }
+}
