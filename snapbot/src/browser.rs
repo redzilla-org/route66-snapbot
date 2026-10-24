@@ -110,6 +110,118 @@ pub struct Fulfill {
     pub body: Vec<u8>,
 }
 
+// WHY: bounded native timings expose network stalls even when ResourceTiming is masked by TAO.
+const NETWORK_TRACE_LIMIT: usize = 128;
+
+#[derive(Default)]
+pub struct NetworkTrace {
+    started: Option<Instant>,
+    requests: Vec<Value>,
+    current: HashMap<String, usize>,
+    interceptions: Vec<Value>,
+    dropped_requests: u64,
+    dropped_interceptions: u64,
+}
+
+impl NetworkTrace {
+    fn elapsed_ms(&self) -> f64 {
+        self.started.map(|start| start.elapsed().as_secs_f64() * 1000.0).unwrap_or(0.0)
+    }
+
+    // WHY: origins identify providers without exposing credentials, paths, queries or fragments.
+    fn origin(raw: &str) -> Option<String> {
+        let url = url::Url::parse(raw).ok()?;
+        matches!(url.scheme(), "http" | "https").then(|| url.origin().ascii_serialization())
+    }
+
+    // WHY: only numeric timing phases and fixed CDP metadata enter this diagnostic payload.
+    fn response(record: &mut Value, response: &Value) {
+        for key in ["status", "protocol", "connectionId", "connectionReused", "fromDiskCache", "fromServiceWorker", "fromPrefetchCache"] {
+            record[key] = response[key].clone();
+        }
+        record["timing"] = response.get("timing").and_then(Value::as_object)
+            .map(|timing| Value::Object(timing.iter().filter(|(_, value)| value.is_number())
+                .map(|(key, value)| (key.clone(), value.clone())).collect()))
+            .unwrap_or(Value::Null);
+    }
+
+    fn event(&mut self, method: &str, p: &Value) {
+        let id = p.get("requestId").and_then(Value::as_str).unwrap_or("");
+        match method {
+            "Network.requestWillBeSent" => {
+                // WHY: redirects reuse Network IDs; keep each leg and close the prior leg explicitly.
+                if let Some(index) = self.current.remove(id) {
+                    if let Some(response) = p.get("redirectResponse") {
+                        let record = &mut self.requests[index];
+                        Self::response(record, response);
+                        record["state"] = json!("redirected");
+                        record["end_timestamp"] = p["timestamp"].clone();
+                    }
+                }
+                let Some(origin) = Self::origin(p.pointer("/request/url").and_then(Value::as_str).unwrap_or("")) else { return; };
+                if self.requests.len() == NETWORK_TRACE_LIMIT {
+                    self.dropped_requests += 1;
+                    return;
+                }
+                let index = self.requests.len();
+                self.requests.push(json!({
+                    "request_id": id, "origin": origin, "resource_type": p["type"],
+                    "request_timestamp": p["timestamp"], "observed_ms": self.elapsed_ms(), "state": "pending",
+                }));
+                self.current.insert(id.to_string(), index);
+            }
+            "Network.responseReceived" => {
+                if let Some(&index) = self.current.get(id) {
+                    let record = &mut self.requests[index];
+                    Self::response(record, &p["response"]);
+                    record["response_timestamp"] = p["timestamp"].clone();
+                    record["resource_type"] = p["type"].clone();
+                }
+            }
+            "Network.requestServedFromCache" => {
+                if let Some(&index) = self.current.get(id) {
+                    self.requests[index]["served_from_cache"] = json!(true);
+                }
+            }
+            "Network.loadingFinished" | "Network.loadingFailed" => {
+                if let Some(index) = self.current.remove(id) {
+                    let record = &mut self.requests[index];
+                    record["state"] = json!(if method == "Network.loadingFinished" { "finished" } else { "failed" });
+                    record["end_timestamp"] = p["timestamp"].clone();
+                    record["encoded_data_length"] = p["encodedDataLength"].clone();
+                    record["canceled"] = p["canceled"].clone();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn paused(&mut self, p: &Value) -> Option<usize> {
+        let origin = Self::origin(p.pointer("/request/url").and_then(Value::as_str).unwrap_or(""))?;
+        if self.interceptions.len() == NETWORK_TRACE_LIMIT {
+            self.dropped_interceptions += 1;
+            return None;
+        }
+        let index = self.interceptions.len();
+        // WHY: Fetch IDs differ from Network IDs; separate records survive cross-domain event ordering and redirect acknowledgements.
+        self.interceptions.push(json!({
+            "fetch_id": p["requestId"], "network_id": p["networkId"], "redirected_fetch_id": p["redirectedRequestId"],
+            "origin": origin, "resource_type": p["resourceType"], "paused_ms": self.elapsed_ms(), "state": "pending",
+            "stage": if p.get("responseStatusCode").is_some() || p.get("responseErrorReason").is_some() { "response" } else { "request" },
+        }));
+        Some(index)
+    }
+
+    // WHY: snapshot pending work without adding a drain wait or changing a journey's readiness budget.
+    pub fn snapshot(&self) -> Value {
+        json!({
+            "limit": NETWORK_TRACE_LIMIT, "captured_ms": self.elapsed_ms(),
+            "dropped_requests": self.dropped_requests, "dropped_interceptions": self.dropped_interceptions,
+            "requests": self.requests, "interceptions": self.interceptions,
+        })
+    }
+}
+
 #[derive(Default)]
 pub struct PageState {
     pub main_frame: String,
@@ -123,6 +235,7 @@ pub struct PageState {
     pub last_net: Option<Instant>,
     pub req_url: HashMap<String, String>,
     pub observe: bool,
+    pub network: NetworkTrace,
     pub console_errors: Vec<String>,
     pub failed_requests: Vec<Value>,
     pub http_errors: Vec<Value>,
@@ -312,7 +425,10 @@ impl Page {
 
     /// Start recording console errors, page errors, failed requests and >=400 responses.
     pub fn observe(&self) {
-        self.state.lock().unwrap().observe = true;
+        let mut state = self.state.lock().unwrap();
+        state.observe = true;
+        // WHY: all diagnostic elapsed times share the browse observation clock.
+        state.network.started.get_or_insert_with(Instant::now);
     }
 
     pub async fn set_intercept(&self, rules: Intercept) -> Result<()> {
@@ -610,6 +726,10 @@ async fn event_loop(
 }
 
 fn apply_event(st: &mut PageState, method: &str, p: &Value) {
+    // WHY: native network diagnostics are collected only for observed browse sessions.
+    if st.observe {
+        st.network.event(method, p);
+    }
     let s = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
     match method {
         "Page.frameNavigated" => {
@@ -703,6 +823,12 @@ fn apply_event(st: &mut PageState, method: &str, p: &Value) {
 }
 
 fn handle_paused(page: i32, p: &Value, state: &Arc<Mutex<PageState>>, intercept: &Arc<Mutex<Option<Intercept>>>) {
+    // WHY: measure interception dispatch separately from CDP acknowledgement without serializing requests.
+    let paused = Instant::now();
+    let trace_index = {
+        let mut state = state.lock().unwrap();
+        if state.observe { state.network.paused(p) } else { None }
+    };
     let request_id = p.get("requestId").and_then(Value::as_str).unwrap_or("").to_string();
     let url = p.pointer("/request/url").and_then(Value::as_str).unwrap_or("").to_string();
     let (method, params) = {
@@ -760,7 +886,20 @@ fn handle_paused(page: i32, p: &Value, state: &Arc<Mutex<PageState>>, intercept:
         }
     };
     // A request the page cancelled meanwhile fails this call; that is harmless.
+    let state = state.clone();
     tokio::spawn(async move {
-        let _ = crate::cdp::send(page, method, params).await;
+        if let Some(index) = trace_index {
+            let mut state = state.lock().unwrap();
+            let record = &mut state.network.interceptions[index];
+            record["action"] = json!(method);
+            record["dispatch_ms"] = json!(paused.elapsed().as_secs_f64() * 1000.0);
+        }
+        let result = crate::cdp::send(page, method, params).await;
+        if let Some(index) = trace_index {
+            let mut state = state.lock().unwrap();
+            let record = &mut state.network.interceptions[index];
+            record["ack_ms"] = json!(paused.elapsed().as_secs_f64() * 1000.0);
+            record["state"] = json!(if result.is_ok() { "acknowledged" } else { "failed" });
+        }
     });
 }

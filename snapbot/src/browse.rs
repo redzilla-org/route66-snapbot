@@ -784,6 +784,8 @@ async fn run_request(page: &Page, c: &mut Ctx, steps: &[Step], started: Instant,
     // Every screenshot step joined its own content-addressed write before
     // returning its reference, so the browse has no pending writer queue.
     let st = page.state.lock().unwrap();
+    // WHY: retain native timing evidence, including pending resources, on both successful and failed journeys.
+    let network = st.network.snapshot();
     Ok(json!({
         "ok": all_ok,
         "steps": results,
@@ -792,7 +794,7 @@ async fn run_request(page: &Page, c: &mut Ctx, steps: &[Step], started: Instant,
         "failed_requests": st.failed_requests,
         "http_errors": st.http_errors,
         "writer_drained": true,
-        "timings": {"total_ms": started.elapsed().as_millis() as u64, "acquire_ms": acquire_ms, "setup_ms": setup_ms},
+        "timings": {"total_ms": started.elapsed().as_millis() as u64, "acquire_ms": acquire_ms, "setup_ms": setup_ms, "network": network},
     }))
 }
 
