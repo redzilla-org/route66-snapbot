@@ -70,15 +70,30 @@ fn client(timeout_ms: u64) -> Result<reqwest::Client> {
         .build()?)
 }
 
-async fn request_one_hop(target: &str, headers: &Map<String, Value>, timeout_ms: u64) -> Result<Hop> {
+/// The request snapbot itself makes. A POST carries its exact body; every byte
+/// of it is signed, so the capture proves what was sent, not only what came back.
+struct Request<'a> {
+    method: &'a str,
+    body: Option<&'a str>,
+}
+
+async fn request_one_hop(target: &str, headers: &Map<String, Value>, timeout_ms: u64, request: &Request<'_>) -> Result<Hop> {
     let u = url::Url::parse(target)?;
     if u.scheme() == "http" {
+        // The IPv6 fetch hop is GET-only by design (it holds no key, writes nothing).
+        if request.method != "GET" {
+            bail!("capture-http-raw sends {} over https only: {target}", request.method);
+        }
         return request_via_ipv6_fetch(target, headers, timeout_ms).await;
     }
     if u.scheme() != "https" {
         bail!("capture-http-raw refuses non-http(s) hop {target}");
     }
-    let mut req = client(timeout_ms)?.get(target);
+    let mut req = match (request.method, request.body) {
+        ("POST", Some(body)) => client(timeout_ms)?.post(target).body(body.to_string()),
+        ("GET", None) => client(timeout_ms)?.get(target),
+        (m, _) => bail!("capture-http-raw: unsupported request {m}"),
+    };
     for (k, v) in headers {
         req = req.header(k.as_str(), v.as_str().unwrap_or(""));
     }
@@ -158,13 +173,62 @@ pub async fn capture_http_raw(event: &Value) -> Result<Value> {
         req_headers.insert("cookie".into(), json!(c.join("; ")));
     }
 
+    // route66#4344: a POST with a form body (application/x-www-form-urlencoded),
+    // made and signed here like every GET. GET stays the default and unchanged.
+    let method = match event.get("method").map(js::js_string).unwrap_or_default().to_uppercase().as_str() {
+        "" | "GET" => "GET",
+        "POST" => "POST",
+        other => bail!("capture-http-raw supports GET and POST, got {other}"),
+    };
+    let form: Vec<(String, String)> = match event.get("form") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(pairs)) => pairs
+            .iter()
+            .map(|p| match (p.get("name").and_then(Value::as_str), p.get("value").and_then(Value::as_str)) {
+                (Some(n), Some(v)) if !n.is_empty() => Ok((n.to_string(), v.to_string())),
+                _ => Err(anyhow!("capture-http-raw form entries must be {{\"name\": non-empty string, \"value\": string}}")),
+            })
+            .collect::<Result<_>>()?,
+        Some(_) => bail!("capture-http-raw form must be an array of {{name, value}}"),
+    };
+    let request_body = if method == "POST" {
+        if form.is_empty() {
+            bail!("capture-http-raw POST needs a non-empty form");
+        }
+        // A POST is answered once: following a redirect would re-send or drop
+        // the body, and either way the signed request would not be the one made.
+        if max_redirects != 0 {
+            bail!("capture-http-raw POST records the first answer only; send max_redirects 0");
+        }
+        if req_headers.keys().any(|k| k.eq_ignore_ascii_case("content-type")) {
+            bail!("capture-http-raw POST sets its own content-type; remove the content-type header");
+        }
+        let mut ser = url::form_urlencoded::Serializer::new(String::new());
+        for (n, v) in &form {
+            ser.append_pair(n, v);
+        }
+        let encoded = ser.finish();
+        // Signed in full below, so it is bounded rather than truncated.
+        if encoded.len() > 2048 {
+            bail!("capture-http-raw POST body is {} bytes; at most 2048 are signed", encoded.len());
+        }
+        req_headers.insert("content-type".into(), json!("application/x-www-form-urlencoded"));
+        Some(encoded)
+    } else {
+        if !form.is_empty() {
+            bail!("capture-http-raw form requires method POST");
+        }
+        None
+    };
+    let request = Request { method, body: request_body.as_deref() };
+
     let captured_at = js::now_iso();
     let mut hops: Vec<(String, i64, String, String, String)> = Vec::new();
     let mut current = requested.clone();
     let mut last: Option<(String, Hop)> = None;
     let mut i = 0;
     loop {
-        let res = request_one_hop(&current, &req_headers, timeout_ms).await?;
+        let res = request_one_hop(&current, &req_headers, timeout_ms, &request).await?;
         let location = res.headers.get("location").map(js::js_string).unwrap_or_default();
         let is_redirect = (300..400).contains(&res.status) && !location.is_empty();
         hops.push((current.clone(), res.status, if is_redirect { location.clone() } else { String::new() }, res.fetched_by.clone(), res.remote_address.clone()));
@@ -208,8 +272,16 @@ pub async fn capture_http_raw(event: &Value) -> Result<Value> {
         ("capture.request-timeout-ms", timeout_ms.to_string()),
         ("capture.cookie-fingerprint-sha256", cookie_fingerprint(&cookies)),
         ("capture.cookie-count", cookies.len().to_string()),
+        ("capture.request-method", method.to_string()),
     ] {
         o.insert(k.to_string(), json!(v));
+    }
+    // The exact bytes sent (bounded to 2048 above, never truncated) and their
+    // digest, so a verifier sees which form produced the signed answer.
+    if let Some(sent) = &request_body {
+        o.insert("capture.request-content-type".into(), json!("application/x-www-form-urlencoded"));
+        o.insert("capture.request-body".into(), json!(sent));
+        o.insert("capture.request-body-sha256".into(), json!(attest::sha256_hex(sent.as_bytes())));
     }
     // Zero-padded so the manifest's key sort is also hop order.
     for (i, (u, status, location, fetched_by, remote)) in hops.iter().enumerate() {
