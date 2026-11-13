@@ -100,5 +100,8 @@ pub async fn run(handler_name: String) -> Result<()> {
             diagnostic_phase("response-posted");
             diagnostic_request().lock().unwrap().clear();
         }
+        // WHY (route66 GH #4463): poll only with the next page already built,
+        // as the first poll does after warm(); the reply above is not delayed.
+        crate::browse::spare_ready().await;
     }
 }

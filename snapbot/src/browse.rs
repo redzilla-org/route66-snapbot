@@ -142,6 +142,24 @@ pub async fn warm(extra: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Join the spare scheduled at release, before the lane polls for more work.
+/// WHY (route66 GH #4463): a lane that polled while its spare was still being
+/// built handed the next request a page created moments earlier; that request
+/// paid the build in acquire_ms and a cold first navigate (ack > 700ms on 123
+/// of 807 such California requests, about 2% on a ready spare). The reply is
+/// already posted, so no request waits on this build. A failed build is left
+/// to take_spare's own in-request fallback.
+pub async fn spare_ready() {
+    let mut st = pool().lock().await;
+    if let Some(t) = st.building.take() {
+        match t.await {
+            Ok(Ok(s)) => st.spare = Some(s),
+            Ok(Err(e)) => eprintln!("[browse] spare context build failed: {e:#}"),
+            Err(e) => eprintln!("[browse] spare context build failed: {e}"),
+        }
+    }
+}
+
 struct Ctx {
     viewport: (i64, i64),
     intercept: Option<Intercept>,
