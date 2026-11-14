@@ -127,8 +127,10 @@ Resources:
       Timeout: 180
       # 2026-10-08 California DEV reached 1526/1536 MB; a 50 MB CEF frame
       # disconnected the writer. Give CEF and the writer CPU with 2 vCPUs.
-      # route66#4470: arm64 Chromium needs 4 vCPU to hold the 4000 ms browse waits that 2 vCPU x86 held.
-      MemorySize: 7076
+      # route66#4479 (2026-11-14 clone benchmark, 1110 calls): CPU-bound (361 ms IO floor
+      # + 2501 ms/vCPU, R2 0.984), max memory 1050 MB. 2560 is the lowest warm GB-s/call;
+      # 7076 cost 1.52x per call. Paired with route66 browseplan.go snapbotPoolWidth 10.
+      MemorySize: 2560
       EphemeralStorage:
         Size: 1024
       # route66#4470: Graviton, ~20% cheaper per GB-s; image built natively by
