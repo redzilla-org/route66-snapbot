@@ -1,6 +1,8 @@
-# route66-snapbot: one amd64 Lambda image holding the Rust handler (GH #4115)
+# route66-snapbot: one Lambda image holding the Rust handler (GH #4115)
 # with Chromium embedded in process through CEF (owner 2026-10-07), and the
 # Tesseract English model. No Node, npm, Playwright or external Chromium.
+# Always a NATIVE build for the host's arch (route66#4470): amd64 on the laptop,
+# arm64 only in the Graviton CodeBuild project; never a cross build.
 
 # ---------------------------------------------------------------------------
 # native-build: glibc toolchain, static Leptonica + Tesseract, CEF, the handler.
@@ -24,7 +26,7 @@ RUN dnf install -y --setopt=install_weak_deps=False gcc gcc-c++ make cmake ninja
         libXrandr libXfixes libXext libX11 libxcb mesa-libgbm pango cairo alsa-lib dbus-libs expat glib2 \
         libxshmfence fontconfig freetype >/dev/null \
     && dnf clean all \
-    && curl -fsSL -o /tmp/rustup-init https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init \
+    && curl -fsSL -o /tmp/rustup-init "https://static.rust-lang.org/rustup/dist/$(uname -m)-unknown-linux-gnu/rustup-init" \
     && chmod +x /tmp/rustup-init \
     && /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain ${RUST_VERSION} \
     && rm /tmp/rustup-init

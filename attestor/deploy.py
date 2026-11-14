@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Build and deploy the command-center route66-snapbot image.
 
-boto3 plus Docker, fixed command-center account/region, immutable SHA image tag,
-and live preflight checks before any stack mutation.
+boto3 only, fixed command-center account/region, immutable SHA image tag,
+and live preflight checks before any stack mutation. The arm64 image is built
+natively by the Graviton CodeBuild project route66-snapbot-arm64-image from a
+`git archive` of the SHA (route66#4470); the laptop runs no docker for it.
 
 KEY MATERIAL (owner 2026-08-26, "the AWS key should be hard-coded (not Lambda
 env)"): the AES unwrap key is the UNWRAP_KEY_B64 constant in snapbot/src/attest.rs;
@@ -32,6 +34,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 import boto3
 import botocore
@@ -55,6 +58,8 @@ PROFILE = os.environ.get("AWS_PROFILE") or "command-center"
 ORG_ID = "o-qpe4445sii"
 SSM_PARAM = "/r66/evidence-attestor/private-key.v1"
 ECR_REPOSITORY = "route66-snapbot"
+# Graviton CodeBuild project in devops-bucket-template.yaml (route66#4470).
+BUILD_PROJECT = "route66-snapbot-arm64-image"
 CI_READ_ROLE_NAME = "route66-evidence-attestor-ci-read"
 
 TEMPLATE = os.path.join(HERE, "evidence-attestor-template.yaml")
@@ -186,129 +191,63 @@ def apply(cfn, name, body, params, capabilities):
 
 
 def ensure_devops_bucket(sess):
-    apply(sess.client("cloudformation"), DEVOPS_STACK_NAME, read_text(DEVOPS_TEMPLATE), [], [])
+    # CAPABILITY_IAM: the stack owns the CodeBuild service role.
+    apply(sess.client("cloudformation"), DEVOPS_STACK_NAME, read_text(DEVOPS_TEMPLATE), [], ["CAPABILITY_IAM"])
     print("devops bucket OK: %s" % DEVOPS_BUCKET)
 
 
-def _registry_get(url, token, accept=None):
-    """GET against public.ecr.aws, following blob redirects WITHOUT the bearer
-    header (the redirect target is a presigned URL that rejects extra auth)."""
-    import urllib.request
-    import urllib.error
-
-    class NoRedirect(urllib.request.HTTPRedirectHandler):
-        def redirect_request(self, *a, **k):
-            return None
-
-    headers = {"Authorization": "Bearer " + token}
-    if accept:
-        headers["Accept"] = accept
-    opener = urllib.request.build_opener(NoRedirect)
-    try:
-        return opener.open(urllib.request.Request(url, headers=headers), timeout=120)
-    except urllib.error.HTTPError as exc:
-        if exc.code in (301, 302, 303, 307, 308):
-            return urllib.request.urlopen(exc.headers["Location"], timeout=300)
-        raise
-
-
-def seed_base_layers(ecr):
-    """Copy the runtime base image's amd64 layer blobs registry-to-registry into
-    our ECR repo before `docker push`.
-
-    WHY (GH #3840 / #3731, first command-center deploy 2026-09-13): Docker
-    Desktop's containerd image store keeps the base image's UNPACKED snapshots
-    but had garbage-collected its COMPRESSED layer blobs. The build succeeds from
-    the snapshots; the push then dies "NotFound: content digest sha256:... not
-    found" on a public.ecr.aws/lambda/nodejs:22 layer (5ca8fe44, 8e2ed86f,
-    c41802d2 in successive attempts). `docker build --pull`, `docker pull
-    --platform linux/amd64`, and untag+re-pull all report the digest present
-    and fetch nothing, because the snapshots satisfy the pull; clearing them
-    would mean discarding the Tesseract/Rust build cache. Pushing a blob the
-    registry already holds is skipped by docker ("Layer already exists"), so
-    placing the base blobs in ECR first makes the push independent of the local
-    content store. Digests are verified by ECR on complete_layer_upload.
-    """
-    import hashlib
-    import urllib.request
-
-    m = [ln.split()[1] for ln in read_text(os.path.join(ROOT, "Dockerfile")).splitlines()
-         if ln.startswith("FROM ")][-1]
-    repo_tag = m.split("public.ecr.aws/", 1)
-    if len(repo_tag) != 2 or "@" in repo_tag[1]:
-        sys.exit("REFUSING: runtime base %s is not a tag-form public.ecr.aws reference" % m)
-    repo, tag = repo_tag[1].rsplit(":", 1)
-    token = json.load(urllib.request.urlopen(
-        "https://public.ecr.aws/token/?service=public.ecr.aws&scope=repository:%s:pull" % repo, timeout=60))["token"]
-    base = "https://public.ecr.aws/v2/%s" % repo
-    accept = ("application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,"
-              "application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json")
-    doc = json.load(_registry_get("%s/manifests/%s" % (base, tag), token, accept))
-    if "manifests" in doc:
-        amd64 = [d for d in doc["manifests"]
-                 if d.get("platform", {}).get("os") == "linux" and d.get("platform", {}).get("architecture") == "amd64"]
-        doc = json.load(_registry_get("%s/manifests/%s" % (base, amd64[0]["digest"]), token, accept))
-    digests = [layer["digest"] for layer in doc["layers"]]
-    have = ecr.batch_check_layer_availability(repositoryName=ECR_REPOSITORY, layerDigests=digests)
-    missing = [l["layerDigest"] for l in have["layers"] if l["layerAvailability"] != "AVAILABLE"]
-    missing += [f["layerDigest"] for f in have.get("failures", [])]
-    print("base %s amd64: %d layers, %d to seed into ECR" % (m, len(digests), len(missing)), flush=True)
-    chunk = 20 * 1024 * 1024
-    for digest in missing:
-        upload_id = ecr.initiate_layer_upload(repositoryName=ECR_REPOSITORY)["uploadId"]
-        body = _registry_get("%s/blobs/%s" % (base, digest), token)
-        sha, offset = hashlib.sha256(), 0
-        while True:
-            buf = body.read(chunk)
-            if not buf:
-                break
-            # read() may return short on a socket; fill the part to a full chunk.
-            while len(buf) < chunk:
-                more = body.read(chunk - len(buf))
-                if not more:
-                    break
-                buf += more
-            sha.update(buf)
-            ecr.upload_layer_part(repositoryName=ECR_REPOSITORY, uploadId=upload_id,
-                                  partFirstByte=offset, partLastByte=offset + len(buf) - 1, layerPartBlob=buf)
-            offset += len(buf)
-        if "sha256:" + sha.hexdigest() != digest:
-            sys.exit("REFUSING: downloaded blob digest mismatch for %s" % digest)
-        ecr.complete_layer_upload(repositoryName=ECR_REPOSITORY, uploadId=upload_id, layerDigests=[digest])
-        print("seeded %s (%d bytes)" % (digest, offset), flush=True)
-
-
-def package(sess=None):
-    """Build and push the exact checkout as an immutable ECR image."""
-    sess = sess or session()
-    assert_command_center(sess)
-    ensure_devops_bucket(sess)
+def head_sha():
     sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True, timeout=15).strip()
     if not re.fullmatch(r"[0-9a-f]{40}", sha):
         sys.exit("REFUSING: git rev-parse did not return a 40-hex SHA")
-    registry = "%s.dkr.ecr.%s.amazonaws.com" % (COMMAND_CENTER_ACCOUNT, REGION)
-    image = "%s/%s:%s" % (registry, ECR_REPOSITORY, sha)
+    return sha
 
-    # Password travels on stdin and never appears in argv or logs. The build is
-    # amd64 because the template declares x86_64 and Chromium pins that ABI.
-    auth = sess.client("ecr").get_authorization_token()["authorizationData"][0]
-    username, password = base64.b64decode(auth["authorizationToken"]).decode("utf-8").split(":", 1)
-    subprocess.run(["docker", "login", "--username", username, "--password-stdin", registry],
-                   input=password, text=True, check=True, timeout=60)
-    # --pull (GH #3840, first command-center deploy 2026-09-13): under Docker's
-    # containerd image store a cached base image can be present as an unpacked
-    # snapshot while its compressed layer blob is gone. The build succeeds from
-    # the snapshot and the push then fails "NotFound: content digest
-    # sha256:5ca8fe44... not found" on that base layer. Re-pulling the bases on
-    # every build restores the blobs the push must upload.
-    subprocess.run(["docker", "build", "--pull", "--platform", "linux/amd64", "-t", image, "."],
-                   cwd=ROOT, check=True, timeout=3600)
-    seed_base_layers(sess.client("ecr"))
-    # Plain push. `--platform linux/amd64` was tried the same day and refused:
-    # the legacy builder's image carries no platform descriptor to select.
-    subprocess.run(["docker", "push", image], cwd=ROOT, check=True, timeout=1800)
-    print("packaged snapbot image %s" % image)
-    return image
+
+def image_arch(ecr, sha):
+    """Architecture recorded in the pushed image's config blob; refuses an index
+    (Lambda needs one plain manifest)."""
+    img = ecr.batch_get_image(repositoryName=ECR_REPOSITORY, imageIds=[{"imageTag": sha}])["images"][0]
+    manifest = json.loads(img["imageManifest"])
+    if "config" not in manifest:
+        sys.exit("REFUSING: %s is a manifest index, not a single image manifest" % sha)
+    import urllib.request
+    url = ecr.get_download_url_for_layer(repositoryName=ECR_REPOSITORY,
+                                         layerDigest=manifest["config"]["digest"])["downloadUrl"]
+    return json.load(urllib.request.urlopen(url, timeout=60))["architecture"], img["imageId"]["imageDigest"]
+
+
+def package(sess=None):
+    """Build the HEAD commit as an arm64 image NATIVELY on Graviton CodeBuild
+    (route66#4470, owner: "Only CI does arm64", "no cross builds"). The laptop
+    only stages `git archive` of the SHA; it never runs docker for the cloud image."""
+    sess = sess or session()
+    assert_command_center(sess)
+    ensure_devops_bucket(sess)
+    sha = head_sha()
+    key = "snapbot-src/%s.zip" % sha
+    archive = subprocess.check_output(["git", "archive", "--format=zip", sha], cwd=ROOT, timeout=300)
+    sess.client("s3").put_object(Bucket=DEVOPS_BUCKET, Key=key, Body=archive)
+    print("staged s3://%s/%s (%d bytes)" % (DEVOPS_BUCKET, key, len(archive)), flush=True)
+    cb = sess.client("codebuild")
+    build_id = cb.start_build(
+        projectName=BUILD_PROJECT, sourceTypeOverride="S3", sourceLocationOverride="%s/%s" % (DEVOPS_BUCKET, key),
+        environmentVariablesOverride=[{"name": "SNAPBOT_SHA", "value": sha, "type": "PLAINTEXT"}],
+    )["build"]["id"]
+    print("codebuild %s started" % build_id, flush=True)
+    # Poll to a terminal status; the build is the whole arm64 compile.
+    while True:
+        build = cb.batch_get_builds(ids=[build_id])["builds"][0]
+        if build["buildStatus"] != "IN_PROGRESS":
+            break
+        time.sleep(30)
+    if build["buildStatus"] != "SUCCEEDED":
+        sys.exit("REFUSING: codebuild %s ended %s; logs %s" % (build_id, build["buildStatus"],
+                                                                build.get("logs", {}).get("deepLink")))
+    arch, digest = image_arch(sess.client("ecr"), sha)
+    if arch != "arm64":
+        sys.exit("REFUSING: pushed image %s is %s, not arm64" % (digest, arch))
+    print("packaged snapbot image %s:%s %s arch=%s" % (ECR_REPOSITORY, sha, digest, arch))
+    return sha
 
 
 def preflight():
@@ -346,7 +285,20 @@ def deploy(sha=None):
     assert_command_center(sess)
     value, create = ssm_string_value(sess)
     validate_seed_matches_public(value)
-    # Resolve before any write: missing publication must not trigger a new build or partial deployment.
+    # route66#4470: HEAD with no published image is built on Graviton CodeBuild
+    # first; an explicit --sha must already be published.
+    if sha is None:
+        sha = head_sha()
+        try:
+            sess.client("ecr").describe_images(repositoryName=ECR_REPOSITORY, imageIds=[{"imageTag": sha}])
+        except botocore.exceptions.ClientError as exc:
+            if "ImageNotFound" not in str(exc):
+                raise
+            package(sess)
+    # The stack declares arm64; refuse any image that is not.
+    arch, _ = image_arch(sess.client("ecr"), sha)
+    if arch != "arm64":
+        sys.exit("REFUSING: image %s is %s, the stack runs arm64" % (sha, arch))
     image_uri = published_image(sess, sha)
     ensure_private_key_parameter(sess, value, create)
     params = [

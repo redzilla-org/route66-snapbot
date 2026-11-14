@@ -23,7 +23,7 @@ AWSTemplateFormatVersion: "2010-09-09"
 Parameters:
   ImageUri:
     Type: String
-    Description: Immutable route66-snapbot amd64 Lambda image URI.
+    Description: Immutable route66-snapbot arm64 Lambda image URI (CodeBuild-built).
 
   TestResultsBucketName:
     Type: String
@@ -130,7 +130,9 @@ Resources:
       MemorySize: 3538
       EphemeralStorage:
         Size: 1024
-      Architectures: [x86_64]
+      # route66#4470: Graviton, ~20% cheaper per GB-s; image built natively by
+      # the route66-snapbot-arm64-image CodeBuild project, never on the laptop.
+      Architectures: [arm64]
       Code:
         ImageUri: !Ref ImageUri
       Environment:
@@ -260,7 +262,8 @@ Resources:
       # The caller's socket timeout is capped at 30s; the rest covers cold start.
       Timeout: 45
       MemorySize: 256
-      Architectures: [x86_64]
+      # Same image as the signer, so the same arch (route66#4470).
+      Architectures: [arm64]
       Code:
         ImageUri: !Ref ImageUri
       ImageConfig:

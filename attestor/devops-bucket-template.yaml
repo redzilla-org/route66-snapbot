@@ -51,6 +51,86 @@ Resources:
             NoncurrentVersionExpiration:
               NoncurrentDays: 90
 
+  # ===========================================================================
+  # arm64 image build (route66#4470). Owner, verbatim: "keep local strictly on
+  # x86, zero arm. Only CI does arm64", "no cross builds". So the arm64 Lambda
+  # image is built NATIVELY on Graviton (ARM_CONTAINER) here, never on the
+  # laptop. Source is a `git archive` zip of the commit that deploy.py stages
+  # under snapbot-src/<sha>.zip in the bucket above (the account has no GitHub
+  # connection, and none is created); the build pushes tag <sha> to the repo.
+  # ===========================================================================
+  SnapbotImageBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: snapbot-image-build
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Its own build logs.
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*"
+              # Reads only the staged source archives.
+              - Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion]
+                Resource: !Sub "${DevOpsBucket.Arn}/snapbot-src/*"
+              # Pushes to the one snapbot repository.
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                Resource: !GetAtt SnapbotRepository.Arn
+
+  SnapbotImageBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: route66-snapbot-arm64-image
+      ServiceRole: !GetAtt SnapbotImageBuildRole.Arn
+      # Rust + static Tesseract + CEF compile; 2h is a ceiling, billed per minute.
+      TimeoutInMinutes: 120
+      Artifacts: { Type: NO_ARTIFACTS }
+      Environment:
+        # Graviton host: the Dockerfile builds natively for arm64, no emulation.
+        Type: ARM_CONTAINER
+        ComputeType: BUILD_GENERAL1_LARGE
+        Image: aws/codebuild/amazonlinux-aarch64-standard:3.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - { Name: REPO_URI, Value: !GetAtt SnapbotRepository.RepositoryUri }
+          # Overridden per build by deploy.py with the full commit SHA.
+          - { Name: SNAPBOT_SHA, Value: unset }
+      Source:
+        Type: S3
+        # Overridden per build with snapbot-src/<sha>.zip.
+        Location: !Sub "${DevOpsBucket}/snapbot-src/unset.zip"
+        # --provenance=false: one plain image manifest, which Lambda requires
+        # (a buildx attestation index is rejected as an unsupported media type).
+        BuildSpec: |
+          version: 0.2
+          phases:
+            build:
+              commands:
+                - test "${#SNAPBOT_SHA}" = 40
+                - aws ecr get-login-password | docker login --username AWS --password-stdin "${REPO_URI%%/*}"
+                - docker buildx build --provenance=false --sbom=false --push -t "$REPO_URI:$SNAPBOT_SHA" .
+
 Outputs:
   BucketName:
     Value: !Ref DevOpsBucket
+  SnapbotImageBuildProject:
+    Value: !Ref SnapbotImageBuild
