@@ -94,7 +94,21 @@ Resources:
                   - ecr:UploadLayerPart
                   - ecr:CompleteLayerUpload
                   - ecr:PutImage
-                Resource: !GetAtt SnapbotRepository.Arn
+                Resource:
+                  - !GetAtt SnapbotRepository.Arn
+                  - !GetAtt SnapbotBuildCacheRepository.Arn
+
+  # Registry layer cache for the arm64 build (owner: "enable docker layer
+  # caching in codebuild"). The image repo is tag-immutable, so the mutable
+  # :buildcache tag lives in its own repo; only the latest cache is kept.
+  SnapbotBuildCacheRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: route66-snapbot-buildcache
+      ImageTagMutability: MUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: >-
+          {"rules":[{"rulePriority":1,"description":"keep only the latest build cache","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":1},"action":{"type":"expire"}}]}
 
   SnapbotImageBuild:
     Type: AWS::CodeBuild::Project
@@ -104,6 +118,10 @@ Resources:
       # Rust + static Tesseract + CEF compile; 2h is a ceiling, billed per minute.
       TimeoutInMinutes: 120
       Artifacts: { Type: NO_ARTIFACTS }
+      # Warm-host layer reuse; the registry cache below covers cold hosts.
+      Cache:
+        Type: LOCAL
+        Modes: [LOCAL_DOCKER_LAYER_CACHE]
       Environment:
         # Graviton host: the Dockerfile builds natively for arm64, no emulation.
         Type: ARM_CONTAINER
@@ -112,6 +130,7 @@ Resources:
         PrivilegedMode: true
         EnvironmentVariables:
           - { Name: REPO_URI, Value: !GetAtt SnapbotRepository.RepositoryUri }
+          - { Name: CACHE_URI, Value: !GetAtt SnapbotBuildCacheRepository.RepositoryUri }
           # Overridden per build by deploy.py with the full commit SHA.
           - { Name: SNAPBOT_SHA, Value: unset }
       Source:
@@ -120,6 +139,8 @@ Resources:
         Location: !Sub "${DevOpsBucket}/snapbot-src/unset.zip"
         # --provenance=false: one plain image manifest, which Lambda requires
         # (a buildx attestation index is rejected as an unsupported media type).
+        # Registry cache export needs a docker-container builder (the default
+        # docker driver cannot --cache-to type=registry). Native arm64 only.
         BuildSpec: |
           version: 0.2
           phases:
@@ -127,7 +148,12 @@ Resources:
               commands:
                 - test "${#SNAPBOT_SHA}" = 40
                 - aws ecr get-login-password | docker login --username AWS --password-stdin "${REPO_URI%%/*}"
-                - docker buildx build --provenance=false --sbom=false --push -t "$REPO_URI:$SNAPBOT_SHA" .
+                - docker buildx create --use --driver docker-container --name snapbot
+                - >-
+                  docker buildx build --provenance=false --sbom=false --push -t "$REPO_URI:$SNAPBOT_SHA"
+                  --cache-from type=registry,ref=$CACHE_URI:buildcache
+                  --cache-to type=registry,ref=$CACHE_URI:buildcache,mode=max,image-manifest=true,oci-mediatypes=true
+                  .
 
 Outputs:
   BucketName:
