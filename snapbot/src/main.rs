@@ -73,6 +73,15 @@ async fn run() -> Result<()> {
         "" | "index.handler" | "fetch-hop.handler" => {
             let h = if arg.is_empty() { handler } else { arg };
             init(&h)?;
+            // WHY (route66 GH #4471): a fresh Lambda sandbox pays Chromium's
+            // first-render costs here, in init, not inside its first browse.
+            if !h.starts_with("fetch-hop") {
+                let args: serde_json::Value = match std::env::var("SNAPBOT_BROWSER_ARGS") {
+                    Ok(v) if !v.is_empty() => serde_json::from_str(&v)?,
+                    _ => serde_json::json!([]),
+                };
+                browse::prime(&args).await?;
+            }
             runtime::run(h).await
         }
         other => anyhow::bail!("unknown command {other:?}"),
