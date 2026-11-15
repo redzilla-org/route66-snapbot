@@ -9,6 +9,24 @@ use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
+// Installed on the target before a locator click (route66#4471). Capture-phase
+// listeners on window see the press first. If pointerdown/mousedown lands outside
+// the target, that press and the rest of its sequence are cancelled, so a moved
+// element neither gains focus nor gets clicked. window.__snapbotHit() removes the
+// listeners and reports 'miss' or 'ok'.
+const HIT_TARGET_JS: &str = "function() {
+    // An earlier attempt that failed before its read leaves listeners; drop them.
+    if (typeof window.__snapbotHit === 'function') window.__snapbotHit();
+    const el = this, types = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
+    let miss = false;
+    const h = (e) => {
+        if ((e.type === 'pointerdown' || e.type === 'mousedown') && !e.composedPath().includes(el)) miss = true;
+        if (miss) { e.preventDefault(); e.stopImmediatePropagation(); }
+    };
+    for (const t of types) window.addEventListener(t, h, true);
+    window.__snapbotHit = () => { for (const t of types) window.removeEventListener(t, h, true); delete window.__snapbotHit; return miss ? 'miss' : 'ok'; };
+}";
+
 /// A navigation's final main-frame response, or None (about:blank, same-document).
 pub struct NavResponse {
     pub resp: DocResponse,
@@ -223,6 +241,7 @@ impl Page {
     }
 
     /// ElementHandle.click: scrollIntoViewIfNeeded, clickablePoint, mouse click.
+    /// (See HIT_TARGET_JS for the locator click's landed-on-target check.)
     async fn click_handle(&self, obj: &str) -> Result<()> {
         // A background tab may never deliver IntersectionObserver callbacks;
         // read the viewport synchronously before using the same CDP click quads.
@@ -388,7 +407,22 @@ impl Page {
 
     /// page.locator(selector).setTimeout(t).click().
     pub async fn locator_click(&self, selector: &str, timeout_ms: u64) -> Result<()> {
-        self.with_locator(selector, timeout_ms, |obj| async move { self.click_handle(&obj).await }).await
+        self.with_locator(selector, timeout_ms, |obj| async move {
+            // WHY (route66#4471): the stable-box check can pass and the page can still
+            // shift before the press lands (SDCF phone listing: +138 px mid-tap), so the
+            // press hit whatever moved under the old point. Playwright's hit-target
+            // interceptor, reproduced: a press outside the target is swallowed (no focus,
+            // no click on the wrong element) and the locator retries on a stable box.
+            self.call_on(&obj, HIT_TARGET_JS, vec![]).await?;
+            self.click_handle(&obj).await?;
+            // A click that navigated has no interceptor left to read; nothing missed.
+            let verdict = self.evaluate("typeof window.__snapbotHit === 'function' ? window.__snapbotHit() : 'gone'").await.unwrap_or(None);
+            if verdict == Some(json!("miss")) {
+                bail!("click landed outside {selector}: the element moved under the pointer");
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// page.locator(selector).setTimeout(t).fill(value), with Playwright's
