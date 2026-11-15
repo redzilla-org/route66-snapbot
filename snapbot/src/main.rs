@@ -76,6 +76,7 @@ async fn run() -> Result<()> {
             // WHY (route66 GH #4471): a fresh Lambda sandbox pays Chromium's
             // first-render costs here, in init, not inside its first browse.
             if !h.starts_with("fetch-hop") {
+                pretouch();
                 let args: serde_json::Value = match std::env::var("SNAPBOT_BROWSER_ARGS") {
                     Ok(v) if !v.is_empty() => serde_json::from_str(&v)?,
                     _ => serde_json::json!([]),
@@ -86,6 +87,33 @@ async fn run() -> Result<()> {
         }
         other => anyhow::bail!("unknown command {other:?}"),
     }
+}
+
+/// WHY (route66 GH #4471): in a fresh Lambda sandbox the whole browser
+/// process froze for 2.5-6 s about 1 s into each of its first two pages, every
+/// thread silent, while warm sandboxes never froze. The working cause is the
+/// first touch of guest memory in a new microVM. This touches
+/// SNAPBOT_PRETOUCH_MB (default 2048) of fresh pages on two threads during
+/// init, times it, and frees them back to the guest kernel for Chromium to reuse.
+fn pretouch() {
+    let mb: usize = std::env::var("SNAPBOT_PRETOUCH_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(2048);
+    let started = std::time::Instant::now();
+    let workers: Vec<_> = (0..2)
+        .map(|_| {
+            std::thread::spawn(move || {
+                let mut buf = vec![0u8; mb / 2 * 1024 * 1024];
+                // One write per 4 KiB page; volatile so the stores are kept.
+                for i in (0..buf.len()).step_by(4096) {
+                    unsafe { std::ptr::write_volatile(buf.as_mut_ptr().add(i), 1) };
+                }
+                drop(buf);
+            })
+        })
+        .collect();
+    for w in workers {
+        w.join().expect("pretouch thread");
+    }
+    println!("[init] pretouched {mb} MB in {}ms", started.elapsed().as_millis());
 }
 
 /// Commands that drive pages initialize CEF on the main thread; the rest never
