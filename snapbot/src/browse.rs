@@ -233,6 +233,9 @@ async fn prime_page(page: &Page) -> Result<()> {
     page.type_into("#q", "9213", 0).await?;
     page.key_press("ArrowDown", 0).await?;
     lap("type", &mut t);
+    // The open dropdown covers #cb; the hit-target check (route66#4471) would retry
+    // that click forever. It has rendered, so close it before clicking.
+    page.evaluate("document.getElementById('dd').replaceChildren()").await?;
     page.locator_click("#cb", 60000).await?;
     lap("click", &mut t);
     page.evaluate("window.scrollTo(0, 1200)").await?;
