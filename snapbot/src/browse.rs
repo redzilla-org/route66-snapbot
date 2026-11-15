@@ -160,6 +160,122 @@ pub async fn spare_ready() {
     }
 }
 
+/// A throwaway page that touches the rendering paths a real journey hits:
+/// fixed/3D-composited layers, transitions, shadows, gradients, radii, blur and
+/// opacity, form controls, text in several faces with fallback glyphs, SVG
+/// dashed paths, canvas 2D readback and a decoded image.
+const PRIME_HTML: &str = r##"<!doctype html><html><head><meta charset="utf-8"><style>
+body{margin:0;font:14px/1.4 sans-serif;color:#222}
+header{position:fixed;top:0;left:0;right:0;height:56px;z-index:10;color:#fff;background:linear-gradient(90deg,#123,#468);box-shadow:0 2px 8px rgba(0,0,0,.4)}
+main{padding:64px 16px 16px}
+.card{border-radius:12px;box-shadow:0 4px 16px rgba(0,0,0,.25);background:radial-gradient(circle,#fff,#eef);padding:16px;margin:8px 0}
+.layer{will-change:transform;transform:translate3d(0,0,0);transition:transform .2s,opacity .2s}
+.moved{transform:translate3d(40px,8px,0) scale(1.05);opacity:.7}
+.blur{filter:blur(2px) drop-shadow(2px 2px 2px #000)}
+.dd{position:absolute;top:100%;left:0;right:0;max-height:160px;overflow:auto;background:#fff;border:1px solid #ccc;border-radius:4px;box-shadow:0 6px 12px rgba(0,0,0,.175)}
+.dd div:hover,.dd .on{background:#e8f0fe}
+#map{position:relative;width:640px;height:360px;overflow:hidden;background:#ddd}
+#map>*{position:absolute;left:0;top:0}
+.stripes{height:1600px;background:repeating-linear-gradient(45deg,#eee 0 10px,#fff 10px 20px)}
+</style></head><body>
+<header><b style="font-size:22px">Prime</b> <span style="font-family:serif">serif</span> <i>italic</i></header>
+<main>
+<div style="position:relative;width:420px"><input id="q" type="text" placeholder="City, ZIP or neighborhood" style="width:100%;padding:8px;border:1px solid #888;border-radius:6px"><div class="dd" id="dd"></div></div>
+<p><label><input id="cb" type="checkbox"> check</label> <label><input type="radio" checked> radio</label>
+<select><option>one</option><option>two</option></select> <button>Search</button> <textarea rows="2">text</textarea>
+<input type="range"> <progress value="40" max="100"></progress></p>
+<div class="card layer" id="mv"><b>Bold</b> <span style="font-weight:300">light</span> <span style="font-family:monospace">mono 0123456789</span>
+<span style="font-size:36px">Big</span> <span style="font-size:9px">tiny</span> &#10003; &#9733; &#8230; &#8364; &#9662; &#26085;&#26412; &#128512;</div>
+<div id="map" class="layer"><img id="img" width="256" height="256" style="transform:translate3d(16px,16px,0)">
+<svg width="640" height="360"><path d="M20 20 L260 60 L200 320 Z" fill="#3388ff" fill-opacity=".2" stroke="#3388ff" stroke-width="3" stroke-dasharray="5,5" stroke-linejoin="round"/>
+<circle cx="400" cy="180" r="60" fill="none" stroke="#e33" stroke-width="2"/><text x="300" y="40">svg text</text></svg>
+<canvas id="c2d" width="320" height="180" style="left:320px;top:180px"></canvas></div>
+<div class="card blur">blurred shadowed card</div>
+<div class="stripes"></div>
+</main>
+<script>
+const c = document.getElementById('c2d').getContext('2d', {willReadFrequently: true});
+c.fillStyle = '#4a4'; c.fillRect(0, 0, 320, 180);
+c.strokeStyle = '#00f'; c.lineWidth = 4; c.setLineDash([6, 4]); c.beginPath(); c.arc(160, 90, 60, 0, 6.283); c.stroke();
+c.font = 'bold 20px sans-serif'; c.fillStyle = '#000'; c.fillText('canvas', 120, 96);
+c.getImageData(0, 0, 320, 180);
+const t = document.createElement('canvas'); t.width = t.height = 256;
+const tc = t.getContext('2d'); tc.fillStyle = tc.createLinearGradient(0, 0, 256, 256); tc.fillRect(0, 0, 256, 256);
+document.getElementById('img').src = t.toDataURL('image/png');
+const dd = document.getElementById('dd');
+document.getElementById('q').addEventListener('input', e => {
+  dd.innerHTML = Array.from({length: 12}, (_, i) => '<div' + (i ? '' : ' class="on"') + '>' + e.target.value + ' Neighborhood ' + i + ' (9201' + i + ')</div>').join('');
+  document.getElementById('mv').classList.toggle('moved');
+});
+let n = 0; const tick = () => { if (++n < 12) requestAnimationFrame(tick); else window.__primed = true; }; requestAnimationFrame(tick);
+</script></body></html>"##;
+
+/// Render PRIME_HTML in its own context at the desktop and a phone viewport,
+/// type into its input, scroll and capture it, then dispose the context.
+async fn prime_page(page: &Page) -> Result<()> {
+    let url = format!("data:text/html;base64,{}", base64::engine::general_purpose::STANDARD.encode(PRIME_HTML));
+    let mut phases = Map::new();
+    let mut t = Instant::now();
+    let mut lap = |name: &str, t: &mut Instant| {
+        phases.insert(name.to_string(), json!(t.elapsed().as_millis() as u64));
+        *t = Instant::now();
+    };
+    page.set_viewport(1366, 900).await?;
+    page.goto(&url, "load", 60000).await?;
+    lap("load", &mut t);
+    page.poll("window.__primed === true", &Value::Null, 60000, "prime: frames never ran").await?;
+    lap("frames", &mut t);
+    page.locator_fill("#q", "92014", 60000).await?;
+    lap("first_fill", &mut t);
+    page.locator_fill("#q", "", 60000).await?;
+    page.type_into("#q", "9213", 0).await?;
+    page.key_press("ArrowDown", 0).await?;
+    lap("type", &mut t);
+    // The open dropdown covers #cb; the hit-target check (route66#4471) would retry
+    // that click forever. It has rendered, so close it before clicking.
+    page.evaluate("document.getElementById('dd').replaceChildren()").await?;
+    page.locator_click("#cb", 60000).await?;
+    lap("click", &mut t);
+    page.evaluate("window.scrollTo(0, 1200)").await?;
+    page.screenshot(false).await?;
+    lap("viewport_shot", &mut t);
+    page.screenshot(true).await?;
+    lap("full_shot", &mut t);
+    page.set_viewport(390, 844).await?;
+    page.evaluate("window.scrollTo(0, 0)").await?;
+    page.screenshot(false).await?;
+    lap("phone_shot", &mut t);
+    println!("[browse] prime phases ms {}", Value::Object(phases));
+    Ok(())
+}
+
+/// WHY (route66 GH #4471/#4483): a fresh CommandCenterSnapbot-app sandbox
+/// stalled 5-8 s on its first browse's first input while the page's JS sat
+/// idle; warm sandboxes never did (35 of 40 fresh over the 4000 ms step
+/// budget, 0 of 120 warm). The measured cause was SwiftShader's per-pipeline JIT,
+/// gone since cefhost runs with --disable-gpu; Chromium's first frames
+/// still pay smaller one-time costs (renderer, font and decode setup) that
+/// warm() alone, building an about:blank page, never triggers. Paying them here, during Lambda init and before the
+/// first poll, leaves no request to pay them inside a step's budget. The
+/// throwaway context is disposed and never counted as served.
+pub async fn prime(extra: &Value) -> Result<()> {
+    let started = Instant::now();
+    let args = parse_browser_args(Some(extra))?;
+    {
+        let mut st = pool().lock().await;
+        ensure_browser(&mut st, &args).await?;
+    }
+    let context = browser::create_context().await?;
+    let page = browser::new_page(Some(&context)).await?;
+    let primed = prime_page(&page).await;
+    drop(page);
+    browser::dispose_context(&context).await?;
+    primed.map_err(|e| anyhow!("prime: {e:#}"))?;
+    warm(extra).await?;
+    println!("[browse] primed in {}ms", started.elapsed().as_millis());
+    Ok(())
+}
+
 struct Ctx {
     viewport: (i64, i64),
     intercept: Option<Intercept>,

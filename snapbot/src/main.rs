@@ -73,15 +73,15 @@ async fn run() -> Result<()> {
         "" | "index.handler" | "fetch-hop.handler" => {
             let h = if arg.is_empty() { handler } else { arg };
             init(&h)?;
-            // WHY (route66 GH #4471): the browser launch and first spare context
-            // happen in init, so a fresh sandbox's first request starts warm.
+            // WHY (route66 GH #4471): a fresh Lambda sandbox pays Chromium's
+            // first-render costs here, in init, not inside its first browse.
             if !h.starts_with("fetch-hop") {
                 spawn_sampler();
                 let args: serde_json::Value = match std::env::var("SNAPBOT_BROWSER_ARGS") {
                     Ok(v) if !v.is_empty() => serde_json::from_str(&v)?,
                     _ => serde_json::json!([]),
                 };
-                browse::warm(&args).await?;
+                browse::prime(&args).await?;
             }
             runtime::run(h).await
         }
