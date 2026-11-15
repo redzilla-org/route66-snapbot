@@ -76,7 +76,7 @@ async fn run() -> Result<()> {
             // WHY (route66 GH #4471): a fresh Lambda sandbox pays Chromium's
             // first-render costs here, in init, not inside its first browse.
             if !h.starts_with("fetch-hop") {
-                pretouch();
+                spawn_sampler();
                 let args: serde_json::Value = match std::env::var("SNAPBOT_BROWSER_ARGS") {
                     Ok(v) if !v.is_empty() => serde_json::from_str(&v)?,
                     _ => serde_json::json!([]),
@@ -89,31 +89,66 @@ async fn run() -> Result<()> {
     }
 }
 
-/// WHY (route66 GH #4471): in a fresh Lambda sandbox the whole browser
-/// process froze for 2.5-6 s about 1 s into each of its first two pages, every
-/// thread silent, while warm sandboxes never froze. The working cause is the
-/// first touch of guest memory in a new microVM. This touches
-/// SNAPBOT_PRETOUCH_MB (default 2048) of fresh pages on two threads during
-/// init, times it, and frees them back to the guest kernel for Chromium to reuse.
-fn pretouch() {
-    let mb: usize = std::env::var("SNAPBOT_PRETOUCH_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(2048);
-    let started = std::time::Instant::now();
-    let workers: Vec<_> = (0..2)
-        .map(|_| {
-            std::thread::spawn(move || {
-                let mut buf = vec![0u8; mb / 2 * 1024 * 1024];
-                // One write per 4 KiB page; volatile so the stores are kept.
-                for i in (0..buf.len()).step_by(4096) {
-                    unsafe { std::ptr::write_volatile(buf.as_mut_ptr().add(i), 1) };
-                }
-                drop(buf);
-            })
-        })
-        .collect();
-    for w in workers {
-        w.join().expect("pretouch thread");
+/// WHY (route66 GH #4471, diagnostic): a fresh Lambda sandbox's browser freezes
+/// 2.5-6 s about 1 s into each of its first two pages, all threads silent in
+/// the log; pre-touching 2 GB of memory (e626f26, 0.6-1 s) did not change it.
+/// For SNAPBOT_SAMPLE_SECS (default 40) after start this logs, every 500 ms,
+/// the sandbox's iowait/steal ticks and its busiest threads (comm, state, CPU
+/// ticks in the window) across every process, so the frozen window shows what
+/// is running, blocked in D state, or descheduled.
+fn spawn_sampler() {
+    let secs: u64 = std::env::var("SNAPBOT_SAMPLE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(40);
+    if secs == 0 {
+        return;
     }
-    println!("[init] pretouched {mb} MB in {}ms", started.elapsed().as_millis());
+    std::thread::spawn(move || {
+        use std::collections::HashMap;
+        let started = std::time::Instant::now();
+        let read = |p: &str| std::fs::read_to_string(p).unwrap_or_default();
+        // /proc/stat cpu line: user nice system idle iowait irq softirq steal
+        let cpu = || -> Vec<u64> { read("/proc/stat").lines().next().unwrap_or("").split_whitespace().skip(1).filter_map(|v| v.parse().ok()).collect() };
+        let threads = || -> HashMap<String, (String, String, u64)> {
+            let mut out = HashMap::new();
+            for p in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+                let pid = p.file_name().to_string_lossy().to_string();
+                if !pid.chars().all(|c| c.is_ascii_digit()) {
+                    continue;
+                }
+                for t in std::fs::read_dir(format!("/proc/{pid}/task")).into_iter().flatten().flatten() {
+                    let tid = t.file_name().to_string_lossy().to_string();
+                    let stat = read(&format!("/proc/{pid}/task/{tid}/stat"));
+                    // comm is parenthesised and may hold spaces; fields resume after ')'.
+                    let (Some(l), Some(r)) = (stat.find('('), stat.rfind(')')) else { continue };
+                    let comm = stat[l + 1..r].to_string();
+                    let f: Vec<&str> = stat.get(r + 2..).unwrap_or("").split_whitespace().collect();
+                    let ticks = f.get(11).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0) + f.get(12).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+                    out.insert(format!("{pid}/{tid}"), (comm, f.first().unwrap_or(&"?").to_string(), ticks));
+                }
+            }
+            out
+        };
+        let mut last_cpu = cpu();
+        let mut last = threads();
+        while started.elapsed().as_secs() < secs {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let c = cpu();
+            let d = |i: usize| c.get(i).unwrap_or(&0).saturating_sub(*last_cpu.get(i).unwrap_or(&0));
+            let now = threads();
+            let mut busy: Vec<(u64, String)> = now
+                .iter()
+                .map(|(k, (comm, st, t))| (t.saturating_sub(last.get(k).map(|x| x.2).unwrap_or(0)), format!("{comm}[{k}]{st}")))
+                .filter(|(dt, s)| *dt > 0 || s.ends_with('D'))
+                .collect();
+            busy.sort_by(|a, b| b.0.cmp(&a.0));
+            let top: Vec<String> = busy.iter().take(5).map(|(dt, s)| format!("{s}:{dt}")).collect();
+            println!(
+                "[sample +{}ms] user={} sys={} idle={} iowait={} steal={} top={}",
+                started.elapsed().as_millis(), d(0) + d(1), d(2), d(3), d(4), d(7), top.join(" ")
+            );
+            last_cpu = c;
+            last = now;
+        }
+    });
 }
 
 /// Commands that drive pages initialize CEF on the main thread; the rest never
