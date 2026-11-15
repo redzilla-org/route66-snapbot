@@ -163,7 +163,7 @@ pub async fn spare_ready() {
 /// A throwaway page that touches the rendering paths a real journey hits:
 /// fixed/3D-composited layers, transitions, shadows, gradients, radii, blur and
 /// opacity, form controls, text in several faces with fallback glyphs, SVG
-/// dashed paths, canvas 2D readback, a decoded image and a WebGL draw.
+/// dashed paths, canvas 2D readback and a decoded image.
 const PRIME_HTML: &str = r##"<!doctype html><html><head><meta charset="utf-8"><style>
 body{margin:0;font:14px/1.4 sans-serif;color:#222}
 header{position:fixed;top:0;left:0;right:0;height:56px;z-index:10;color:#fff;background:linear-gradient(90deg,#123,#468);box-shadow:0 2px 8px rgba(0,0,0,.4)}
@@ -189,7 +189,7 @@ main{padding:64px 16px 16px}
 <div id="map" class="layer"><img id="img" width="256" height="256" style="transform:translate3d(16px,16px,0)">
 <svg width="640" height="360"><path d="M20 20 L260 60 L200 320 Z" fill="#3388ff" fill-opacity=".2" stroke="#3388ff" stroke-width="3" stroke-dasharray="5,5" stroke-linejoin="round"/>
 <circle cx="400" cy="180" r="60" fill="none" stroke="#e33" stroke-width="2"/><text x="300" y="40">svg text</text></svg>
-<canvas id="c2d" width="320" height="180" style="left:320px;top:180px"></canvas><canvas id="gl" width="128" height="128" style="left:500px"></canvas></div>
+<canvas id="c2d" width="320" height="180" style="left:320px;top:180px"></canvas></div>
 <div class="card blur">blurred shadowed card</div>
 <div class="stripes"></div>
 </main>
@@ -202,8 +202,6 @@ c.getImageData(0, 0, 320, 180);
 const t = document.createElement('canvas'); t.width = t.height = 256;
 const tc = t.getContext('2d'); tc.fillStyle = tc.createLinearGradient(0, 0, 256, 256); tc.fillRect(0, 0, 256, 256);
 document.getElementById('img').src = t.toDataURL('image/png');
-const g = document.getElementById('gl').getContext('webgl');
-if (g) { g.clearColor(0.2, 0.4, 0.6, 1); g.clear(g.COLOR_BUFFER_BIT); }
 const dd = document.getElementById('dd');
 document.getElementById('q').addEventListener('input', e => {
   dd.innerHTML = Array.from({length: 12}, (_, i) => '<div' + (i ? '' : ' class="on"') + '>' + e.target.value + ' Neighborhood ' + i + ' (9201' + i + ')</div>').join('');
@@ -255,7 +253,7 @@ async fn prime_page(page: &Page) -> Result<()> {
 /// stalled 5-8 s on its first browse's first input while the page's JS sat
 /// idle; warm sandboxes never did (35 of 40 fresh over the 4000 ms step
 /// budget, 0 of 120 warm). The measured cause was SwiftShader's per-pipeline JIT,
-/// now kept off the page path by cefhost's switches; Chromium's first frames
+/// gone since cefhost runs with --disable-gpu; Chromium's first frames
 /// still pay smaller one-time costs (renderer, font and decode setup) that
 /// warm() alone, building an about:blank page, never triggers. Paying them here, during Lambda init and before the
 /// first poll, leaves no request to pay them inside a step's budget. The
