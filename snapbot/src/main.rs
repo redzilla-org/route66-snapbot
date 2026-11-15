@@ -92,12 +92,14 @@ async fn run() -> Result<()> {
 /// WHY (route66 GH #4471, diagnostic): a fresh Lambda sandbox's browser freezes
 /// 2.5-6 s about 1 s into each of its first two pages, all threads silent in
 /// the log; pre-touching 2 GB of memory (e626f26, 0.6-1 s) did not change it.
-/// For SNAPBOT_SAMPLE_SECS (default 40) after start this logs, every 500 ms,
+/// It showed one browser thread at 100% for 4-6 s: SwiftShader's pipeline JIT
+/// (see cefhost base_switches). Opt-in now (SNAPBOT_SAMPLE_SECS, default 0).
+/// For SNAPBOT_SAMPLE_SECS after start this logs, every 500 ms,
 /// the sandbox's iowait/steal ticks and its busiest threads (comm, state, CPU
 /// ticks in the window) across every process, so the frozen window shows what
 /// is running, blocked in D state, or descheduled.
 fn spawn_sampler() {
-    let secs: u64 = std::env::var("SNAPBOT_SAMPLE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(40);
+    let secs: u64 = std::env::var("SNAPBOT_SAMPLE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     if secs == 0 {
         return;
     }

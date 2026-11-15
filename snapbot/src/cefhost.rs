@@ -174,6 +174,16 @@ fn base_switches() -> Vec<String> {
         "--use-gl=angle",
         "--use-angle=swiftshader",
         "--enable-unsafe-swiftshader",
+        // WHY (route66 GH #4471): page pixels never go through SwiftShader. On
+        // arm64 SwiftShader JIT-compiles (LLVM) every new GPU pipeline once per
+        // process on one thread; a fresh Lambda sandbox's first page held that
+        // thread at 100% for 4-6 s and every frame and input waited on it (a
+        // per-thread sampler in the CommandCenterSnapbot-app log, 845ffae).
+        // Compositing, tile raster and 2D canvas run in software; WebGL alone
+        // still gets SwiftShader.
+        "--disable-gpu-compositing",
+        "--disable-gpu-rasterization",
+        "--disable-accelerated-2d-canvas",
     ]
     .iter()
     .map(|s| s.to_string())

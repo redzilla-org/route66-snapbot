@@ -251,10 +251,10 @@ async fn prime_page(page: &Page) -> Result<()> {
 /// WHY (route66 GH #4471/#4483): a fresh CommandCenterSnapbot-app sandbox
 /// stalled 5-8 s on its first browse's first input while the page's JS sat
 /// idle; warm sandboxes never did (35 of 40 fresh over the 4000 ms step
-/// budget, 0 of 120 warm). Chromium's first frames in a process pay one-time
-/// costs (the GPU thread's SwiftShader pipeline JIT, raster/compositor
-/// programs, font and decode setup) that warm() alone, building an about:blank
-/// page, never triggers. Paying them here, during Lambda init and before the
+/// budget, 0 of 120 warm). The measured cause was SwiftShader's per-pipeline JIT,
+/// now kept off the page path by cefhost's switches; Chromium's first frames
+/// still pay smaller one-time costs (renderer, font and decode setup) that
+/// warm() alone, building an about:blank page, never triggers. Paying them here, during Lambda init and before the
 /// first poll, leaves no request to pay them inside a step's budget. The
 /// throwaway context is disposed and never counted as served.
 pub async fn prime(extra: &Value) -> Result<()> {
