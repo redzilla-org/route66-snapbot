@@ -83,6 +83,11 @@ pub async fn new_page(context: Option<&str>) -> Result<Page> {
     Page::attach(handle, rx).await
 }
 
+/// Close one page, leaving its context (cookie jar, cache, connections) open.
+pub async fn close_page(page: &Page) -> Result<()> {
+    cefhost::close_page(page.handle.id).await
+}
+
 /// A document response the main frame received for one loader.
 #[derive(Clone, Debug)]
 pub struct DocResponse {
@@ -240,6 +245,9 @@ pub struct PageState {
     pub failed_requests: Vec<Value>,
     pub http_errors: Vec<Value>,
     pub crashed: bool,
+    /// Every http(s) origin a frame of this page navigated to, main or child;
+    /// the request's storage is cleared for exactly these (route66 GH #4471).
+    pub origins: HashSet<String>,
 }
 
 /// The tallest CEF view a single CDP screenshot captures. A taller document
@@ -386,6 +394,11 @@ impl Page {
 
     pub fn url(&self) -> String {
         self.state.lock().unwrap().url.clone()
+    }
+
+    /// The http(s) origins this page's frames navigated to.
+    pub fn visited_origins(&self) -> Vec<String> {
+        self.state.lock().unwrap().origins.iter().cloned().collect()
     }
 
     /// Wait until `cond` holds over the page state, or the deadline passes.
@@ -734,6 +747,11 @@ fn apply_event(st: &mut PageState, method: &str, p: &Value) {
     match method {
         "Page.frameNavigated" => {
             let f = &p["frame"];
+            // WHY: securityOrigin is the frame's storage origin; opaque ("null") and about: are not.
+            let origin = s(f, "securityOrigin");
+            if origin.starts_with("http://") || origin.starts_with("https://") {
+                st.origins.insert(origin);
+            }
             if f.get("parentId").is_none() {
                 st.main_frame = s(f, "id");
                 st.url = format!("{}{}", s(f, "url"), s(f, "urlFragment"));

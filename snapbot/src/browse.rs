@@ -3,14 +3,17 @@
 //! Owner directives 2026-09-26: "snapbot daemon should host the playwright
 //! browser sessions exclusively", "snapbot receives a complete browsing request
 //! as a lambda call" and "delegate to snapbot which can stay up as a permanent
-//! pool along with kumo". The browser is launched once per process lifetime and
-//! a fresh context+page is PRE-CREATED while the process is idle, so a request
-//! pays only its own navigation and steps.
+//! pool along with kumo". The browser and ONE browsing context are set up once,
+//! during init (route66 GH #4471, owner: "one context built in init", "two clear
+//! calls, keep HTTP cache"). The context keeps DNS, connections, TLS sessions,
+//! HSTS and the HTTP cache warm across requests. Each request gets its own page,
+//! so sessionStorage, init scripts, interception and the document start empty.
+//! After the request, cookies and every visited origin's storage are cleared
+//! and the page is closed.
 //!
-//! ONE REQUEST AT A TIME PER PROCESS (the Lambda contract). A spare context is
-//! built only after the previous request's context is closed, so no context is
-//! driving pages while the next one is created (route66 GH #4040: doing so
-//! hangs the browser).
+//! ONE REQUEST AT A TIME PER PROCESS (the Lambda contract). A page is created
+//! only after the previous request's page is closed, so no page is driving
+//! while the next one is created (route66 GH #4040: doing so hangs the browser).
 //!
 //! Snapbot captures; the caller judges. The contract (request and result
 //! shapes, the op set, if_ok/if_failed, clocks) is the former browse.js's.
@@ -27,7 +30,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
 
 const MAX_STEPS: usize = 200;
 const MAX_STEP_TIMEOUT_MS: f64 = 120000.0;
@@ -39,17 +41,10 @@ const OPS: [&str; 21] = [
     "start_clock",
 ];
 
-struct Spare {
-    context: String,
-    page: Page,
-}
-
 #[derive(Default)]
 struct PoolState {
     browser: Option<Browser>,
     args_key: Option<String>,
-    spare: Option<Spare>,
-    building: Option<JoinHandle<Result<Spare>>>,
     launches: u64,
     served: u64,
 }
@@ -85,10 +80,6 @@ async fn ensure_browser(st: &mut PoolState, extra: &[String]) -> Result<()> {
         } else {
             eprintln!("[browse] browser disconnected; relaunching it");
         }
-        if let Some(t) = st.building.take() {
-            t.abort();
-        }
-        st.spare = None;
         if let Some(old) = st.browser.take() {
             old.close().await;
         }
@@ -102,62 +93,32 @@ async fn ensure_browser(st: &mut PoolState, extra: &[String]) -> Result<()> {
     Ok(())
 }
 
-async fn build_spare() -> Result<Spare> {
-    let context = browser::create_context().await?;
-    let page = browser::new_page(Some(&context)).await?;
-    Ok(Spare { context, page })
-}
+/// The one browsing context every request's page opens in. cefhost creates a
+/// CEF request context the first time a page names it; dispose_context forgets
+/// it, so the next page opens a new one under the same name.
+const REQUEST_CONTEXT: &str = "request";
 
-fn schedule_spare(st: &mut PoolState) {
-    if st.browser.is_some() {
-        st.building = Some(tokio::spawn(build_spare()));
-    }
-}
-
-async fn take_spare(st: &mut PoolState) -> Result<Spare> {
-    if st.spare.is_none() {
-        if let Some(t) = st.building.take() {
-            match t.await {
-                Ok(Ok(s)) => st.spare = Some(s),
-                Ok(Err(e)) => eprintln!("[browse] spare context build failed: {e:#}"),
-                Err(e) => eprintln!("[browse] spare context build failed: {e}"),
-            }
-        }
-    }
-    if let Some(s) = st.spare.take() {
-        return Ok(s);
-    }
-    st.browser.as_ref().ok_or_else(|| anyhow!("no browser"))?;
-    build_spare().await.map_err(|e| anyhow!("no browser context could be built for this request: {e:#}"))
-}
-
-/// Launch the browser and build the first spare before the lane polls, so no
-/// request ever lands on a cold process.
+/// Launch the browser and open the one context during init, so no request
+/// pays either.
 pub async fn warm(extra: &Value) -> Result<()> {
     let extra = parse_browser_args(Some(extra))?;
     let mut st = pool().lock().await;
     ensure_browser(&mut st, &extra).await?;
-    let spare = take_spare(&mut st).await.map_err(|e| anyhow!("warm: first spare context could not be built: {e:#}"))?;
-    st.spare = Some(spare);
+    // WHY: opening and closing one page creates the CEF request context now, in init.
+    let page = browser::new_page(Some(REQUEST_CONTEXT)).await.map_err(|e| anyhow!("warm: the browsing context could not be opened: {e:#}"))?;
+    browser::close_page(&page).await?;
     Ok(())
 }
 
-/// Join the spare scheduled at release, before the lane polls for more work.
-/// WHY (route66 GH #4463): a lane that polled while its spare was still being
-/// built handed the next request a page created moments earlier; that request
-/// paid the build in acquire_ms and a cold first navigate (ack > 700ms on 123
-/// of 807 such California requests, about 2% on a ready spare). The reply is
-/// already posted, so no request waits on this build. A failed build is left
-/// to take_spare's own in-request fallback.
-pub async fn spare_ready() {
-    let mut st = pool().lock().await;
-    if let Some(t) = st.building.take() {
-        match t.await {
-            Ok(Ok(s)) => st.spare = Some(s),
-            Ok(Err(e)) => eprintln!("[browse] spare context build failed: {e:#}"),
-            Err(e) => eprintln!("[browse] spare context build failed: {e}"),
-        }
+/// Clear what one request could leave for the next: the context's cookie jar,
+/// and every visited origin's storage (localStorage, IndexedDB, Cache Storage,
+/// service workers). The HTTP cache stays warm, by owner order.
+async fn clear_request_state(page: &Page) -> Result<()> {
+    page.send("Network.clearBrowserCookies", json!({})).await?;
+    for origin in page.visited_origins() {
+        page.send("Storage.clearDataForOrigin", json!({"origin": origin, "storageTypes": "all"})).await?;
     }
+    Ok(())
 }
 
 /// A throwaway page that touches the rendering paths a real journey hits:
@@ -786,8 +747,8 @@ pub async fn browse(event: &Value) -> Result<Value> {
     Ok(out)
 }
 
-/// Run `f` on this process's pooled page: acquire the pre-built context+page,
-/// then release it (close the context, build the next spare in the background).
+/// Run `f` on a new page in this process's one context, then clear the
+/// request's cookies and origin storage and close the page.
 /// Every capture -- a browse request or an evidence screenshot -- goes through
 /// here, so there is one browser path. Returns f's result and the worker facts.
 pub async fn with_page<T, F, Fut>(browser_args: &[String], f: F) -> Result<(T, Value)>
@@ -810,28 +771,28 @@ where
 {
     let acquire_start = Instant::now();
     crate::runtime::diagnostic_phase("page-acquire");
-    let spare = {
+    let page = {
         let mut st = pool().lock().await;
         ensure_browser(&mut st, browser_args).await?;
-        take_spare(&mut st).await?
+        browser::new_page(Some(REQUEST_CONTEXT)).await.map_err(|e| anyhow!("no page could be opened for this request: {e:#}"))?
     };
     let acquire_ms = acquire_start.elapsed().as_millis() as u64;
     // Shared so tasks f spawns on the page (a capture's click and navigation
-    // waiters) may outlive f; the context close ends them.
-    let page = Arc::new(spare.page);
+    // waiters) may outlive f; the page close ends them.
+    let page = Arc::new(page);
     crate::runtime::diagnostic_phase("page-acquired");
     let result = f(page.clone(), acquire_ms).await;
 
     crate::runtime::diagnostic_phase("page-cleanup");
     let mut st = pool().lock().await;
-    if st.browser.is_some() {
-        // Closing the context closes its page and ends the page's event stream.
-        if let Err(e) = browser::dispose_context(&spare.context).await {
+    // WHY: a context whose state could not be cleared is dropped whole, so
+    // nothing from this request can reach the next; the next page opens a new one.
+    let cleared = clear_request_state(&page).await.and(browser::close_page(&page).await);
+    if let Err(e) = cleared {
+        eprintln!("[browse] request state clear or page close failed, dropping the context: {e:#}");
+        if let Err(e) = browser::dispose_context(REQUEST_CONTEXT).await {
             eprintln!("[browse] context close failed: {e:#}");
         }
-    }
-    if st.browser.as_ref().is_some_and(Browser::connected) {
-        schedule_spare(&mut st);
     }
     if result.is_ok() {
         st.served += 1;

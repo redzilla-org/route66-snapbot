@@ -578,6 +578,26 @@ pub async fn dispose_context(context: &str) -> Result<()> {
     Ok(())
 }
 
+/// Close one page's browser and wait for it; its request context stays open.
+pub async fn close_page(id: i32) -> Result<()> {
+    let wait = ui_call(move || {
+        // Collect first: close_browser may run OnBeforeClose re-entrantly,
+        // which edits the same registry.
+        let host = UI.with(|u| u.borrow().browsers.get(&id).and_then(|b| b.browser.host()));
+        host.map(|h| {
+            let (tx, rx) = oneshot::channel();
+            hub().closed.lock().unwrap().insert(id, tx);
+            h.close_browser(1);
+            rx
+        })
+    })
+    .await?;
+    if let Some(w) = wait {
+        tokio::time::timeout(Duration::from_secs(10), w).await.map_err(|_| anyhow!("page {id} did not close within 10s"))?.ok();
+    }
+    Ok(())
+}
+
 /// Whether a page's browser is still open.
 pub fn session_open(id: i32) -> bool {
     hub().sessions.lock().unwrap().contains_key(&id)
