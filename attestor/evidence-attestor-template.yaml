@@ -130,7 +130,9 @@ Resources:
       # route66#4479 (2026-11-14 clone benchmark, 1110 calls): CPU-bound (361 ms IO floor
       # + 2501 ms/vCPU, R2 0.984), max memory 1050 MB. 2560 is the lowest warm GB-s/call;
       # 7076 cost 1.52x per call. Paired with route66 browseplan.go snapbotPoolWidth 10.
-      MemorySize: 2560
+      # route66#4479 sec. 5 (owner 2026-11-14, "just bump it"): 2560 (~1.45 vCPU) left
+      # california-dev browse checks flaking on the 4000 ms ceiling; 3538 = 2 x 1769 MB = 2 vCPU.
+      MemorySize: 3538
       EphemeralStorage:
         Size: 1024
       # route66#4470: Graviton, ~20% cheaper per GB-s; image built natively by
