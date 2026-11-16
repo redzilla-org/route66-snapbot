@@ -557,13 +557,14 @@ async fn screenshot_step(step: &Step, page: &Page, armed: Option<crate::cefhost:
     }
     inspect_spec["resolved_regions"] = json!(resolved);
 
-    // Freeze the painted view (route66 GH #4486). An armed image froze on the
-    // first paint after its step completed. An unarmed one (first in a
-    // request, after another image, or after a skipped step) freezes on the
-    // first paint after an invalidate, never the last delivered frame: that
-    // froze a document's first paint (local-verify 20261116T070021Z
-    // california/CTH/workflow-saved-search-newsfeed). No paint within the
-    // deadline is the unarmed twin of the armed "never swapped" error.
+    // The image is one CDP surface capture (route66 GH #4486). An armed image
+    // was captured when its step completed. An unarmed one (first in a
+    // request, after another image, or after a skipped step) is captured now.
+    // Both replace OSR view copies that froze stale frames (local-verify
+    // 20261116T070021Z california/CTH/workflow-saved-search-newsfeed) and
+    // composites (20261116T072458Z california/DMV/
+    // map-picker-unobscured-centering). No reply within the deadline is the
+    // unarmed twin of the armed "surface capture never returned" error.
     let t = Instant::now();
     let frozen = match armed {
         Some(f) => f,
@@ -571,7 +572,7 @@ async fn screenshot_step(step: &Step, page: &Page, armed: Option<crate::cefhost:
             Ok(r) => r?,
             Err(_) => {
                 page.disarm();
-                bail!("screenshot not painted within its {SCREENSHOT_TIMEOUT_MS}ms deadline (unarmed capture never swapped)");
+                bail!("screenshot not captured within its {SCREENSHOT_TIMEOUT_MS}ms deadline (unarmed surface capture never returned)");
             }
         },
     };
@@ -580,10 +581,9 @@ async fn screenshot_step(step: &Step, page: &Page, armed: Option<crate::cefhost:
     let url = page.url();
     // WHY (route66 GH #4082, owner 2026-10-07: "log the OCR timings"; GH #4486):
     // only unsigned numbers, route66's harness decodes timings as map[string]uint64.
-    let mut timings = json!({"fns_ms": fns_ms, "capture_ms": capture_ms, "tiles": 0, "frame_bytes": frame.height * frame.stride,
-                             "freeze_copy_ms": frozen.freeze_copy_ms, "freeze_copy_bytes": frozen.freeze_copy_bytes,
-                             "shot_copy_bytes": 0, "paints": frozen.paints, "paint_copy_bytes": frozen.paint_bytes,
-                             "ready_to_paint_ms": frozen.ready_to_paint_ms});
+    let mut timings = json!({"fns_ms": fns_ms, "capture_ms": capture_ms, "tiles": 1, "frame_bytes": frame.height * frame.stride,
+                             "ready_to_capture_ms": frozen.ready_to_capture_ms, "decode_ms": frozen.decode_ms,
+                             "png_bytes": frozen.png_bytes});
     let timings_ready_by = frozen.ready_by;
     // The three readers (PNG encode+store, OCR, inspect) run in parallel on the
     // frozen frame while the page's next browser step runs (owner 2026-11-16:
@@ -659,19 +659,19 @@ async fn run_step(step: &Step, page: &Page, ctx: &mut RunCtx) -> Result<Option<V
         }
     };
     let deadline = if step.op == "goto" { t.unwrap_or(ctx.navigation_timeout) } else { t.unwrap_or(ctx.default_timeout) };
-    // A step whose image follows completes on the swapping paint: the first
-    // paint after its completing message (route66 GH #4486). A step whose
-    // completion is not one CDP message makes the capture ready on return.
+    // A step whose image follows completes on its surface capture, sent at
+    // its completing message (route66 GH #4486). A step whose completion is
+    // not one CDP message makes the capture ready on return.
     if let Some(rx) = ctx.armed.take() {
-        // A goto freezes only on its lifecycle events and paint; any other
-        // step not completed by its matched reply freezes now (no-op if done).
+        // A goto captures only on its lifecycle events; any other step not
+        // completed by its matched reply captures now (no-op if done).
         if !matches!(step.op.as_str(), "goto" | "wait_for_function" | "wait_for_selector" | "wait_for_render") {
             page.ready_posted();
         }
         let w = Instant::now();
         let frozen = tokio::time::timeout(Duration::from_millis(deadline), rx)
             .await
-            .map_err(|_| anyhow!("{} result not painted within its {deadline}ms deadline (armed capture never swapped)", step.op))?
+            .map_err(|_| anyhow!("{} result not captured within its {deadline}ms deadline (armed surface capture never returned)", step.op))?
             .map_err(|_| anyhow!("{}'s armed capture was dropped", step.op))??;
         ctx.paint_wait_ms = Some(w.elapsed().as_millis() as u64);
         ctx.frozen = Some(frozen);
@@ -774,9 +774,9 @@ async fn run_step_op(step: &Step, page: &Page, ctx: &mut RunCtx, t: Option<u64>)
         }
         "evaluate" => {
             let expr = call_expr(step.raw.get("fn"), step.raw.get("arg"))?;
-            // An evaluate whose image follows freezes the view on its reply, so
-            // the reply waits two animation frames: a frame produced after every
-            // DOM change made before it (route66 local-verify 2026-11-15 20:42 PT
+            // An evaluate whose image follows is captured on its reply, so
+            // the reply waits two animation frames: every DOM change made
+            // before it is committed (route66 local-verify 2026-11-15 20:42 PT
             // froze spinners on CTH search-result-page-2 after its card wait held).
             if ctx.armed.is_some() {
                 page.evaluate(&format!("(async () => {{ const v = await ({expr}); await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))); return v; }})()")).await

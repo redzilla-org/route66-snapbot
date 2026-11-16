@@ -463,7 +463,7 @@ async fn capture_with(
     phase("settle", &format!("wait-ms={wait_ms}"));
     phase("screenshot-start", &format!("full-page={full_page}"));
     // A full-page evidence shot is the whole document, whose height is not
-    // known before capture; a viewport shot reads the painted view.
+    // known before capture; a viewport shot is one CDP surface capture (freeze).
     let shot = async { if full_page { page.screenshot_document().await } else { page.freeze(false).await.map(|f| crate::browser::Shot { frame: f.frame, tiles: 0, timings: Default::default() }) } };
     let shot = tokio::time::timeout(Duration::from_secs(30), shot)
         .await

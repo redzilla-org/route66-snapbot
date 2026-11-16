@@ -4,8 +4,9 @@
 //! The rendering switches live in cefhost (they reproduce the former puppeteer +
 //! @sparticuz/chromium argv). This module keeps the page-level contract the
 //! browse ops are written against: CDP commands, lifecycle/network/console state,
-//! request interception, and the screenshot: the painted OSR view copied into
-//! the raw BGRA frame OCR, inspection and the PNG writer share.
+//! request interception, and the screenshot: the compositor surface captured
+//! through CDP and decoded into the raw BGRA frame OCR, inspection and the PNG
+//! writer share.
 
 use crate::cefhost::{self, Event, PageHandle};
 use crate::js;
@@ -550,15 +551,20 @@ impl Page {
         Ok(())
     }
 
-    /// Freeze the view for an image (cefhost::freeze) on the first paint after
-    /// an invalidate: `full_page` is the whole capture view, its top row at
-    /// the current scroll position; otherwise the top viewport-height rows. No
-    /// CDP capture, no PNG round trip, no resize, no timer (route66 owner
-    /// 2026-11-15/16, GH #4486). The caller's deadline bounds the paint wait.
-    pub async fn freeze(&self, full_page: bool) -> Result<cefhost::Frozen> {
-        let (_, vh) = self.viewport.lock().unwrap().unwrap_or((800, 600));
+    /// An image's size: `full_page` is the whole capture view, its top row at
+    /// the current scroll position; otherwise the top viewport-height rows.
+    /// The view's width is the viewport's (set_view).
+    fn shot_size(&self, full_page: bool) -> cefhost::ShotSize {
+        let (vw, vh) = self.viewport.lock().unwrap().unwrap_or((800, 600));
         let (_, ch) = self.view.lock().unwrap().unwrap_or((800, 600));
-        cefhost::freeze(&self.handle, if full_page { ch } else { vh } as usize)
+        cefhost::ShotSize { width: vw as usize, height: if full_page { ch } else { vh } as usize, viewport_height: vh as usize }
+    }
+
+    /// Capture the page now (cefhost::freeze): one CDP Page.captureScreenshot
+    /// from the compositor's current surface, decoded into the BGRA frame
+    /// (route66 GH #4486). The caller's deadline bounds it.
+    pub async fn freeze(&self, full_page: bool) -> Result<cefhost::Frozen> {
+        cefhost::freeze(&self.handle, self.shot_size(full_page))
             .await
             .await
             .map_err(|_| anyhow!("page {}'s unarmed capture was dropped", self.handle.id))?
@@ -566,9 +572,7 @@ impl Page {
 
     /// Arm a capture for the image after the next step (cefhost::arm).
     pub async fn arm(&self, full_page: bool, completes: Option<cefhost::Completes>) -> tokio::sync::oneshot::Receiver<Result<cefhost::Frozen>> {
-        let (_, vh) = self.viewport.lock().unwrap().unwrap_or((800, 600));
-        let (_, ch) = self.view.lock().unwrap().unwrap_or((800, 600));
-        cefhost::arm(&self.handle, if full_page { ch } else { vh } as usize, completes).await
+        cefhost::arm(&self.handle, self.shot_size(full_page), completes).await
     }
 
     pub fn ready_posted(&self) {
@@ -761,7 +765,8 @@ fn add_ms(timings: &mut Map<String, Value>, key: &str, t: Instant) {
 }
 
 /// Decode Chromium's PNG once; preserve the existing BGRA memfd contract.
-fn decode_screenshot(bytes: &[u8], width: usize, height: usize) -> Result<Frame> {
+/// Shared by the document tiles and cefhost's surface captures.
+pub(crate) fn decode_screenshot(bytes: &[u8], width: usize, height: usize) -> Result<Frame> {
     let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let header = decoder.read_header_info()?;
