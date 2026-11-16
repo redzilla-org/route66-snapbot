@@ -673,7 +673,22 @@ async fn run_step(step: &Step, page: &Page, ctx: &mut RunCtx) -> Result<Option<V
     // read (location.href, DOM state): it damages nothing, so off-screen
     // rendering never paints after it and a paint wait only times out. An
     // evaluate whose image follows still completes on its reply (armed path).
-    if matches!(step.op.as_str(), "goto" | "click" | "fill" | "check" | "press" | "type") {
+    // A goto with no image finishes on its document's firstContentfulPaint:
+    // DOMContentLoaded can precede it (a render-blocking stylesheet: route66
+    // local-verify 2026-11-15 20:11 PT froze every detail-not-found blank), and
+    // a document whose content painted before the step returned paints nothing
+    // after it (CTC ctc-home-clear-filters-resets-fields timed out on gen 7).
+    if step.op == "goto" {
+        let w = Instant::now();
+        page.wait_state(Some(Instant::now() + Duration::from_millis(deadline)), |st| {
+            st.lifecycle.get(&st.loader).filter(|l| l.contains("firstContentfulPaint")).map(|_| ())
+        })
+        .await
+        .ok_or_else(|| anyhow!("goto result not painted within its {deadline}ms deadline (no firstContentfulPaint)"))?;
+        ctx.paint_wait_ms = Some(w.elapsed().as_millis() as u64);
+        return Ok(value);
+    }
+    if matches!(step.op.as_str(), "click" | "fill" | "check" | "press" | "type") {
         let since = page.paint_generation();
         let w = Instant::now();
         tokio::time::timeout(Duration::from_millis(deadline), page.painted_after(since))
