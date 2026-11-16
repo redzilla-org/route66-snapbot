@@ -35,10 +35,10 @@ const MAX_STEPS: usize = 200;
 const MAX_STEP_TIMEOUT_MS: f64 = 120000.0;
 const SCREENSHOT_TIMEOUT_MS: u64 = 30000;
 
-const OPS: [&str; 21] = [
+const OPS: [&str; 22] = [
     "goto", "wait_for_function", "evaluate", "click", "fill", "check", "press", "type", "wait_for_selector", "wait_for_url",
     "wait_for_navigation", "text", "attribute", "count", "content", "url", "cookies", "set_cookies", "screenshot", "sleep",
-    "start_clock",
+    "start_clock", "wait_for_render",
 ];
 
 #[derive(Default)]
@@ -199,13 +199,13 @@ async fn prime_page(page: &Page) -> Result<()> {
     page.locator_click("#cb", 60000).await?;
     lap("click", &mut t);
     page.evaluate("window.scrollTo(0, 1200)").await?;
-    page.screenshot(false).await?;
+    page.freeze(false).await?;
     lap("viewport_shot", &mut t);
-    page.screenshot(true).await?;
+    page.freeze(true).await?;
     lap("full_shot", &mut t);
     page.set_viewport(390, 844).await?;
     page.evaluate("window.scrollTo(0, 0)").await?;
-    page.screenshot(false).await?;
+    page.freeze(false).await?;
     lap("phone_shot", &mut t);
     println!("[browse] prime phases ms {}", Value::Object(phases));
     Ok(())
@@ -449,6 +449,12 @@ fn safe_name(v: Option<&Value>) -> Result<String> {
 }
 
 struct RunCtx {
+    /// How long the last page-changing step waited for its result's paint.
+    paint_wait_ms: Option<u64>,
+    /// The capture armed for the image after the current step, and once that
+    /// step completes, the frozen view (with what made it ready).
+    armed: Option<tokio::sync::oneshot::Receiver<Result<crate::cefhost::Frozen>>>,
+    frozen: Option<crate::cefhost::Frozen>,
     clocks: HashMap<String, i64>,
     default_timeout: u64,
     navigation_timeout: u64,
@@ -508,7 +514,9 @@ async fn page_fn(page: &Page, src: &str, what: &str) -> Result<Value> {
     page.evaluate(&expr).await?.ok_or_else(|| anyhow!("{what} returned undefined"))
 }
 
-async fn screenshot_step(step: &Step, page: &Page) -> Result<Option<Value>> {
+/// Start an image: evaluate the caller's capture-instant functions, freeze
+/// the view, and return the readers' task (awaited by run_request).
+async fn screenshot_step(step: &Step, page: &Page, armed: Option<crate::cefhost::Frozen>) -> Result<(tokio::task::JoinHandle<Result<Value>>, &'static str)> {
     let name = safe_name(step.raw.get("name"))?;
     let full_page = step.raw.get("full_page") != Some(&Value::Bool(false));
     let ocr_spec = match step.get("ocr") {
@@ -549,64 +557,81 @@ async fn screenshot_step(step: &Step, page: &Page) -> Result<Option<Value>> {
     }
     inspect_spec["resolved_regions"] = json!(resolved);
 
-    // The encoded bytes determine the shared object key after compression;
-    // no caller-supplied test or run prefix participates in storage.
+    // Freeze the painted view: the image is the page as its last step's paint
+    // left it (route66 GH #4486). The previous step already awaited its paint.
     let t = Instant::now();
-    let shot = tokio::time::timeout(Duration::from_millis(SCREENSHOT_TIMEOUT_MS), page.screenshot(full_page))
-        .await
-        .map_err(|_| anyhow!("screenshot exceeded {SCREENSHOT_TIMEOUT_MS}ms"))??;
+    let frozen = match armed {
+        Some(f) => f,
+        None => tokio::time::timeout(Duration::from_millis(SCREENSHOT_TIMEOUT_MS), page.freeze(full_page))
+            .await
+            .map_err(|_| anyhow!("screenshot freeze exceeded {SCREENSHOT_TIMEOUT_MS}ms"))??,
+    };
     let capture_ms = t.elapsed().as_millis() as u64;
-    let frame = Arc::new(shot.frame);
-    // The caller supplies per-capture thresholds. Analyze the live BGRA frame
-    // while OCR and PNG storage run; no process later downloads the PNG.
-    let inspect_frame = frame.clone();
-    let inspection = tokio::task::spawn_blocking(move || crate::inspect::analyze(&inspect_frame, &inspect_spec));
-    // The lane's background task encodes and stores from this OCR frame; no
-    // extra process or pixel transport is involved.
-    let t = Instant::now();
-    let write = crate::writer::submit(&frame);
-    let submit_ms = t.elapsed().as_millis() as u64;
-    let (w, h) = (frame.width as i64, frame.height as i64);
-    // WHY (route66 GH #4082, owner 2026-10-07: "log the OCR timings"): capture,
-    // conversion, the read's own thread CPU and its text size ride in the timings the
-    // harness already logs, so reads can be ranked by cost. Measurement only.
-    // Only unsigned numbers: route66's harness decodes timings as map[string]uint64.
-    let mut timings = json!({"fns_ms": fns_ms, "capture_ms": capture_ms, "tiles": shot.tiles, "submit_ms": submit_ms,
-                             "frame_bytes": frame.seg.len()});
-    // The capture's own phases (settle_ms, copy_ms), unsigned ms.
-    for (k, v) in &shot.timings {
-        timings[k] = v.clone();
-    }
-    let mut ocr_result = None;
-    let mut ocr_error = None;
-    if let Some(spec) = spec {
-        let regions: Vec<Value> = spec.regions.iter().map(|r| json!({"x": r.x, "y": r.y, "width": r.width, "height": r.height})).collect();
-        // In the lane, on the frame just painted: converted once in memory, no
-        // codec or temp file. The write continues even if OCR fails.
-        let label = json!({"name": name, "url": page.url(), "full_page": full_page});
-        match ocr::read(frame.clone(), spec, keywords, label).await {
-            Ok(mut out) => {
-                for k in ["convert_ms", "resample_ms", "ocr_ms", "cpu_ms", "wall_ms", "engine_init_ms", "text_bytes"] {
-                    timings[k] = out["timings"][k].clone();
+    let frame = Arc::new(frozen.frame);
+    let url = page.url();
+    // WHY (route66 GH #4082, owner 2026-10-07: "log the OCR timings"; GH #4486):
+    // only unsigned numbers, route66's harness decodes timings as map[string]uint64.
+    let mut timings = json!({"fns_ms": fns_ms, "capture_ms": capture_ms, "tiles": 0, "frame_bytes": frame.height * frame.stride,
+                             "freeze_copy_ms": frozen.freeze_copy_ms, "freeze_copy_bytes": frozen.freeze_copy_bytes,
+                             "shot_copy_bytes": 0, "paints": frozen.paints, "paint_copy_bytes": frozen.paint_bytes,
+                             "ready_to_paint_ms": frozen.ready_to_paint_ms});
+    let timings_ready_by = frozen.ready_by;
+    // The three readers (PNG encode+store, OCR, inspect) run in parallel on the
+    // frozen frame while the page's next browser step runs (owner 2026-11-16:
+    // "Allocate a new memfd and start the next browser step while PNG/OCR
+    // run!"). The frame is freed when the last of them finishes.
+    let readers = tokio::spawn(async move {
+        let rest = Instant::now();
+        let inspect_frame = frame.clone();
+        let inspection = tokio::task::spawn_blocking(move || {
+            let t = Instant::now();
+            (crate::inspect::analyze(&inspect_frame, &inspect_spec), t.elapsed().as_millis() as u64)
+        });
+        let write = crate::writer::submit(&frame);
+        let (w, h) = (frame.width as i64, frame.height as i64);
+        let mut ocr_result = None;
+        let mut ocr_error = None;
+        if let Some(spec) = spec {
+            let regions: Vec<Value> = spec.regions.iter().map(|r| json!({"x": r.x, "y": r.y, "width": r.width, "height": r.height})).collect();
+            let label = json!({"name": name, "url": url, "full_page": full_page});
+            let t = Instant::now();
+            let read = ocr::read(frame.clone(), spec, keywords, label).await;
+            timings["ocr_reader_ms"] = json!(t.elapsed().as_millis() as u64);
+            match read {
+                Ok(mut out) => {
+                    for k in ["convert_ms", "resample_ms", "ocr_ms", "cpu_ms", "wall_ms", "engine_init_ms", "text_bytes"] {
+                        timings[k] = out["timings"][k].clone();
+                    }
+                    out["regions"] = json!(regions);
+                    ocr_result = Some(out);
                 }
-                out["regions"] = json!(regions);
-                ocr_result = Some(out);
+                Err(e) => ocr_error = Some(e),
             }
-            Err(e) => ocr_error = Some(e),
         }
-    }
-    let mut stored = crate::writer::finish(write).await?;
-    stored["inspect"] = inspection.await.map_err(|e| anyhow!("screenshot inspector exited: {e}"))?;
-    if let Some(e) = ocr_error { return Err(e); }
-    stored["width"] = json!(w);
-    stored["height"] = json!(h);
-    if let Some(out) = ocr_result { stored["ocr"] = out; }
-    // The log and response use the final SHA-1 address, not a temporary name.
-    eprintln!("SNAPBOT-SHOT {}", json!({"name": name, "url": page.url(), "png": stored["url"], "full_page": full_page,
-                                        "width": w, "height": h, "frame_bytes": frame.seg.len(), "capture_ms": capture_ms,
-                                        "tiles": shot.tiles, "submit_ms": submit_ms, "phases": shot.timings}));
-    stored["timings"] = timings;
-    Ok(Some(stored))
+        let mut stored = crate::writer::finish(write).await?;
+        let (inspected, inspect_ms) = inspection.await.map_err(|e| anyhow!("screenshot inspector exited: {e}"))?;
+        stored["inspect"] = inspected;
+        for k in ["encode_ms", "write_ms"] {
+            timings[k] = stored[k].take();
+            stored.as_object_mut().unwrap().remove(k);
+        }
+        timings["inspect_ms"] = json!(inspect_ms);
+        timings["rest_ms"] = json!(rest.elapsed().as_millis() as u64);
+        if let Some(e) = ocr_error {
+            return Err(e);
+        }
+        stored["width"] = json!(w);
+        stored["height"] = json!(h);
+        if let Some(out) = ocr_result {
+            stored["ocr"] = out;
+        }
+        // The log and response use the final SHA-1 address, not a temporary name.
+        eprintln!("SNAPBOT-SHOT {}", json!({"name": name, "url": url, "png": stored["url"], "full_page": full_page,
+                                            "width": w, "height": h, "timings": timings}));
+        stored["timings"] = timings;
+        Ok(stored)
+    });
+    Ok((readers, timings_ready_by))
 }
 
 /// One step against the page. Ok(None) is a JS `undefined` value.
@@ -615,6 +640,76 @@ async fn run_step(step: &Step, page: &Page, ctx: &mut RunCtx) -> Result<Option<V
         Timeout::Exhausted => bail!("clock {} exhausted before {} began", js_arg(step, "clock"), step.op),
         Timeout::Ms(t) => t,
     };
+    let value = match run_step_op(step, page, ctx, t).await {
+        Ok(v) => v,
+        Err(e) => {
+            if ctx.armed.take().is_some() {
+                page.disarm();
+            }
+            return Err(e);
+        }
+    };
+    let deadline = if step.op == "goto" { t.unwrap_or(ctx.navigation_timeout) } else { t.unwrap_or(ctx.default_timeout) };
+    // A step whose image follows completes on the swapping paint: the first
+    // paint after its completing message (route66 GH #4486). A step whose
+    // completion is not one CDP message makes the capture ready on return.
+    if let Some(rx) = ctx.armed.take() {
+        // A goto freezes only on its lifecycle events and paint; any other
+        // step not completed by its matched reply freezes now (no-op if done).
+        if !matches!(step.op.as_str(), "goto" | "wait_for_function" | "wait_for_selector" | "wait_for_render") {
+            page.ready_posted();
+        }
+        let w = Instant::now();
+        let frozen = tokio::time::timeout(Duration::from_millis(deadline), rx)
+            .await
+            .map_err(|_| anyhow!("{} result not painted within its {deadline}ms deadline (armed capture never swapped)", step.op))?
+            .map_err(|_| anyhow!("{}'s armed capture was dropped", step.op))??;
+        ctx.paint_wait_ms = Some(w.elapsed().as_millis() as u64);
+        ctx.frozen = Some(frozen);
+        return Ok(value);
+    }
+    // A page-changing step with no image finishes when its result is painted:
+    // the generation recorded now, the first paint after it.
+    if matches!(step.op.as_str(), "goto" | "click" | "fill" | "check" | "press" | "type" | "evaluate") {
+        let since = page.paint_generation();
+        let w = Instant::now();
+        tokio::time::timeout(Duration::from_millis(deadline), page.painted_after(since))
+            .await
+            .map_err(|_| anyhow!("{} result not painted within its {deadline}ms deadline (no paint after generation {since})", step.op))??;
+        ctx.paint_wait_ms = Some(w.elapsed().as_millis() as u64);
+    }
+    Ok(value)
+}
+
+/// A goto step's wait_until as the CDP lifecycle event name.
+fn goto_lifecycle(step: &Step) -> String {
+    match step.str("wait_until").filter(|s| !s.is_empty()).unwrap_or("domcontentloaded") {
+        "load" => "load",
+        "networkidle0" | "networkidle" => "networkIdle",
+        "networkidle2" => "networkAlmostIdle",
+        _ => "DOMContentLoaded",
+    }
+    .to_string()
+}
+
+/// The CDP message that completes `op` when its image is armed (cefhost::Completes).
+fn completes_for(step: &Step) -> Option<crate::cefhost::Completes> {
+    use crate::cefhost::Completes;
+    match step.op.as_str() {
+        "evaluate" => Some(Completes::Reply),
+        // A wait completes on a paint its condition holds for (checked per paint).
+        "wait_for_function" => call_expr(step.raw.get("fn"), step.raw.get("arg")).ok().map(Completes::Condition),
+        "wait_for_render" => Some(Completes::Rendered(js_arg(step, "name"))),
+        "wait_for_selector" => {
+            let state = step.str("state").filter(|s| !s.is_empty()).unwrap_or("attached");
+            crate::actions::selector_predicate(&js_arg(step, "selector"), state).ok().map(|(p, _)| Completes::Condition(p))
+        }
+        _ => None,
+    }
+}
+
+/// The step's own operation.
+async fn run_step_op(step: &Step, page: &Page, ctx: &mut RunCtx, t: Option<u64>) -> Result<Option<Value>> {
     let wait_default = t.unwrap_or(ctx.default_timeout);
     let nav_default = t.unwrap_or(ctx.navigation_timeout);
     let sel = || js_arg(step, "selector");
@@ -688,6 +783,17 @@ async fn run_step(step: &Step, page: &Page, ctx: &mut RunCtx) -> Result<Option<V
             page.wait_for_selector(&sel(), state, wait_default).await?;
             Ok(Some(Value::Bool(true)))
         }
+        // The page calls __r66Rendered(name) at the point its render callback
+        // chooses (after DOM insert, image decode, fonts, a double rAF).
+        "wait_for_render" => {
+            let name = js_arg(step, "name");
+            let seen = page.state.lock().unwrap().rendered.len();
+            let dl = Some(Instant::now() + Duration::from_millis(wait_default));
+            page.wait_state(dl, |st| st.rendered[seen..].iter().any(|p| *p == name).then_some(()))
+                .await
+                .ok_or_else(|| anyhow!("wait_for_render {name}: __r66Rendered({name:?}) not called within {wait_default}ms"))?;
+            Ok(Some(Value::Bool(true)))
+        }
         "wait_for_url" => {
             let re = match step.raw.get("url_regex") {
                 Some(Value::String(s)) if !s.is_empty() => s.clone(),
@@ -731,7 +837,6 @@ async fn run_step(step: &Step, page: &Page, ctx: &mut RunCtx) -> Result<Option<V
             ctx.clocks.insert(name.to_string(), js::now_ms() + ms as i64);
             Ok(Some(Value::Null))
         }
-        "screenshot" => screenshot_step(step, page).await,
         other => bail!("unreachable op {other}"),
     }
 }
@@ -836,6 +941,9 @@ async fn run_request(page: &Page, c: &mut Ctx, steps: &[Step], started: Instant,
     install_context(page, c).await?;
     let setup_ms = setup_start.elapsed().as_millis() as u64;
     let mut ctx = RunCtx {
+        paint_wait_ms: None,
+        armed: None,
+        frozen: None,
         clocks: HashMap::new(),
         default_timeout: c.default_timeout.unwrap_or(30000),
         navigation_timeout: c.navigation_timeout.or(c.default_timeout).unwrap_or(30000),
@@ -844,7 +952,15 @@ async fn run_request(page: &Page, c: &mut Ctx, steps: &[Step], started: Instant,
     let mut by_id: HashMap<String, (bool, bool)> = HashMap::new(); // id -> (skipped, ok)
     let mut stopped = false;
     let mut all_ok = true;
+    // Images whose readers are still running: (result index, readers, start).
+    let mut images: Vec<(usize, tokio::task::JoinHandle<Result<Value>>, Instant)> = Vec::new();
     for step in steps {
+        // A gate on an image waits for that image's readers.
+        for g in ["if_ok", "if_failed", "if_html_incomplete"] {
+            if let Some(id) = step.raw.get(g).map(js::js_string) {
+                settle_images(&mut images, &mut results, &mut by_id, steps, &mut stopped, &mut all_ok, Some(&id)).await;
+            }
+        }
         let gate_ok = step.raw.get("if_ok").is_some_and(|g| !by_id.get(&js::js_string(g)).is_some_and(|r| !r.0 && r.1));
         let gate_failed = step.raw.get("if_failed").is_some_and(|g| !by_id.get(&js::js_string(g)).is_some_and(|r| !r.0 && !r.1));
         // Keep the first HTML bytes and transport outcome intact; a skipped
@@ -868,6 +984,40 @@ async fn run_request(page: &Page, c: &mut Ctx, steps: &[Step], started: Instant,
         let mut r = Map::new();
         r.insert("id".into(), json!(step.id));
         r.insert("op".into(), json!(step.op));
+        if step.op == "screenshot" {
+            // The image's readers run while the next step runs; its result is
+            // filled in when they finish (settle_images).
+            match screenshot_step(step, page, ctx.frozen.take()).await {
+                Ok((readers, ready_by)) => {
+                    r.insert("freeze_to_next_step_ms".into(), json!(t0.elapsed().as_millis() as u64));
+                    r.insert("ready_by".into(), json!(ready_by));
+                    images.push((results.len(), readers, t0));
+                    by_id.insert(step.id.clone(), (false, true));
+                    results.push(Value::Object(r));
+                    continue;
+                }
+                Err(e) => {
+                    r.insert("ok".into(), json!(false));
+                    r.insert("error".into(), json!(format!("{e:#}")));
+                    r.insert("elapsed_ms".into(), json!(t0.elapsed().as_millis() as u64));
+                    if !step.optional() {
+                        stopped = true;
+                        all_ok = false;
+                    }
+                    by_id.insert(step.id.clone(), (false, false));
+                    results.push(Value::Object(r));
+                    continue;
+                }
+            }
+        }
+        ctx.paint_wait_ms = None;
+        let next_image = steps.get(results.len() + 1).filter(|n| n.op == "screenshot");
+        if let Some(n) = next_image {
+            let full = n.raw.get("full_page") != Some(&Value::Bool(false));
+            ctx.armed = Some(page.arm(full, completes_for(step).or_else(|| (step.op == "goto").then(|| {
+                crate::cefhost::Completes::Lifecycle(goto_lifecycle(step))
+            }))).await);
+        }
         let ok = match run_step(step, page, &mut ctx).await {
             Ok(value) => {
                 let failure = check_expect(step.raw.get("expect"), value.as_ref());
@@ -887,6 +1037,9 @@ async fn run_request(page: &Page, c: &mut Ctx, steps: &[Step], started: Instant,
             }
         };
         r.insert("elapsed_ms".into(), json!(t0.elapsed().as_millis() as u64));
+        if let Some(ms) = ctx.paint_wait_ms {
+            r.insert("paint_wait_ms".into(), json!(ms));
+        }
         if crate::runtime::diagnostic_enabled() {
             crate::runtime::diagnostic_phase(&format!("step-return id={} op={} elapsed_ms={} ok={ok}", step.id, step.op, t0.elapsed().as_millis()));
         }
@@ -897,8 +1050,8 @@ async fn run_request(page: &Page, c: &mut Ctx, steps: &[Step], started: Instant,
         by_id.insert(step.id.clone(), (false, ok));
         results.push(Value::Object(r));
     }
-    // Every screenshot step joined its own content-addressed write before
-    // returning its reference, so the browse has no pending writer queue.
+    // Every image's readers (and its content-addressed write) finish before the response.
+    settle_images(&mut images, &mut results, &mut by_id, steps, &mut stopped, &mut all_ok, None).await;
     let st = page.state.lock().unwrap();
     // WHY: retain native timing evidence, including pending resources, on both successful and failed journeys.
     let network = st.network.snapshot();
@@ -912,6 +1065,52 @@ async fn run_request(page: &Page, c: &mut Ctx, steps: &[Step], started: Instant,
         "writer_drained": true,
         "timings": {"total_ms": started.elapsed().as_millis() as u64, "acquire_ms": acquire_ms, "setup_ms": setup_ms, "network": network},
     }))
+}
+
+/// Await image readers: the one whose step id is `only`, or all of them, and
+/// fill their step results. A failed non-optional image fails the browse.
+async fn settle_images(
+    images: &mut Vec<(usize, tokio::task::JoinHandle<Result<Value>>, Instant)>,
+    results: &mut [Value],
+    by_id: &mut HashMap<String, (bool, bool)>,
+    steps: &[Step],
+    stopped: &mut bool,
+    all_ok: &mut bool,
+    only: Option<&str>,
+) {
+    let mut i = 0;
+    while i < images.len() {
+        let idx = images[i].0;
+        let id = results[idx]["id"].as_str().unwrap_or("").to_string();
+        if only.is_some_and(|o| o != id) {
+            i += 1;
+            continue;
+        }
+        let (_, readers, t0) = images.remove(i);
+        let step = steps.iter().find(|s| s.id == id).expect("an image result names its step");
+        let r = results[idx].as_object_mut().unwrap();
+        let ok = match readers.await.map_err(|e| anyhow!("image readers exited: {e}")).and_then(|x| x) {
+            Ok(v) => {
+                let failure = check_expect(step.raw.get("expect"), Some(&v));
+                r.insert("value".into(), v);
+                if let Some(f) = &failure {
+                    r.insert("error".into(), json!(format!("expect: {f}")));
+                }
+                failure.is_none()
+            }
+            Err(e) => {
+                r.insert("error".into(), json!(format!("{e:#}")));
+                false
+            }
+        };
+        r.insert("ok".into(), json!(ok));
+        r.insert("elapsed_ms".into(), json!(t0.elapsed().as_millis() as u64));
+        if !ok && !step.optional() {
+            *stopped = true;
+            *all_ok = false;
+        }
+        by_id.insert(id, (false, ok));
+    }
 }
 
 #[cfg(test)]

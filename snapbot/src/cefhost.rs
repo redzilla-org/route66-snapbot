@@ -25,7 +25,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
 /// One CDP event from a page, routed to its session.
@@ -35,21 +35,88 @@ pub struct Event {
     pub params: Value,
 }
 
-/// The per-page OSR view size GetViewRect reads for layout, and the view's
-/// pixels as OnPaint last delivered them.
+/// The per-page OSR view size GetViewRect reads for layout, and the paint
+/// generation the orchestrator awaits ("a step finishes when its result is
+/// painted", route66 GH #4486).
 pub struct Slot {
     id: AtomicI32,
     view: Mutex<(i32, i32)>,
-    paint: Mutex<Paint>,
+    /// The paint generation: bumped after every VIEW paint lands in the live view.
+    painted: tokio::sync::watch::Sender<u64>,
+    /// The size of the latest VIEW paint (a view change completes at its new size).
+    painted_size: Mutex<(i32, i32)>,
 }
 
-/// The last painted VIEW frame: OnPaint's buffer is valid only during the
-/// callback, so its dirty rects are copied here as they arrive.
-#[derive(Default)]
-struct Paint {
+/// A page's live VIEW memfd, owned by the CEF UI thread alone (route66 GH
+/// #4486, owner 2026-11-16: "why do you need a lock? orchestrator"). OnPaint
+/// copies exactly its dirty rects into it; a freeze, posted to the same
+/// thread, hands it to an image's readers and installs a full copy as the
+/// new live view, so a frozen frame is never written again.
+struct Live {
     width: usize,
     height: usize,
-    data: Vec<u8>,
+    seg: Segment,
+    /// OnPaint calls, and the dirty-rect bytes they copied, since the last freeze.
+    paints: u64,
+    paint_bytes: u64,
+    /// The capture armed before the step whose image follows.
+    armed: Option<Armed>,
+}
+
+/// A capture waiting for its step's completing event (route66 GH #4486, owner
+/// 2026-11-16: "There should be no need to ever force a repaint, when you can
+/// just grab the memfd from the last paint"). A matched reply or condition
+/// freezes the live view in that same observer callback; a goto freezes on
+/// the first paint after firstContentfulPaint once its wait_until fired too.
+/// UI thread only: plain fields.
+struct Armed {
+    rows: usize,
+    tx: oneshot::Sender<Result<Frozen>>,
+    ready: bool,
+    /// How `ready` was set: "reply", "truthy", "lifecycle" or "posted".
+    by: &'static str,
+    ready_at: Option<Instant>,
+    /// A goto's completing lifecycle events: (wait_until name, the navigate's
+    /// loaderId, its main frame id), and which of them fired.
+    lifecycle: Option<(String, String, String)>,
+    seen_wait: bool,
+    seen_fcp: bool,
+    /// A paint landed after firstContentfulPaint.
+    painted_after_fcp: bool,
+    /// A wait_for_* condition checked per paint (Completes::Condition).
+    cond: Option<String>,
+    /// The __r66Rendered payload that completes (Completes::Rendered).
+    rendered: Option<String>,
+}
+
+/// Which CDP message completes an armed page's step (set by the orchestrator
+/// for the step's duration).
+#[derive(Clone)]
+pub enum Completes {
+    /// The reply to the step's Runtime.evaluate (an `evaluate` step).
+    Reply,
+    /// A Runtime.evaluate reply whose value is truthy (a polled condition).
+    Truthy,
+    /// Page.navigate's reply names the loader; its `name` lifecycle event completes.
+    Lifecycle(String),
+    /// A wait_for_* condition, checked on the UI thread after every paint
+    /// (and once at arm time); a true check with no newer paint completes.
+    Condition(String),
+    /// The page's __r66Rendered(name) call: the observer freezes the last
+    /// paint in that callback.
+    Rendered(String),
+}
+
+/// A frozen view handed to an image's readers, and what it cost.
+pub struct Frozen {
+    pub frame: Frame,
+    /// What made the capture ready, and ready -> swapping paint, in ms.
+    pub ready_by: &'static str,
+    pub ready_to_paint_ms: u64,
+    pub freeze_copy_ms: u64,
+    pub freeze_copy_bytes: u64,
+    pub paints: u64,
+    pub paint_bytes: u64,
 }
 
 /// Cross-thread routing: CDP replies by message id, events by browser id.
@@ -59,6 +126,8 @@ struct Hub {
     sessions: Mutex<HashMap<i32, mpsc::UnboundedSender<Event>>>,
     closed: Mutex<HashMap<i32, oneshot::Sender<()>>>,
     next_msg: AtomicI32,
+    /// Per page: which message completes its current armed step (see Completes).
+    completes: Mutex<HashMap<i32, Completes>>,
     quitting: AtomicBool,
 }
 
@@ -82,6 +151,12 @@ struct Ui {
 
 thread_local! {
     static UI: RefCell<Ui> = RefCell::new(Ui::default());
+    /// Each page's live view, by browser id (UI thread only; see Live).
+    static LIVE: RefCell<HashMap<i32, Live>> = RefCell::new(HashMap::new());
+    /// In-flight CDP messages that complete an armed step: msg id -> (page, how).
+    static COMPLETING: RefCell<HashMap<i32, (i32, Completes, String)>> = RefCell::new(HashMap::new());
+    /// In-flight paint checks of an armed condition: msg id -> (page, the paint generation it checks).
+    static CHECKS: RefCell<HashMap<i32, (i32, u64)>> = RefCell::new(HashMap::new());
 }
 
 /// A CEF (UTF-16) string as a Rust String.
@@ -425,18 +500,45 @@ wrap_render_handler! {
             let row = w * 4;
             // SAFETY: CEF hands a width*height*4 BGRA buffer for the duration of OnPaint.
             let src = unsafe { std::slice::from_raw_parts(buffer, row * h) };
-            let mut p = self.slot.paint.lock().unwrap();
-            if (p.width, p.height) != (w, h) {
-                *p = Paint { width: w, height: h, data: src.to_vec() };
-                return;
-            }
-            for r in dirty_rects.unwrap_or(&[]) {
-                let clamp = |v: i32, max: usize| (v.max(0) as usize).min(max);
-                let (x0, x1) = (clamp(r.x, w), clamp(r.x + r.width, w));
-                for y in clamp(r.y, h)..clamp(r.y + r.height, h) {
-                    let (a, b) = (y * row + x0 * 4, y * row + x1 * 4);
-                    p.data[a..b].copy_from_slice(&src[a..b]);
+            let id = self.slot.id.load(Ordering::SeqCst);
+            let cond = LIVE.with(|l| {
+                let mut l = l.borrow_mut();
+                let live = l.entry(id).or_insert_with(|| Live { width: 0, height: 0, seg: blank_view(1, 1), paints: 0, paint_bytes: 0, armed: None });
+                if (live.width, live.height) != (w, h) {
+                    // A new view size: a live view of that size (Chromium marks
+                    // the whole view dirty, so the rects below fill it).
+                    live.seg = blank_view(w, h);
+                    (live.width, live.height) = (w, h);
                 }
+                let dst = live.seg.as_mut_slice();
+                for r in dirty_rects.unwrap_or(&[]) {
+                    let clamp = |v: i32, max: usize| (v.max(0) as usize).min(max);
+                    let (x0, x1) = (clamp(r.x, w), clamp(r.x + r.width, w));
+                    for y in clamp(r.y, h)..clamp(r.y + r.height, h) {
+                        let (a, b) = (y * row + x0 * 4, y * row + x1 * 4);
+                        dst[a..b].copy_from_slice(&src[a..b]);
+                        live.paint_bytes += (b - a) as u64;
+                    }
+                }
+                live.paints += 1;
+                if let Some(a) = live.armed.as_mut() {
+                    if a.seen_fcp {
+                        a.painted_after_fcp = true;
+                    }
+                }
+                // A ready capture freezes on this paint (a goto after its
+                // firstContentfulPaint, or a view not yet painted at its size).
+                let view = *self.slot.view.lock().unwrap();
+                if live.armed.as_ref().is_some_and(|a| a.ready) {
+                    complete(live, view);
+                }
+                live.armed.as_ref().and_then(|a| a.cond.clone())
+            });
+            *self.slot.painted_size.lock().unwrap() = (width, height);
+            // The orchestrator's step-painted signal.
+            self.slot.painted.send_modify(|g| *g += 1);
+            if let Some(expr) = cond {
+                send_check(id, &expr, *self.slot.painted.borrow());
             }
         }
     }
@@ -457,6 +559,7 @@ wrap_life_span_handler! {
             // Dropping the session sender ends the page's event loop.
             hub().sessions.lock().unwrap().remove(&id);
             UI.with(|u| u.borrow_mut().browsers.remove(&id));
+            LIVE.with(|l| l.borrow_mut().remove(&id));
             if let Some(tx) = hub().closed.lock().unwrap().remove(&id) {
                 let _ = tx.send(());
             }
@@ -497,8 +600,49 @@ wrap_dev_tools_message_observer! {
             success: ::std::os::raw::c_int,
             result: Option<&[u8]>,
         ) {
-            let Some(tx) = hub().pending.lock().unwrap().remove(&message_id) else { return };
             let v: Value = result.and_then(|r| serde_json::from_slice(r).ok()).unwrap_or(Value::Null);
+            // A paint check: true with no newer paint freezes that paint; a
+            // newer paint has sent its own check; false waits for the next paint.
+            if let Some((page, p)) = CHECKS.with(|c| c.borrow_mut().remove(&message_id)) {
+                if success == 1 && truthy(v.pointer("/result/value")) && *self.slot.painted.borrow() == p {
+                    let view = *self.slot.view.lock().unwrap();
+                    LIVE.with(|l| {
+                        let mut l = l.borrow_mut();
+                        let Some(live) = l.get_mut(&page) else { return };
+                        if let Some(a) = live.armed.as_mut().filter(|a| a.cond.is_some()) {
+                            a.make_ready("paint-check");
+                            complete(live, view);
+                        }
+                    });
+                }
+                return;
+            }
+            // The step's completing message, on this (the paint) thread, before forwarding.
+            if let Some((page, how, frame)) = COMPLETING.with(|c| c.borrow_mut().remove(&message_id)) {
+                let view = *self.slot.view.lock().unwrap();
+                LIVE.with(|l| {
+                    let mut l = l.borrow_mut();
+                    let Some(live) = l.get_mut(&page) else { return };
+                    let Some(a) = live.armed.as_mut() else { return };
+                    // A matched reply freezes the view now, in this callback.
+                    let by = match how {
+                        Completes::Reply if success == 1 => "reply",
+                        Completes::Truthy if success == 1 && truthy(v.pointer("/result/value")) => "truthy",
+                        Completes::Lifecycle(name) if success == 1 => match v.get("loaderId").and_then(Value::as_str) {
+                            Some(loader) => {
+                                a.lifecycle = Some((name, loader.to_string(), frame));
+                                return;
+                            }
+                            // A same-document navigation: no new document; the reply completes it.
+                            None => "reply",
+                        },
+                        _ => return,
+                    };
+                    a.make_ready(by);
+                    complete(live, view);
+                });
+            }
+            let Some(tx) = hub().pending.lock().unwrap().remove(&message_id) else { return };
             let _ = tx.send(if success == 1 {
                 Ok(v)
             } else {
@@ -510,6 +654,47 @@ wrap_dev_tools_message_observer! {
             let id = self.slot.id.load(Ordering::SeqCst);
             let method = method.map(cs).unwrap_or_default();
             let params: Value = params.and_then(|p| serde_json::from_slice(p).ok()).unwrap_or(Value::Null);
+            // The page's render callback: freeze the last paint in this callback.
+            if method == "Runtime.bindingCalled" && params.get("name").and_then(Value::as_str) == Some("__r66Rendered") {
+                let payload = params.get("payload").and_then(Value::as_str).unwrap_or("").to_string();
+                let view = *self.slot.view.lock().unwrap();
+                LIVE.with(|l| {
+                    let mut l = l.borrow_mut();
+                    let Some(live) = l.get_mut(&id) else { return };
+                    if let Some(a) = live.armed.as_mut().filter(|a| a.rendered.as_deref() == Some(payload.as_str())) {
+                        a.make_ready("rendered");
+                        complete(live, view);
+                    }
+                });
+            }
+            // A goto's completing lifecycle event, on this (the paint) thread, before forwarding.
+            if method == "Page.lifecycleEvent" {
+                let view = *self.slot.view.lock().unwrap();
+                LIVE.with(|l| {
+                    let mut l = l.borrow_mut();
+                    let Some(live) = l.get_mut(&id) else { return };
+                    let Some(a) = live.armed.as_mut() else { return };
+                    let Some((wait, loader, frame)) = a.lifecycle.clone() else { return };
+                    let field = |k: &str| params.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+                    if field("loaderId") != loader || field("frameId") != frame {
+                        return;
+                    }
+                    // A goto is painted at wait_until AND firstContentfulPaint.
+                    if field("name") == wait {
+                        a.seen_wait = true;
+                    }
+                    if field("name") == "firstContentfulPaint" {
+                        a.seen_fcp = true;
+                    }
+                    if a.seen_wait && a.seen_fcp {
+                        a.make_ready("lifecycle");
+                        // Already painted after FCP: that paint is in the live view.
+                        if a.painted_after_fcp {
+                            complete(live, view);
+                        }
+                    }
+                });
+            }
             if let Some(tx) = hub().sessions.lock().unwrap().get(&id) {
                 let _ = tx.send(Event { method, params });
             }
@@ -539,7 +724,8 @@ pub struct PageHandle {
 /// A new about:blank windowless page in `context` (a fresh in-memory cookie
 /// jar and cache per context id), its event stream, and its paint slot.
 pub async fn create_page(context: &str, width: i32, height: i32) -> Result<(PageHandle, mpsc::UnboundedReceiver<Event>)> {
-    let slot = Arc::new(Slot { id: AtomicI32::new(-1), view: Mutex::new((width, height)), paint: Mutex::new(Paint::default()) });
+    let slot = Arc::new(Slot { id: AtomicI32::new(-1), view: Mutex::new((width, height)), 
+                               painted: tokio::sync::watch::channel(0).0, painted_size: Mutex::new((0, 0)) });
     let (tx, rx) = mpsc::unbounded_channel();
     let ctx = context.to_string();
     let s = slot.clone();
@@ -652,7 +838,16 @@ pub async fn send(id: i32, method: &str, params: Value) -> std::result::Result<V
     let body = serde_json::to_vec(&json!({"id": msg_id, "method": method, "params": params})).map_err(|e| e.to_string())?;
     let (tx, rx) = oneshot::channel();
     hub().pending.lock().unwrap().insert(msg_id, tx);
+    // A goto's navigate names its main frame; its lifecycle event must match it.
+    let frame = params.get("frameId").and_then(Value::as_str).unwrap_or("").to_string();
+    let completes = hub().completes.lock().unwrap().get(&id).cloned().filter(|c| match c {
+        Completes::Lifecycle(_) => method == "Page.navigate",
+        _ => method == "Runtime.evaluate",
+    });
     on_ui(move || {
+        if let Some(c) = completes {
+            COMPLETING.with(|m| m.borrow_mut().insert(msg_id, (id, c, frame)));
+        }
         let sent = host_of(id).map(|h| h.send_dev_tools_message(Some(&body[..])) == 1).unwrap_or(false);
         if !sent {
             if let Some(tx) = hub().pending.lock().unwrap().remove(&msg_id) {
@@ -681,18 +876,197 @@ fn host_of(id: i32) -> Option<BrowserHost> {
     UI.with(|u| u.borrow().browsers.get(&id).and_then(|b| b.browser.host()))
 }
 
-/// The top `rows` of page `id`'s last painted view, copied once into a frame
-/// segment. A painted size other than the view's means the view has not
-/// painted at its current size yet: fail hard rather than return stale pixels.
-pub fn read_view(page: &PageHandle, rows: usize) -> Result<Frame> {
-    let (vw, vh) = *page.slot.view.lock().unwrap();
-    let p = page.slot.paint.lock().unwrap();
-    if (p.width, p.height) != (vw as usize, vh as usize) {
-        bail!("the view painted {}x{}, not its {vw}x{vh} size", p.width, p.height);
+/// A slot's current paint generation (the event loop holds the slot, not the handle).
+pub fn slot_generation(slot: &Slot) -> u64 {
+    *slot.painted.borrow()
+}
+
+/// Page `id`'s current paint generation (how many VIEW paints have landed).
+pub fn paint_generation(page: &PageHandle) -> u64 {
+    *page.slot.painted.borrow()
+}
+
+/// Wait until page `id` has painted after generation `since`: a step's
+/// result is painted (route66 GH #4486). No clock: the caller's step deadline
+/// bounds it.
+pub async fn painted_after(page: &PageHandle, since: u64) -> Result<u64> {
+    let mut painted = page.slot.painted.subscribe();
+    loop {
+        let g = *painted.borrow_and_update();
+        if g > since {
+            return Ok(g);
+        }
+        painted.changed().await.map_err(|_| anyhow!("page {} closed before it painted", page.id))?;
     }
-    let rows = rows.min(p.height);
-    let stride = p.width * 4;
-    let seg = Segment::create(stride * rows)?;
-    seg.as_mut_slice().copy_from_slice(&p.data[..stride * rows]);
-    Ok(Frame { seg, width: p.width, height: rows, stride })
+}
+
+impl Armed {
+    /// Mark the capture ready; true when this call made it so.
+    fn make_ready(&mut self, by: &'static str) -> bool {
+        if self.ready {
+            return false;
+        }
+        (self.ready, self.by, self.ready_at) = (true, by, Some(Instant::now()));
+        true
+    }
+}
+
+/// Freeze the armed capture from the live view as it was last painted: swap A
+/// for B = copy of A and send A. A view not yet painted at its current size
+/// stays armed (ready) and freezes on the first paint at that size.
+fn complete(live: &mut Live, view: (i32, i32)) {
+    if (live.width, live.height) != (view.0 as usize, view.1 as usize) {
+        return;
+    }
+    let Some(a) = live.armed.take() else { return };
+    let ready_to_paint_ms = a.ready_at.map_or(0, |t| t.elapsed().as_millis() as u64);
+    let _ = a.tx.send(swap(live, a.rows).map(|f| Frozen { ready_by: a.by, ready_to_paint_ms, ..f }));
+}
+
+/// Wait until page `id` paints at `w`x`h` after generation `since`: a view
+/// change completes at its new size, never on a paint at the old one.
+pub async fn painted_at_size(page: &PageHandle, mut since: u64, w: i32, h: i32) -> Result<()> {
+    loop {
+        since = painted_after(page, since).await?;
+        if *page.slot.painted_size.lock().unwrap() == (w, h) {
+            return Ok(());
+        }
+    }
+}
+
+/// Swap the live view: allocate B, copy A into B, install B, return A with
+/// its top `rows`. UI thread only, between paints, so A is never torn and
+/// never written again.
+fn swap(live: &mut Live, rows: usize) -> Result<Frozen> {
+    let t = Instant::now();
+    let next = Segment::create(live.seg.len())?;
+    next.as_mut_slice().copy_from_slice(live.seg.as_slice());
+    let a = std::mem::replace(&mut live.seg, next);
+    Ok(Frozen {
+        frame: Frame { seg: Arc::new(a), width: live.width, height: rows.min(live.height), stride: live.width * 4 },
+        ready_by: "immediate",
+        ready_to_paint_ms: 0,
+        freeze_copy_ms: t.elapsed().as_millis() as u64,
+        freeze_copy_bytes: live.seg.len() as u64,
+        paints: std::mem::take(&mut live.paints),
+        paint_bytes: std::mem::take(&mut live.paint_bytes),
+    })
+}
+
+/// Arm a capture on page `id` before the step whose image follows: the step's
+/// completing message (`completes`, matched on the UI thread) makes it ready,
+/// and the first paint after that swaps the view and sends A here.
+pub async fn arm(page: &PageHandle, rows: usize, completes: Option<Completes>) -> oneshot::Receiver<Result<Frozen>> {
+    let (tx, rx) = oneshot::channel();
+    let id = page.id;
+    let cond = match &completes {
+        Some(Completes::Condition(expr)) => Some(expr.clone()),
+        _ => None,
+    };
+    let rendered = match &completes {
+        Some(Completes::Rendered(name)) => Some(name.clone()),
+        _ => None,
+    };
+    match completes.filter(|c| !matches!(c, Completes::Condition(_) | Completes::Rendered(_))) {
+        Some(c) => hub().completes.lock().unwrap().insert(id, c),
+        None => hub().completes.lock().unwrap().remove(&id),
+    };
+    let gen_now = page.slot.clone();
+    let (done_tx, done_rx) = oneshot::channel();
+    on_ui(move || {
+        LIVE.with(|l| {
+            let mut l = l.borrow_mut();
+            let live = l.entry(id).or_insert_with(|| Live { width: 0, height: 0, seg: blank_view(1, 1), paints: 0, paint_bytes: 0, armed: None });
+            live.armed = Some(Armed { rows, tx, ready: false, by: "", ready_at: None, lifecycle: None, seen_wait: false, seen_fcp: false, painted_after_fcp: false, cond: cond.clone(), rendered: rendered.clone() });
+        });
+        // One check now: already true with no paint pending freezes the last paint.
+        if let Some(expr) = cond {
+            send_check(id, &expr, *gen_now.painted.borrow());
+        }
+        let _ = done_tx.send(());
+    });
+    let _ = done_rx.await;
+    rx
+}
+
+/// The step returned without its completing message being matched (a step
+/// whose completion is not one CDP message): freeze the armed capture now.
+pub fn ready_posted(page: &PageHandle) {
+    let id = page.id;
+    let view = *page.slot.view.lock().unwrap();
+    hub().completes.lock().unwrap().remove(&id);
+    on_ui(move || {
+        LIVE.with(|l| {
+            let mut l = l.borrow_mut();
+            let Some(live) = l.get_mut(&id) else { return };
+            if let Some(a) = live.armed.as_mut() {
+                a.make_ready("posted");
+                complete(live, view);
+            }
+        });
+    });
+}
+
+/// Drop page `id`'s armed capture (its step failed or its image was skipped).
+pub fn disarm(page: &PageHandle) {
+    let id = page.id;
+    hub().completes.lock().unwrap().remove(&id);
+    on_ui(move || LIVE.with(|l| {
+        if let Some(live) = l.borrow_mut().get_mut(&id) {
+            live.armed = None;
+        }
+    }));
+}
+
+/// Freeze page `id`'s live view now, with no step to wait on (an image right
+/// after another image, or first in a request): the swap runs on the UI
+/// thread, which owns the view, between paints.
+pub async fn freeze(page: &PageHandle, rows: usize) -> Result<Frozen> {
+    let (tx, rx) = oneshot::channel();
+    let id = page.id;
+    let (vw, vh) = *page.slot.view.lock().unwrap();
+    on_ui(move || {
+        let r = LIVE.with(|l| {
+            let mut l = l.borrow_mut();
+            let live = l.get_mut(&id).ok_or_else(|| anyhow!("page {id} has not painted"))?;
+            if (live.width, live.height) != (vw as usize, vh as usize) {
+                bail!("page {id} painted {}x{}, not its {vw}x{vh} view", live.width, live.height);
+            }
+            live.armed = None;
+            swap(live, rows)
+        });
+        let _ = tx.send(r);
+    });
+    rx.await.map_err(|_| anyhow!("page {id}'s UI thread dropped the freeze"))?
+}
+
+/// Send an armed condition's check for paint generation `p` (UI thread).
+fn send_check(id: i32, expr: &str, p: u64) {
+    let msg_id = hub().next_msg.fetch_add(1, Ordering::SeqCst);
+    let expression = format!("(async () => {{ return ({expr}); }})()");
+    let body = serde_json::to_vec(&json!({"id": msg_id, "method": "Runtime.evaluate",
+        "params": {"expression": expression, "returnByValue": true, "awaitPromise": true}})).unwrap();
+    CHECKS.with(|c| c.borrow_mut().insert(msg_id, (id, p)));
+    if host_of(id).map(|h| h.send_dev_tools_message(Some(&body[..])) == 1) != Some(true) {
+        CHECKS.with(|c| c.borrow_mut().remove(&msg_id));
+    }
+}
+
+/// JavaScript truthiness of a returned value (absent = undefined).
+fn truthy(v: Option<&Value>) -> bool {
+    match v {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Number(n)) => n.as_f64().is_some_and(|f| f != 0.0 && !f.is_nan()),
+        Some(Value::String(s)) => !s.is_empty(),
+        Some(_) => true,
+    }
+}
+
+/// A zeroed live view of `w`x`h` (OnPaint fills it from its dirty rects).
+fn blank_view(w: usize, h: usize) -> Segment {
+    match Segment::create(w * h * 4) {
+        Ok(s) => s,
+        Err(e) => panic!("live view segment of {w}x{h}: {e}"),
+    }
 }

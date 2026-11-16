@@ -45,6 +45,17 @@ fn lifecycle_name(wait_until: &str) -> Result<&'static str> {
     })
 }
 
+/// waitForSelector's predicate for `state`, and the polling it uses.
+pub fn selector_predicate(selector: &str, state: &str) -> Result<(String, Value)> {
+    let sel = serde_json::to_string(selector)?;
+    let visible = "(el) => { const st = getComputedStyle(el); const r = el.getBoundingClientRect(); return st.visibility !== 'hidden' && r.width > 0 && r.height > 0; }";
+    Ok(match state {
+        "visible" => (format!("(() => {{ const el = document.querySelector({sel}); return !!el && ({visible})(el); }})()"), json!("raf")),
+        "hidden" => (format!("(() => {{ const el = document.querySelector({sel}); return !el || !({visible})(el); }})()"), json!("raf")),
+        _ => (format!("!!document.querySelector({sel})"), json!("mutation")),
+    })
+}
+
 /// Timeout in ms -> deadline; 0 disables the timeout, as in puppeteer.
 fn deadline(ms: u64) -> Option<Instant> {
     (ms > 0).then(|| Instant::now() + Duration::from_millis(ms))
@@ -219,13 +230,7 @@ impl Page {
 
     /// page.waitForSelector(selector, {visible, hidden, timeout}).
     pub async fn wait_for_selector(&self, selector: &str, state: &str, timeout_ms: u64) -> Result<()> {
-        let sel = serde_json::to_string(selector)?;
-        let visible = "(el) => { const st = getComputedStyle(el); const r = el.getBoundingClientRect(); return st.visibility !== 'hidden' && r.width > 0 && r.height > 0; }";
-        let (pred, polling) = match state {
-            "visible" => (format!("(() => {{ const el = document.querySelector({sel}); return !!el && ({visible})(el); }})()"), json!("raf")),
-            "hidden" => (format!("(() => {{ const el = document.querySelector({sel}); return !el || !({visible})(el); }})()"), json!("raf")),
-            _ => (format!("!!document.querySelector({sel})"), json!("mutation")),
-        };
+        let (pred, polling) = selector_predicate(selector, state)?;
         let msg = format!("Waiting for selector `{selector}` failed: Waiting failed: {timeout_ms}ms exceeded");
         self.poll(&pred, &polling, timeout_ms, &msg).await.map(|_| ())
     }

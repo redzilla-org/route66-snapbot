@@ -234,6 +234,8 @@ pub struct PageState {
     pub loader: String,
     pub lifecycle: HashMap<String, HashSet<String>>,
     pub same_doc: u64,
+    /// Every __r66Rendered(name) payload the page called, in order.
+    pub rendered: Vec<String>,
     pub doc_resp: HashMap<String, DocResponse>,
     pub extra: HashMap<String, Vec<(i64, Value)>>,
     pub inflight: HashSet<String>,
@@ -248,6 +250,9 @@ pub struct PageState {
     /// Every http(s) origin a frame of this page navigated to, main or child;
     /// the request's storage is cleared for exactly these (route66 GH #4471).
     pub origins: HashSet<String>,
+    /// The paint generation at the last main-frame commit: a goto finishes at
+    /// the first paint after it (route66 GH #4486).
+    pub committed_at: u64,
 }
 
 /// The tallest CEF view a single CDP screenshot captures. A taller document
@@ -264,10 +269,6 @@ pub struct Shot {
     pub timings: Map<String, Value>,
 }
 
-/// Elapsed whole ms since `t`, as a JSON unsigned integer.
-fn ms_since(t: Instant) -> Value {
-    json!(t.elapsed().as_millis() as u64)
-}
 
 /// One attached page session.
 pub struct Page {
@@ -378,7 +379,7 @@ impl Page {
         let state = Arc::new(Mutex::new(PageState::default()));
         let (tick_tx, tick) = watch::channel(0u64);
         let intercept: Arc<Mutex<Option<Intercept>>> = Arc::new(Mutex::new(None));
-        tokio::spawn(event_loop(handle.id, rx, state.clone(), tick_tx, intercept.clone()));
+        tokio::spawn(event_loop(handle.id, handle.slot.clone(), rx, state.clone(), tick_tx, intercept.clone()));
         let page = Page { handle, state, tick, intercept, viewport: Mutex::new(None), view: Mutex::new(None) };
         page.send("Page.enable", json!({})).await?;
         let tree = page.send("Page.getFrameTree", json!({})).await?;
@@ -391,6 +392,9 @@ impl Page {
         }
         page.send("Page.setLifecycleEventsEnabled", json!({"enabled": true})).await?;
         page.send("Runtime.enable", json!({})).await?;
+        // The page's own render callback names its trigger point by calling
+        // __r66Rendered(name); CDP keeps the binding across navigations.
+        page.send("Runtime.addBinding", json!({"name": "__r66Rendered"})).await?;
         page.send("Network.enable", json!({})).await?;
         page.send("Log.enable", json!({})).await?;
         Ok(page)
@@ -453,8 +457,13 @@ impl Page {
         if capture_height < height || capture_height > TILE_MAX as i64 {
             bail!("capture height {capture_height} must be {height}..={TILE_MAX} (viewport height up to the compositor view limit)");
         }
+        let since = self.paint_generation();
         cefhost::resize(&self.handle, width as i32, capture_height as i32).await?;
         self.send("Emulation.setDeviceMetricsOverride", device_metrics(width, height)).await?;
+        // The view change finishes when painted at its new size.
+        tokio::time::timeout(Duration::from_secs(30), cefhost::painted_at_size(&self.handle, since, width as i32, capture_height as i32))
+            .await
+            .map_err(|_| anyhow!("the {width}x{capture_height} view did not paint within the 30s step deadline"))??;
         self.send("Emulation.setTouchEmulationEnabled", json!({"enabled": false})).await?;
         *self.viewport.lock().unwrap() = Some((width, height));
         *self.view.lock().unwrap() = Some((width, capture_height));
@@ -539,24 +548,39 @@ impl Page {
         Ok(())
     }
 
-    /// The screenshot, read from the painted OSR view: no CDP capture, no PNG
-    /// encode or decode, no resize (route66 owner 2026-11-15). The readiness
-    /// signal is unchanged: two animation frames, after which OnPaint has
-    /// delivered the frame (byte-identical to Page.captureScreenshot's on
-    /// route66 detail, search, map and home pages, both markets). `full_page`
-    /// is the whole capture view, its top row at the current scroll position;
-    /// otherwise the top viewport-height rows.
-    pub async fn screenshot(&self, full_page: bool) -> Result<Shot> {
+    /// Freeze the painted view for an image (cefhost::freeze): `full_page` is
+    /// the whole capture view, its top row at the current scroll position;
+    /// otherwise the top viewport-height rows. No CDP capture, no PNG round
+    /// trip, no resize, no timer (route66 owner 2026-11-15/16, GH #4486).
+    pub async fn freeze(&self, full_page: bool) -> Result<cefhost::Frozen> {
         let (_, vh) = self.viewport.lock().unwrap().unwrap_or((800, 600));
         let (_, ch) = self.view.lock().unwrap().unwrap_or((800, 600));
-        let mut timings = Map::new();
-        let t = Instant::now();
-        self.settle_frames().await?;
-        timings.insert("settle_ms".into(), ms_since(t));
-        let t = Instant::now();
-        let frame = cefhost::read_view(&self.handle, if full_page { ch } else { vh } as usize)?;
-        timings.insert("copy_ms".into(), ms_since(t));
-        Ok(Shot { frame, tiles: 0, timings })
+        cefhost::freeze(&self.handle, if full_page { ch } else { vh } as usize).await
+    }
+
+    /// Arm a capture for the image after the next step (cefhost::arm).
+    pub async fn arm(&self, full_page: bool, completes: Option<cefhost::Completes>) -> tokio::sync::oneshot::Receiver<Result<cefhost::Frozen>> {
+        let (_, vh) = self.viewport.lock().unwrap().unwrap_or((800, 600));
+        let (_, ch) = self.view.lock().unwrap().unwrap_or((800, 600));
+        cefhost::arm(&self.handle, if full_page { ch } else { vh } as usize, completes).await
+    }
+
+    pub fn ready_posted(&self) {
+        cefhost::ready_posted(&self.handle)
+    }
+
+    pub fn disarm(&self) {
+        cefhost::disarm(&self.handle)
+    }
+
+    /// Wait for the page to paint after generation `since` (a step's result).
+    pub async fn painted_after(&self, since: u64) -> Result<u64> {
+        cefhost::painted_after(&self.handle, since).await
+    }
+
+    /// The page's current paint generation.
+    pub fn paint_generation(&self) -> u64 {
+        cefhost::paint_generation(&self.handle)
     }
 
     /// Capture the compositor's finished visible surface through CDP, then
@@ -631,7 +655,7 @@ impl Page {
         add_ms(&mut timings, "restore_ms", t);
         captured?;
         restored?;
-        Ok(Shot { frame: Frame { seg, width, height, stride }, tiles, timings })
+        Ok(Shot { frame: Frame { seg: Arc::new(seg), width, height, stride }, tiles, timings })
     }
 
     /// The response body text as puppeteer's HTTPResponse.text() decodes it.
@@ -760,7 +784,7 @@ fn decode_screenshot(bytes: &[u8], width: usize, height: usize) -> Result<Frame>
         }
         other => bail!("captureScreenshot returned unsupported PNG color type {other:?}"),
     }
-    Ok(Frame { seg, width, height, stride })
+    Ok(Frame { seg: Arc::new(seg), width, height, stride })
 }
 
 fn eval_result(v: &Value) -> Result<Option<Value>> {
@@ -780,6 +804,7 @@ fn eval_result(v: &Value) -> Result<Option<Value>> {
 
 async fn event_loop(
     page: i32,
+    slot: Arc<cefhost::Slot>,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<Event>,
     state: Arc<Mutex<PageState>>,
     tick: watch::Sender<u64>,
@@ -790,6 +815,12 @@ async fn event_loop(
         let p = &ev.params;
         match ev.method.as_str() {
             "Fetch.requestPaused" => handle_paused(page, p, &state, &intercept),
+            // A main-frame commit replaces the document: only its own paints count.
+            "Page.frameNavigated" if p["frame"].get("parentId").is_none() => {
+                let mut st = state.lock().unwrap();
+                st.committed_at = cefhost::slot_generation(&slot);
+                apply_event(&mut st, &ev.method, p);
+            }
             _ => apply_event(&mut state.lock().unwrap(), &ev.method, p),
         }
         n += 1;
@@ -818,6 +849,9 @@ fn apply_event(st: &mut PageState, method: &str, p: &Value) {
                 st.url = format!("{}{}", s(f, "url"), s(f, "urlFragment"));
                 st.loader = s(f, "loaderId");
             }
+        }
+        "Runtime.bindingCalled" if p.get("name").and_then(Value::as_str) == Some("__r66Rendered") => {
+            st.rendered.push(s(p, "payload"));
         }
         "Page.navigatedWithinDocument" => {
             if s(p, "frameId") == st.main_frame {

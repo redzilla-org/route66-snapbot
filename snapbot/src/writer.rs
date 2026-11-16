@@ -20,9 +20,13 @@ pub fn submit(frame: &Arc<Frame>) -> JoinHandle<Result<Value>> {
             .context("PNG encoder task exited")??;
         let encode_ms = started.elapsed().as_millis() as u64;
         let started = std::time::Instant::now();
-        let stored = crate::store::put_content(png, "image/png").await?;
+        let mut stored = crate::store::put_content(png, "image/png").await?;
+        let write_ms = started.elapsed().as_millis() as u64;
         eprintln!("SNAPBOT-PNG-WRITTEN {}", serde_json::json!({"url": stored["url"], "bytes": stored["bytes"],
-            "sha1": stored["sha1"], "encode_ms": encode_ms, "write_ms": started.elapsed().as_millis() as u64}));
+            "sha1": stored["sha1"], "encode_ms": encode_ms, "write_ms": write_ms}));
+        // The shot's per-reader timings (browse.rs moves them into its timings).
+        stored["encode_ms"] = encode_ms.into();
+        stored["write_ms"] = write_ms.into();
         Ok(stored)
     })
 }

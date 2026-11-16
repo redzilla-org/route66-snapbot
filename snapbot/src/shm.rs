@@ -1,11 +1,11 @@
-//! One memfd segment per captured frame.
+//! memfd segments for frames.
 //!
-//! WHY (owner 2026-10-07: "pass the raw frame byte buffers to the writer process
-//! via shared memory, not a pipe", then "Allocate one memfd segment per frame on
-//! demand and free it after the write"). Chromium's screenshot PNG is decoded
-//! into this segment; OCR reads it in place and the PNG writer process maps the same
-//! pages through the passed fd. memfd is anonymous memory, so /dev/shm's size
-//! (Docker's 64 MB default) never bounds it.
+//! WHY: each page's live view is one memfd that OnPaint patches with its dirty
+//! rects (cefhost.rs; route66 GH #4486), and a view shot reads it in place:
+//! OCR, inspect and the PNG encode, which runs in-process in the lane
+//! (writer.rs), all read the same mapping. The legacy CDP document path still
+//! decodes its PNG tiles into a segment of its own. memfd is anonymous memory,
+//! so /dev/shm's size (Docker's 64 MB default) never bounds it.
 
 use anyhow::{bail, Result};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -88,9 +88,11 @@ impl Drop for Segment {
     }
 }
 
-/// One captured frame: BGRA rows, `stride` bytes apart, in its own segment.
+/// One captured frame: BGRA rows, `stride` bytes apart, in a segment that is
+/// never written again once a frame holds it (a view shot shares the page's
+/// last painted segment; see cefhost::read_view).
 pub struct Frame {
-    pub seg: Segment,
+    pub seg: std::sync::Arc<Segment>,
     pub width: usize,
     pub height: usize,
     pub stride: usize,
