@@ -550,14 +550,18 @@ impl Page {
         Ok(())
     }
 
-    /// Freeze the painted view for an image (cefhost::freeze): `full_page` is
-    /// the whole capture view, its top row at the current scroll position;
-    /// otherwise the top viewport-height rows. No CDP capture, no PNG round
-    /// trip, no resize, no timer (route66 owner 2026-11-15/16, GH #4486).
+    /// Freeze the view for an image (cefhost::freeze) on the first paint after
+    /// an invalidate: `full_page` is the whole capture view, its top row at
+    /// the current scroll position; otherwise the top viewport-height rows. No
+    /// CDP capture, no PNG round trip, no resize, no timer (route66 owner
+    /// 2026-11-15/16, GH #4486). The caller's deadline bounds the paint wait.
     pub async fn freeze(&self, full_page: bool) -> Result<cefhost::Frozen> {
         let (_, vh) = self.viewport.lock().unwrap().unwrap_or((800, 600));
         let (_, ch) = self.view.lock().unwrap().unwrap_or((800, 600));
-        cefhost::freeze(&self.handle, if full_page { ch } else { vh } as usize).await
+        cefhost::freeze(&self.handle, if full_page { ch } else { vh } as usize)
+            .await
+            .await
+            .map_err(|_| anyhow!("page {}'s unarmed capture was dropped", self.handle.id))?
     }
 
     /// Arm a capture for the image after the next step (cefhost::arm).

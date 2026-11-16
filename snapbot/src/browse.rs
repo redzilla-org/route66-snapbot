@@ -557,14 +557,23 @@ async fn screenshot_step(step: &Step, page: &Page, armed: Option<crate::cefhost:
     }
     inspect_spec["resolved_regions"] = json!(resolved);
 
-    // Freeze the painted view: the image is the page as its last step's paint
-    // left it (route66 GH #4486). The previous step already awaited its paint.
+    // Freeze the painted view (route66 GH #4486). An armed image froze on the
+    // first paint after its step completed. An unarmed one (first in a
+    // request, after another image, or after a skipped step) freezes on the
+    // first paint after an invalidate, never the last delivered frame: that
+    // froze a document's first paint (local-verify 20261116T070021Z
+    // california/CTH/workflow-saved-search-newsfeed). No paint within the
+    // deadline is the unarmed twin of the armed "never swapped" error.
     let t = Instant::now();
     let frozen = match armed {
         Some(f) => f,
-        None => tokio::time::timeout(Duration::from_millis(SCREENSHOT_TIMEOUT_MS), page.freeze(full_page))
-            .await
-            .map_err(|_| anyhow!("screenshot freeze exceeded {SCREENSHOT_TIMEOUT_MS}ms"))??,
+        None => match tokio::time::timeout(Duration::from_millis(SCREENSHOT_TIMEOUT_MS), page.freeze(full_page)).await {
+            Ok(r) => r?,
+            Err(_) => {
+                page.disarm();
+                bail!("screenshot not painted within its {SCREENSHOT_TIMEOUT_MS}ms deadline (unarmed capture never swapped)");
+            }
+        },
     };
     let capture_ms = t.elapsed().as_millis() as u64;
     let frame = Arc::new(frozen.frame);
