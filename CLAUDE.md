@@ -15,41 +15,27 @@ do NOT move to docker hub". A `FROM` pointing at Docker Hub is rejected.
 
 `.github/workflows/image.yml` pulls ECR Public anonymously and has no AWS
 credential. Run 36532827638 (commit f3b4946) failed its `test` job with
-`429 Too Many Requests ... toomanyrequests: Data limit exceeded`, and no release
-published. The repository has no Actions secrets, and no AWS account holds a
-GitHub OIDC provider or a role trusting this repository. The workflow cannot
-publish until an owner-authorized credential exists: an OIDC role scoped to
-`repo:redzilla-org/route66-snapbot:*` with `ecr-public:GetAuthorizationToken`
-and `sts:GetServiceBearerToken`, then `aws-actions/configure-aws-credentials`
-and `aws-actions/amazon-ecr-login` (`registry-type: public`) ahead of both
-docker builds.
+`429 Too Many Requests ... toomanyrequests: Data limit exceeded`. The workflow
+publishes only the GitHub release archive; it never pushes to ECR. `publish`
+exits 0 when `snapbot-<sha>` already exists.
 
-Until then an image is published from the owner workstation, from the route66
-checkout, against a clean snapbot checkout at the commit:
+## Deploy (arm64 only, route66 GH #4470)
 
-```
-python D:/git/route66/scripts/maintenance/publish_snapbot_release_from_laptop_gh4115.py D:/git/route66-snapbot <sha>
-python D:/git/route66/scripts/maintenance/push_snapbot_image_to_ecr_gh4115.py <sha>
-```
+The snapbot Lambdas are arm64-only. The ECR repository `route66-snapbot` has
+IMMUTABLE tags, and the image is built only by the Graviton CodeBuild project
+`route66-snapbot-arm64-image`. Never build or push a snapbot image from the
+laptop: a workstation build is amd64, the stack refuses it, and the immutable
+SHA tag it occupies can never be replaced by the correct arm64 build.
 
-The first builds `ghcr.io/redzilla-org/route66-snapbot:<sha>` locally and
-creates the `snapbot-<sha>` release. The second tags that local image into the
-ECR repository, pushes it, and prints the ECR digest. f3b4946 was published this
-way (`sha256:d522f0f4eae89af8e92951a266bf33193c9b649fd6a6432ad3d78489af44de1d`).
-The 429 is intermittent: c78ae6f and 33472fc passed `test`, then failed
-`publish` on `a release with the same tag name already exists`, because the
-workstation release landed first. `publish` now exits 0 when `snapbot-<sha>`
-already exists, so CI never pushes a second build under a published pin.
-The Lambda moves to a new image through route66
-`scripts/deployment/deploy_snapbot.py`.
-
-Deployment resolves an already-published ECR SHA tag to its immutable digest;
-it never packages or rebuilds an image. Keep the tested build identity explicit
-when a later deployment-tool-only commit advances HEAD:
+The only supported command, from the route66 checkout against clean, pushed
+snapbot main:
 
 ```
-python D:/git/route66/scripts/deployment/deploy_snapbot.py deploy --sha <built-full-commit-sha>
+python D:/git/route66/scripts/deployment/deploy_snapbot.py deploy
 ```
 
-Without `--sha`, deploy selects current HEAD. Missing publication fails before
-stack mutation. The explicit `package` mode remains a separate build/push action.
+With no `--sha` it selects HEAD; if HEAD has no ECR image, `attestor/deploy.py`
+builds it on CodeBuild first, refuses any image that is not arm64, and deploys
+the stack by immutable digest. `--sha <full sha>` only selects an earlier image
+that CodeBuild already published (for a later deployment-tool-only commit); it
+never builds.
