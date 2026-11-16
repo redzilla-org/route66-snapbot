@@ -88,7 +88,9 @@ struct Armed {
     seen_fcp: bool,
     /// The surface capture was sent: later ready events send no second one.
     shooting: bool,
-    /// A wait_for_* condition checked per paint (Completes::Condition).
+    /// A condition poll is in flight (start_poll).
+    polling: bool,
+    /// A wait_for_* condition polled per animation frame (Completes::Condition).
     cond: Option<String>,
     /// The __r66Rendered payload that completes (Completes::Rendered).
     rendered: Option<String>,
@@ -112,8 +114,8 @@ pub enum Completes {
     Truthy,
     /// Page.navigate's reply names the loader; its `name` lifecycle event completes.
     Lifecycle(String),
-    /// A wait_for_* condition, checked on the UI thread after every paint
-    /// (and once at arm time); a true check with no newer paint completes.
+    /// A wait_for_* condition, polled in the page from arm time once per
+    /// animation frame (start_poll); its first truthy value completes.
     Condition(String),
     /// The page's __r66Rendered(name) call: the observer sends the surface
     /// capture from that callback.
@@ -170,7 +172,7 @@ thread_local! {
     static SHOTS: RefCell<HashMap<i32, (i32, u64, ShotStage)>> = RefCell::new(HashMap::new());
     /// In-flight CDP messages that complete an armed step: msg id -> (page, how).
     static COMPLETING: RefCell<HashMap<i32, (i32, Completes, String)>> = RefCell::new(HashMap::new());
-    /// In-flight paint checks of an armed condition: msg id -> (page, the paint generation it checks).
+    /// In-flight condition polls: msg id -> (page, capture token).
     static CHECKS: RefCell<HashMap<i32, (i32, u64)>> = RefCell::new(HashMap::new());
     /// Each page's __r66Rendered payloads since its main-frame document committed.
     static RENDERED: RefCell<HashMap<i32, Vec<String>>> = RefCell::new(HashMap::new());
@@ -524,15 +526,12 @@ wrap_render_handler! {
                 return;
             }
             let id = self.slot.id.load(Ordering::SeqCst);
-            // A condition still waiting is checked against this paint; a
-            // ready one has sent its capture and needs no more checks.
-            let cond = ARMED.with(|m| m.borrow().get(&id).filter(|a| !a.ready).and_then(|a| a.cond.clone()));
             *self.slot.painted_size.lock().unwrap() = (width, height);
             // The orchestrator's step-painted signal.
             self.slot.painted.send_modify(|g| *g += 1);
-            if let Some(expr) = cond {
-                send_check(id, &expr, *self.slot.painted.borrow());
-            }
+            // A condition whose poll ended with its document restarts in the
+            // new one (a no-op while a poll runs or once ready).
+            start_poll(id);
         }
     }
 }
@@ -602,17 +601,19 @@ wrap_dev_tools_message_observer! {
                 return;
             }
             let v: Value = result.and_then(|r| serde_json::from_slice(r).ok()).unwrap_or(Value::Null);
-            // A paint check: true makes the capture ready and sends its
-            // surface capture. The check held its true reply for two animation
-            // frames (send_check); the capture forces a fresh compositor frame
-            // of the state the check read (route66 local-verify 2026-11-15
-            // 20:42 PT froze spinners on CTH search-result-page-2 with every
-            // card data-loaded). False waits for the next paint's check.
-            if let Some((page, _p)) = CHECKS.with(|c| c.borrow_mut().remove(&message_id)) {
+            // A condition poll's reply: true makes the capture ready and sends
+            // its surface capture. The poll held its true reply for two
+            // animation frames (start_poll); the capture forces a fresh
+            // compositor frame of the state it read (route66 local-verify
+            // 2026-11-15 20:42 PT froze spinners on CTH search-result-page-2
+            // with every card data-loaded). A failed poll (its document went
+            // away) restarts on the next paint.
+            if let Some((page, token)) = CHECKS.with(|c| c.borrow_mut().remove(&message_id)) {
+                poll_ended(page, token);
                 if success == 1 && truthy(v.pointer("/result/value")) {
                     ARMED.with(|m| {
-                        if let Some(a) = m.borrow_mut().get_mut(&page).filter(|a| a.cond.is_some()) {
-                            a.make_ready("paint-check");
+                        if let Some(a) = m.borrow_mut().get_mut(&page).filter(|a| a.token == token && a.cond.is_some()) {
+                            a.make_ready("poll");
                             shoot(page, a);
                         }
                     });
@@ -917,7 +918,7 @@ fn new_armed(size: ShotSize, tx: oneshot::Sender<Result<Frozen>>, cond: Option<S
     // completes a later capture on the same page.
     static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
     let token = NEXT_TOKEN.fetch_add(1, Ordering::SeqCst);
-    Armed { token, size, tx, ready: false, by: "", ready_at: None, lifecycle: None, seen_wait: false, seen_fcp: false, shooting: false, cond, rendered }
+    Armed { token, size, tx, ready: false, by: "", ready_at: None, lifecycle: None, seen_wait: false, seen_fcp: false, shooting: false, polling: false, cond, rendered }
 }
 
 /// A ready capture sends its ONE surface capture (route66 GH #4486): CDP
@@ -1068,7 +1069,6 @@ pub async fn arm(page: &PageHandle, size: ShotSize, completes: Option<Completes>
         Some(c) => hub().completes.lock().unwrap().insert(id, c),
         None => hub().completes.lock().unwrap().remove(&id),
     };
-    let gen_now = page.slot.clone();
     let (done_tx, done_rx) = oneshot::channel();
     on_ui(move || {
         ARMED.with(|m| {
@@ -1083,10 +1083,8 @@ pub async fn arm(page: &PageHandle, size: ShotSize, completes: Option<Completes>
             }
             m.borrow_mut().insert(id, a);
         });
-        // One check now: already true sends the surface capture.
-        if let Some(expr) = cond {
-            send_check(id, &expr, *gen_now.painted.borrow());
-        }
+        // The condition poll starts now: already true sends the surface capture.
+        start_poll(id);
         let _ = done_tx.send(());
     });
     let _ = done_rx.await;
@@ -1141,18 +1139,49 @@ pub async fn freeze(page: &PageHandle, size: ShotSize) -> oneshot::Receiver<Resu
     rx
 }
 
-/// Send an armed condition's check for paint generation `p` (UI thread).
-fn send_check(id: i32, expr: &str, p: u64) {
+/// Start page `id`'s armed condition poll unless one is in flight or the
+/// capture is ready (UI thread, outside ARMED's borrow). The poll runs in the
+/// page: the condition is evaluated now and then once per animation frame,
+/// as Playwright's polling: 'raf' does, independent of OnPaint. WHY: a
+/// per-paint check never re-ran a condition that turned true after the last
+/// paint (contained harness on 9b47274: "wait_for_function result not
+/// captured within its 8000ms deadline (armed surface capture never
+/// returned)" for a flag set after a double rAF). A poll ended by its
+/// document (navigation) restarts on the next paint, the new document's.
+fn start_poll(id: i32) {
+    let started = ARMED.with(|m| {
+        let mut m = m.borrow_mut();
+        let a = m.get_mut(&id)?;
+        if a.ready || a.polling {
+            return None;
+        }
+        let expr = a.cond.clone()?;
+        a.polling = true;
+        Some((a.token, expr))
+    });
+    let Some((token, expr)) = started else { return };
     let msg_id = hub().next_msg.fetch_add(1, Ordering::SeqCst);
     // A true result waits two animation frames before replying, so the state
-    // it read is committed before the reply sends the surface capture.
-    let expression = format!("(async () => {{ const v = await ({expr}); if (v) {{ await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))); }} return v; }})()");
+    // it read is committed before the reply sends the surface capture. The
+    // page-global token ends a superseded poll (a later capture's poll on the
+    // same document) instead of leaving it looping every frame.
+    let expression = format!("(async () => {{ globalThis.__r66Poll = {token}; while (globalThis.__r66Poll === {token}) {{ const v = await ({expr}); if (v) {{ await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))); return v; }} await new Promise(r => requestAnimationFrame(r)); }} return false; }})()");
     let body = serde_json::to_vec(&json!({"id": msg_id, "method": "Runtime.evaluate",
         "params": {"expression": expression, "returnByValue": true, "awaitPromise": true}})).unwrap();
-    CHECKS.with(|c| c.borrow_mut().insert(msg_id, (id, p)));
+    CHECKS.with(|c| c.borrow_mut().insert(msg_id, (id, token)));
     if host_of(id).map(|h| h.send_dev_tools_message(Some(&body[..])) == 1) != Some(true) {
         CHECKS.with(|c| c.borrow_mut().remove(&msg_id));
+        poll_ended(id, token);
     }
+}
+
+/// Capture `token`'s poll on page `id` is no longer in flight.
+fn poll_ended(id: i32, token: u64) {
+    ARMED.with(|m| {
+        if let Some(a) = m.borrow_mut().get_mut(&id).filter(|a| a.token == token) {
+            a.polling = false;
+        }
+    });
 }
 
 /// JavaScript truthiness of a returned value (absent = undefined).

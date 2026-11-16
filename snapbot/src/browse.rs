@@ -727,7 +727,7 @@ fn completes_for(step: &Step) -> Option<crate::cefhost::Completes> {
     use crate::cefhost::Completes;
     match step.op.as_str() {
         "evaluate" => Some(Completes::Reply),
-        // A wait completes on a paint its condition holds for (checked per paint).
+        // A wait completes when its condition holds (polled per animation frame).
         "wait_for_function" => call_expr(step.raw.get("fn"), step.raw.get("arg")).ok().map(Completes::Condition),
         "wait_for_render" => Some(Completes::Rendered(js_arg(step, "name"))),
         "wait_for_selector" => {
