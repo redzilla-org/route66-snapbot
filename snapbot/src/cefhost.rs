@@ -157,6 +157,8 @@ thread_local! {
     static COMPLETING: RefCell<HashMap<i32, (i32, Completes, String)>> = RefCell::new(HashMap::new());
     /// In-flight paint checks of an armed condition: msg id -> (page, the paint generation it checks).
     static CHECKS: RefCell<HashMap<i32, (i32, u64)>> = RefCell::new(HashMap::new());
+    /// Each page's __r66Rendered payloads since its main-frame document committed.
+    static RENDERED: RefCell<HashMap<i32, Vec<String>>> = RefCell::new(HashMap::new());
 }
 
 /// A CEF (UTF-16) string as a Rust String.
@@ -560,6 +562,7 @@ wrap_life_span_handler! {
             hub().sessions.lock().unwrap().remove(&id);
             UI.with(|u| u.borrow_mut().browsers.remove(&id));
             LIVE.with(|l| l.borrow_mut().remove(&id));
+            RENDERED.with(|r| r.borrow_mut().remove(&id));
             if let Some(tx) = hub().closed.lock().unwrap().remove(&id) {
                 let _ = tx.send(());
             }
@@ -655,8 +658,13 @@ wrap_dev_tools_message_observer! {
             let method = method.map(cs).unwrap_or_default();
             let params: Value = params.and_then(|p| serde_json::from_slice(p).ok()).unwrap_or(Value::Null);
             // The page's render callback: freeze the last paint in this callback.
+            // A main-frame commit starts a new document's render calls.
+            if method == "Page.frameNavigated" && params.pointer("/frame/parentId").is_none() {
+                RENDERED.with(|r| r.borrow_mut().remove(&id));
+            }
             if method == "Runtime.bindingCalled" && params.get("name").and_then(Value::as_str) == Some("__r66Rendered") {
                 let payload = params.get("payload").and_then(Value::as_str).unwrap_or("").to_string();
+                RENDERED.with(|r| r.borrow_mut().entry(id).or_default().push(payload.clone()));
                 let view = *self.slot.view.lock().unwrap();
                 LIVE.with(|l| {
                     let mut l = l.borrow_mut();
@@ -972,12 +980,23 @@ pub async fn arm(page: &PageHandle, rows: usize, completes: Option<Completes>) -
         None => hub().completes.lock().unwrap().remove(&id),
     };
     let gen_now = page.slot.clone();
+    let view = *page.slot.view.lock().unwrap();
     let (done_tx, done_rx) = oneshot::channel();
     on_ui(move || {
         LIVE.with(|l| {
             let mut l = l.borrow_mut();
             let live = l.entry(id).or_insert_with(|| Live { width: 0, height: 0, seg: blank_view(1, 1), paints: 0, paint_bytes: 0, armed: None });
             live.armed = Some(Armed { rows, tx, ready: false, by: "", ready_at: None, lifecycle: None, seen_wait: false, seen_fcp: false, painted_after_fcp: false, cond: cond.clone(), rendered: rendered.clone() });
+            // Already rendered in this document: its callback ran after its
+            // double rAF, so the last paint shows it; freeze that now.
+            if let Some(name) = &rendered {
+                if RENDERED.with(|r| r.borrow().get(&id).is_some_and(|v| v.contains(name))) {
+                    if let Some(a) = live.armed.as_mut() {
+                        a.make_ready("rendered-earlier");
+                    }
+                    complete(live, view);
+                }
+            }
         });
         // One check now: already true with no paint pending freezes the last paint.
         if let Some(expr) = cond {

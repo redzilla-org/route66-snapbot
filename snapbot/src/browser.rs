@@ -234,8 +234,10 @@ pub struct PageState {
     pub loader: String,
     pub lifecycle: HashMap<String, HashSet<String>>,
     pub same_doc: u64,
-    /// Every __r66Rendered(name) payload the page called, in order.
+    /// Every __r66Rendered(name) payload the page called, in order, and the
+    /// index where the current main-frame document's calls begin.
     pub rendered: Vec<String>,
+    pub rendered_from: usize,
     pub doc_resp: HashMap<String, DocResponse>,
     pub extra: HashMap<String, Vec<(i64, Value)>>,
     pub inflight: HashSet<String>,
@@ -845,6 +847,8 @@ fn apply_event(st: &mut PageState, method: &str, p: &Value) {
                 st.origins.insert(origin);
             }
             if f.get("parentId").is_none() {
+                // A new document: only its own render calls count.
+                st.rendered_from = st.rendered.len();
                 st.main_frame = s(f, "id");
                 st.url = format!("{}{}", s(f, "url"), s(f, "urlFragment"));
                 st.loader = s(f, "loaderId");

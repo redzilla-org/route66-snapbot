@@ -787,7 +787,8 @@ async fn run_step_op(step: &Step, page: &Page, ctx: &mut RunCtx, t: Option<u64>)
         // chooses (after DOM insert, image decode, fonts, a double rAF).
         "wait_for_render" => {
             let name = js_arg(step, "name");
-            let seen = page.state.lock().unwrap().rendered.len();
+            // Any call since this document committed, earlier steps included.
+            let seen = page.state.lock().unwrap().rendered_from;
             let dl = Some(Instant::now() + Duration::from_millis(wait_default));
             page.wait_state(dl, |st| st.rendered[seen..].iter().any(|p| *p == name).then_some(()))
                 .await
