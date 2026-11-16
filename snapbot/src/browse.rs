@@ -678,13 +678,16 @@ async fn run_step(step: &Step, page: &Page, ctx: &mut RunCtx) -> Result<Option<V
     // local-verify 2026-11-15 20:11 PT froze every detail-not-found blank), and
     // a document whose content painted before the step returned paints nothing
     // after it (CTC ctc-home-clear-filters-resets-fields timed out on gen 7).
+    // A document with no contentful content never reaches FCP (the empty
+    // /agent/_admin_check timed out at 2026-11-15 20:42 PT): its load event,
+    // after every render-blocking resource, completes it instead.
     if step.op == "goto" {
         let w = Instant::now();
         page.wait_state(Some(Instant::now() + Duration::from_millis(deadline)), |st| {
-            st.lifecycle.get(&st.loader).filter(|l| l.contains("firstContentfulPaint")).map(|_| ())
+            st.lifecycle.get(&st.loader).filter(|l| l.contains("firstContentfulPaint") || l.contains("load")).map(|_| ())
         })
         .await
-        .ok_or_else(|| anyhow!("goto result not painted within its {deadline}ms deadline (no firstContentfulPaint)"))?;
+        .ok_or_else(|| anyhow!("goto result not painted within its {deadline}ms deadline (no firstContentfulPaint or load)"))?;
         ctx.paint_wait_ms = Some(w.elapsed().as_millis() as u64);
         return Ok(value);
     }
@@ -760,7 +763,18 @@ async fn run_step_op(step: &Step, page: &Page, ctx: &mut RunCtx, t: Option<u64>)
             let v = page.poll(&expr, &polling, wait_default, &msg).await?;
             Ok(Some(v.unwrap_or(Value::Null)))
         }
-        "evaluate" => page.evaluate(&call_expr(step.raw.get("fn"), step.raw.get("arg"))?).await,
+        "evaluate" => {
+            let expr = call_expr(step.raw.get("fn"), step.raw.get("arg"))?;
+            // An evaluate whose image follows freezes the view on its reply, so
+            // the reply waits two animation frames: a frame produced after every
+            // DOM change made before it (route66 local-verify 2026-11-15 20:42 PT
+            // froze spinners on CTH search-result-page-2 after its card wait held).
+            if ctx.armed.is_some() {
+                page.evaluate(&format!("(async () => {{ const v = await ({expr}); await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))); return v; }})()")).await
+            } else {
+                page.evaluate(&expr).await
+            }
+        }
         "click" => {
             page.locator_click(&sel(), t.unwrap_or(30000)).await?;
             Ok(Some(Value::Null))

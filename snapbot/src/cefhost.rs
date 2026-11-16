@@ -604,10 +604,15 @@ wrap_dev_tools_message_observer! {
             result: Option<&[u8]>,
         ) {
             let v: Value = result.and_then(|r| serde_json::from_slice(r).ok()).unwrap_or(Value::Null);
-            // A paint check: true with no newer paint freezes that paint; a
-            // newer paint has sent its own check; false waits for the next paint.
-            if let Some((page, p)) = CHECKS.with(|c| c.borrow_mut().remove(&message_id)) {
-                if success == 1 && truthy(v.pointer("/result/value")) && *self.slot.painted.borrow() == p {
+            // A paint check: true freezes the live view now. The check held its
+            // true reply for two animation frames (send_check), so the view
+            // already holds a frame produced after the state it read: a check
+            // run after paint P can read DOM changed after P's commit (route66
+            // local-verify 2026-11-15 20:42 PT froze spinners on
+            // CTH search-result-page-2 with every card data-loaded). False
+            // waits for the next paint's check.
+            if let Some((page, _p)) = CHECKS.with(|c| c.borrow_mut().remove(&message_id)) {
+                if success == 1 && truthy(v.pointer("/result/value")) {
                     let view = *self.slot.view.lock().unwrap();
                     LIVE.with(|l| {
                         let mut l = l.borrow_mut();
@@ -1062,7 +1067,9 @@ pub async fn freeze(page: &PageHandle, rows: usize) -> Result<Frozen> {
 /// Send an armed condition's check for paint generation `p` (UI thread).
 fn send_check(id: i32, expr: &str, p: u64) {
     let msg_id = hub().next_msg.fetch_add(1, Ordering::SeqCst);
-    let expression = format!("(async () => {{ return ({expr}); }})()");
+    // A true result waits two animation frames before replying, so the frame
+    // painting the state it read is produced before the reply freezes the view.
+    let expression = format!("(async () => {{ const v = await ({expr}); if (v) {{ await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))); }} return v; }})()");
     let body = serde_json::to_vec(&json!({"id": msg_id, "method": "Runtime.evaluate",
         "params": {"expression": expression, "returnByValue": true, "awaitPromise": true}})).unwrap();
     CHECKS.with(|c| c.borrow_mut().insert(msg_id, (id, p)));
