@@ -181,7 +181,8 @@ async fn prime_page(page: &Page) -> Result<()> {
         phases.insert(name.to_string(), json!(t.elapsed().as_millis() as u64));
         *t = Instant::now();
     };
-    page.set_viewport(1366, 900).await?;
+    // A capture view taller than the viewport, as route66's height-declaring checks use.
+    page.set_view(1366, 900, 3000).await?;
     page.goto(&url, "load", 60000).await?;
     lap("load", &mut t);
     page.poll("window.__primed === true", &Value::Null, 60000, "prime: frames never ran").await?;
@@ -239,6 +240,8 @@ pub async fn prime(extra: &Value) -> Result<()> {
 
 struct Ctx {
     viewport: (i64, i64),
+    /// The OSR view (capture) height; the viewport height when not requested.
+    capture_height: i64,
     intercept: Option<Intercept>,
     init_scripts: Vec<String>,
     cookies: Vec<Value>,
@@ -270,6 +273,19 @@ fn parse_context(raw: Option<&Value>) -> Result<Ctx> {
             match (int("width"), int("height")) {
                 (Some(w), Some(h)) => (w, h),
                 _ => bail!("context.viewport needs integer width/height"),
+            }
+        }
+    };
+    // WHY (route66 owner 2026-11-15: capture size is a per-test-case
+    // parameter): context.capture {width, height} sizes the painted view once
+    // for the whole visit; width must be the viewport's (tiling is vertical).
+    let capture_height = match c.get("capture").filter(|v| js::truthy(Some(v))) {
+        None => viewport.1,
+        Some(v) => {
+            let int = |k: &str| v.get(k).and_then(Value::as_f64).filter(|f| f.fract() == 0.0).map(|f| f as i64);
+            match (int("width"), int("height")) {
+                (Some(w), Some(h)) if w == viewport.0 && h >= viewport.1 => h,
+                _ => bail!("context.capture needs integer width (= viewport width {}) and height (>= viewport height {})", viewport.0, viewport.1),
             }
         }
     };
@@ -307,6 +323,7 @@ fn parse_context(raw: Option<&Value>) -> Result<Ctx> {
         (!abort.is_empty() || !fulfill.is_empty() || !header_rules.is_empty()).then_some(Intercept::Browse { abort, fulfill, header_rules });
     Ok(Ctx {
         viewport,
+        capture_height,
         intercept,
         init_scripts,
         cookies: arr("cookies"),
@@ -556,6 +573,10 @@ async fn screenshot_step(step: &Step, page: &Page) -> Result<Option<Value>> {
     // Only unsigned numbers: route66's harness decodes timings as map[string]uint64.
     let mut timings = json!({"fns_ms": fns_ms, "capture_ms": capture_ms, "tiles": shot.tiles, "submit_ms": submit_ms,
                              "frame_bytes": frame.seg.len()});
+    // The capture's own phases (settle_ms, copy_ms), unsigned ms.
+    for (k, v) in &shot.timings {
+        timings[k] = v.clone();
+    }
     let mut ocr_result = None;
     let mut ocr_error = None;
     if let Some(spec) = spec {
@@ -583,7 +604,7 @@ async fn screenshot_step(step: &Step, page: &Page) -> Result<Option<Value>> {
     // The log and response use the final SHA-1 address, not a temporary name.
     eprintln!("SNAPBOT-SHOT {}", json!({"name": name, "url": page.url(), "png": stored["url"], "full_page": full_page,
                                         "width": w, "height": h, "frame_bytes": frame.seg.len(), "capture_ms": capture_ms,
-                                        "tiles": shot.tiles, "submit_ms": submit_ms}));
+                                        "tiles": shot.tiles, "submit_ms": submit_ms, "phases": shot.timings}));
     stored["timings"] = timings;
     Ok(Some(stored))
 }
@@ -718,7 +739,7 @@ async fn run_step(step: &Step, page: &Page, ctx: &mut RunCtx) -> Result<Option<V
 /// Apply the request's context-level setup to the fresh page: viewport,
 /// default timeouts, init scripts, cookies and request interception.
 async fn install_context(page: &Page, c: &mut Ctx) -> Result<()> {
-    page.set_viewport(c.viewport.0, c.viewport.1).await?;
+    page.set_view(c.viewport.0, c.viewport.1, c.capture_height).await?;
     for src in &c.init_scripts {
         page.send("Page.addScriptToEvaluateOnNewDocument", json!({"source": src})).await?;
     }

@@ -4,8 +4,8 @@
 //! The rendering switches live in cefhost (they reproduce the former puppeteer +
 //! @sparticuz/chromium argv). This module keeps the page-level contract the
 //! browse ops are written against: CDP commands, lifecycle/network/console state,
-//! request interception, and a CDP screenshot decoded into the raw BGRA frame
-//! OCR and the PNG writer share.
+//! request interception, and the screenshot: the painted OSR view copied into
+//! the raw BGRA frame OCR, inspection and the PNG writer share.
 
 use crate::cefhost::{self, Event, PageHandle};
 use crate::js;
@@ -254,10 +254,19 @@ pub struct PageState {
 /// needs vertically offset OSR views before their compositor screenshots.
 const TILE_MAX: usize = 8192;
 
-/// One screenshot: the frame plus how many CDP captures it took.
+/// One screenshot: the frame, how many CDP captures it took (0: none, the
+/// pixels came from the painted view), and its phase timings in ms.
 pub struct Shot {
     pub frame: Frame,
     pub tiles: u64,
+    /// WHY (route66 owner 2026-11-15): capture_ms alone hid where a shot's
+    /// time went. Unsigned only: route66 decodes timings as map[string]uint64.
+    pub timings: Map<String, Value>,
+}
+
+/// Elapsed whole ms since `t`, as a JSON unsigned integer.
+fn ms_since(t: Instant) -> Value {
+    json!(t.elapsed().as_millis() as u64)
 }
 
 /// One attached page session.
@@ -268,6 +277,8 @@ pub struct Page {
     pub intercept: Arc<Mutex<Option<Intercept>>>,
     /// The viewport set_viewport emulates (None: the 800x600 creation window).
     viewport: Mutex<Option<(i64, i64)>>,
+    /// The OSR view size (the capture size); None: the 800x600 creation window.
+    view: Mutex<Option<(i64, i64)>>,
 }
 
 /// JS `.slice(0, n)` over UTF-16 code units.
@@ -368,7 +379,7 @@ impl Page {
         let (tick_tx, tick) = watch::channel(0u64);
         let intercept: Arc<Mutex<Option<Intercept>>> = Arc::new(Mutex::new(None));
         tokio::spawn(event_loop(handle.id, rx, state.clone(), tick_tx, intercept.clone()));
-        let page = Page { handle, state, tick, intercept, viewport: Mutex::new(None) };
+        let page = Page { handle, state, tick, intercept, viewport: Mutex::new(None), view: Mutex::new(None) };
         page.send("Page.enable", json!({})).await?;
         let tree = page.send("Page.getFrameTree", json!({})).await?;
         {
@@ -429,10 +440,24 @@ impl Page {
     /// puppeteer setViewport (EmulationManager.emulateViewport defaults). The
     /// OSR window is resized to the same size, since the window is what paints.
     pub async fn set_viewport(&self, width: i64, height: i64) -> Result<()> {
-        cefhost::resize(&self.handle, width as i32, height as i32).await?;
+        self.set_view(width, height, height).await
+    }
+
+    /// The CSS viewport `width`x`height` painted in a `width`x`capture_height`
+    /// OSR view. WHY (route66 owner 2026-11-15: capture size is a per-test-case
+    /// parameter, "NO resize at capture time"): the view is sized once, when
+    /// the request's context is installed, so every row a screenshot reads is
+    /// painted during the visit; emulation keeps layout, viewport units and
+    /// media queries on the requested viewport.
+    pub async fn set_view(&self, width: i64, height: i64, capture_height: i64) -> Result<()> {
+        if capture_height < height || capture_height > TILE_MAX as i64 {
+            bail!("capture height {capture_height} must be {height}..={TILE_MAX} (viewport height up to the compositor view limit)");
+        }
+        cefhost::resize(&self.handle, width as i32, capture_height as i32).await?;
         self.send("Emulation.setDeviceMetricsOverride", device_metrics(width, height)).await?;
         self.send("Emulation.setTouchEmulationEnabled", json!({"enabled": false})).await?;
         *self.viewport.lock().unwrap() = Some((width, height));
+        *self.view.lock().unwrap() = Some((width, capture_height));
         Ok(())
     }
 
@@ -445,8 +470,11 @@ impl Page {
     }
 
     pub async fn set_intercept(&self, rules: Intercept) -> Result<()> {
+        // WHY (route66 owner 2026-11-15): no Network.setCacheDisabled. The
+        // context's HTTP cache stays warm by owner order (browse.rs); Fetch's
+        // request stage runs before the cache, so abort and fulfill rules still
+        // apply to cached URLs, and a fulfilled body is never cached.
         *self.intercept.lock().unwrap() = Some(rules);
-        self.send("Network.setCacheDisabled", json!({"cacheDisabled": true})).await?;
         self.send("Fetch.enable", json!({"patterns": [{"urlPattern": "*"}], "handleAuthRequests": false})).await?;
         Ok(())
     }
@@ -511,33 +539,55 @@ impl Page {
         Ok(())
     }
 
-    /// Capture the compositor's finished visible surface through CDP, then
-    /// decode it into the BGRA frame consumed by OCR and the PNG writer.
-    async fn capture_frame(&self, width: usize, height: usize, y: Option<usize>) -> Result<Frame> {
+    /// The screenshot, read from the painted OSR view: no CDP capture, no PNG
+    /// encode or decode, no resize (route66 owner 2026-11-15). The readiness
+    /// signal is unchanged: two animation frames, after which OnPaint has
+    /// delivered the frame (byte-identical to Page.captureScreenshot's on
+    /// route66 detail, search, map and home pages, both markets). `full_page`
+    /// is the whole capture view, its top row at the current scroll position;
+    /// otherwise the top viewport-height rows.
+    pub async fn screenshot(&self, full_page: bool) -> Result<Shot> {
+        let (_, vh) = self.viewport.lock().unwrap().unwrap_or((800, 600));
+        let (_, ch) = self.view.lock().unwrap().unwrap_or((800, 600));
+        let mut timings = Map::new();
+        let t = Instant::now();
         self.settle_frames().await?;
-        let mut params = json!({"format": "png", "fromSurface": true,
-                                "captureBeyondViewport": y.is_some(), "optimizeForSpeed": true});
-        // CDP's clip bounds the PNG to the painted OSR tile and selects its
-        // document offset; beyond-viewport painting preserves the CSS viewport.
-        if let Some(y) = y {
-            params["clip"] = json!({"x": 0, "y": y, "width": width, "height": height, "scale": 1});
-        }
-        let reply = self
-            .send("Page.captureScreenshot", params)
-            .await?;
-        let encoded = reply.get("data").and_then(Value::as_str).ok_or_else(|| anyhow!("captureScreenshot returned no PNG data"))?;
-        let png = base64::engine::general_purpose::STANDARD.decode(encoded)?;
-        decode_screenshot(&png, width, height)
+        timings.insert("settle_ms".into(), ms_since(t));
+        let t = Instant::now();
+        let frame = cefhost::read_view(&self.handle, if full_page { ch } else { vh } as usize)?;
+        timings.insert("copy_ms".into(), ms_since(t));
+        Ok(Shot { frame, tiles: 0, timings })
     }
 
-    /// CEF's off-screen CDP capture repeats the physical viewport when asked
-    /// for a single full-content clip. Paint each clip in a tile-sized OSR view
-    /// while preserving the CSS viewport, then stitch its BGRA rows.
-    pub async fn screenshot(&self, full_page: bool) -> Result<Shot> {
+    /// Capture the compositor's finished visible surface through CDP, then
+    /// decode it into the BGRA frame consumed by OCR and the PNG writer.
+    async fn capture_frame(&self, width: usize, height: usize, y: usize, timings: &mut Map<String, Value>) -> Result<Frame> {
+        let t = Instant::now();
+        self.settle_frames().await?;
+        add_ms(timings, "settle_ms", t);
+        // CDP's clip bounds the PNG to the painted OSR tile and selects its
+        // document offset; beyond-viewport painting preserves the CSS viewport.
+        let params = json!({"format": "png", "fromSurface": true, "captureBeyondViewport": true, "optimizeForSpeed": true,
+                            "clip": {"x": 0, "y": y, "width": width, "height": height, "scale": 1}});
+        let t = Instant::now();
+        let reply = self.send("Page.captureScreenshot", params).await?;
+        add_ms(timings, "cdp_ms", t);
+        let t = Instant::now();
+        let encoded = reply.get("data").and_then(Value::as_str).ok_or_else(|| anyhow!("captureScreenshot returned no PNG data"))?;
+        let png = base64::engine::general_purpose::STANDARD.decode(encoded)?;
+        let frame = decode_screenshot(&png, width, height);
+        add_ms(timings, "decode_ms", t);
+        frame
+    }
+
+    /// The whole document from its top, at the CSS viewport: the evidence
+    /// capture's full page (capture.rs), whose content height is not known in
+    /// advance. CEF's off-screen CDP capture repeats the physical viewport when
+    /// asked for a single full-content clip. Paint each clip in a tile-sized
+    /// OSR view while preserving the CSS viewport, then stitch its BGRA rows.
+    pub async fn screenshot_document(&self) -> Result<Shot> {
         let (vw, vh) = self.viewport.lock().unwrap().unwrap_or((800, 600));
-        if !full_page {
-            return Ok(Shot { frame: self.capture_frame(vw as usize, vh as usize, None).await?, tiles: 1 });
-        }
+        let mut timings = Map::new();
         let m = self.send("Page.getLayoutMetrics", json!({})).await?;
         let size = m.get("cssContentSize").or_else(|| m.get("contentSize")).ok_or_else(|| anyhow!("getLayoutMetrics returned no content size"))?;
         let dim = |k: &str| size.get(k).and_then(Value::as_f64).filter(|f| *f > 0.0).ok_or_else(|| anyhow!("content size has no {k}"));
@@ -552,11 +602,13 @@ impl Page {
         let captured = async {
             for y in (0..height).step_by(TILE_MAX) {
                 let th = (height - y).min(TILE_MAX);
+                let t = Instant::now();
                 cefhost::resize(&self.handle, width as i32, th as i32).await?;
                 // Layout must keep the requested viewport: vh-sized content
                 // changes height if emulation uses the full document instead.
                 self.send("Emulation.setDeviceMetricsOverride", device_metrics(vw, vh)).await?;
-                let tile = self.capture_frame(width, th, Some(y)).await?;
+                add_ms(&mut timings, "resize_ms", t);
+                let tile = self.capture_frame(width, th, y, &mut timings).await?;
                 let start = y * stride;
                 seg.as_mut_slice()[start..start + tile.seg.len()].copy_from_slice(tile.seg.as_slice());
                 tiles += 1;
@@ -564,9 +616,11 @@ impl Page {
             Ok::<(), anyhow::Error>(())
         }
         .await;
-        // Restore the page's original layout even when one tile fails.
+        // Restore the page's view and layout even when one tile fails.
+        let t = Instant::now();
         let restored = async {
-            cefhost::resize(&self.handle, vw as i32, vh as i32).await?;
+            let (w, h) = self.view.lock().unwrap().unwrap_or((800, 600));
+            cefhost::resize(&self.handle, w as i32, h as i32).await?;
             let vp = *self.viewport.lock().unwrap();
             match vp {
                 Some((w, h)) => self.send("Emulation.setDeviceMetricsOverride", device_metrics(w, h)).await.map(|_| ()),
@@ -574,9 +628,10 @@ impl Page {
             }
         }
         .await;
+        add_ms(&mut timings, "restore_ms", t);
         captured?;
         restored?;
-        Ok(Shot { frame: Frame { seg, width, height, stride }, tiles })
+        Ok(Shot { frame: Frame { seg, width, height, stride }, tiles, timings })
     }
 
     /// The response body text as puppeteer's HTTPResponse.text() decodes it.
@@ -667,6 +722,12 @@ impl Page {
         }
         Ok(())
     }
+}
+
+/// Add the ms since `t` to `timings[key]` (a phase that runs once per tile).
+fn add_ms(timings: &mut Map<String, Value>, key: &str, t: Instant) {
+    let prev = timings.get(key).and_then(Value::as_u64).unwrap_or(0);
+    timings.insert(key.into(), json!(prev + t.elapsed().as_millis() as u64));
 }
 
 /// Decode Chromium's PNG once; preserve the existing BGRA memfd contract.

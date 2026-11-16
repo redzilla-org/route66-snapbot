@@ -110,7 +110,7 @@ pub async fn run(url: &str, best_dir: &str) -> Result<()> {
         let mut frame = None;
         for i in 0..3 {
             let (t, cpu) = (Instant::now(), process_cpu_ms());
-            let shot = page.screenshot(true).await?;
+            let shot = page.screenshot_document().await?;
             let (capture_ms, capture_cpu_ms) = (t.elapsed().as_millis() as u64, process_cpu_ms() - cpu);
             let (t, cpu) = (Instant::now(), thread_cpu_ms());
             let g = snapbot_ocr::from_bgra(shot.frame.seg.as_slice(), shot.frame.width, shot.frame.height, shot.frame.stride).map_err(|e| anyhow!(e))?;

@@ -2,8 +2,9 @@
 //!
 //! WHY (owner 2026-10-07, verbatim: "this sounds perfect: Embed Chromium in
 //! snapbot ... hands over the raw pixel buffer in the same process"). The page
-//! uses CEF's off-screen view for layout and CDP's compositor screenshot for
-//! complete rasterization. CDP commands stay in process through
+//! paints into CEF's off-screen view; OnPaint's BGRA buffer is kept per page and
+//! a screenshot copies it once (route66 owner 2026-11-15: no Chromium PNG
+//! round trip). CDP commands stay in process through
 //! CefBrowserHost::SendDevToolsMessage and a DevToolsMessageObserver.
 //!
 //! WHY THE `cef` CRATE (tauri-apps/cef-rs): it ships pre-generated Rust bindings
@@ -16,7 +17,8 @@
 //! object lives only on the UI thread (thread-local `UI`); tokio code reaches it
 //! by posting closures (`on_ui`) and gets answers through channels.
 
-use anyhow::{anyhow, Result};
+use crate::shm::{Frame, Segment};
+use anyhow::{anyhow, bail, Result};
 use cef::*;
 use serde_json::{json, Value};
 use std::cell::RefCell;
@@ -33,10 +35,21 @@ pub struct Event {
     pub params: Value,
 }
 
-/// The per-page OSR view size GetViewRect reads for layout.
+/// The per-page OSR view size GetViewRect reads for layout, and the view's
+/// pixels as OnPaint last delivered them.
 pub struct Slot {
     id: AtomicI32,
     view: Mutex<(i32, i32)>,
+    paint: Mutex<Paint>,
+}
+
+/// The last painted VIEW frame: OnPaint's buffer is valid only during the
+/// callback, so its dirty rects are copied here as they arrive.
+#[derive(Default)]
+struct Paint {
+    width: usize,
+    height: usize,
+    data: Vec<u8>,
 }
 
 /// Cross-thread routing: CDP replies by message id, events by browser id.
@@ -169,6 +182,14 @@ fn base_switches() -> Vec<String> {
         "--disable-site-isolation-trials",
         // The pool's acceptInsecureCerts: every caller ran with it on.
         "--ignore-certificate-errors",
+        // WHY (route66 owner 2026-11-15, capture size per test case): the OSR
+        // view is the capture size while the CSS viewport stays emulated.
+        // Without this the main frame clips its painting to the emulated
+        // viewport and every row below it stays background. It is the clip
+        // Page.captureScreenshot's captureBeyondViewport lifts per shot
+        // (record_whole_document); layout, viewport units and
+        // IntersectionObserver still see the emulated viewport.
+        "--blink-settings=mainFrameClipsContent=false",
         // WHY (route66 GH #4471): no GPU and no emulated GPU. Lambda has no GPU,
         // and no route66 page uses WebGL. SwiftShader JIT-compiled every pipeline
         // on one thread on arm64 and froze a fresh sandbox's first page 4-6 s.
@@ -385,17 +406,39 @@ wrap_render_handler! {
             }
         }
 
-        // CEF needs the OSR callback even though screenshot pixels now come
-        // from Page.captureScreenshot after Chromium completes rasterization.
+        // Keep the view's pixels: a full copy when the size changed, else only
+        // the dirty rects. Popups (select dropdowns) paint separately and are
+        // not page pixels.
         fn on_paint(
             &self,
             _browser: Option<&mut Browser>,
-            _type_: PaintElementType,
-            _dirty_rects: Option<&[Rect]>,
-            _buffer: *const u8,
-            _width: ::std::os::raw::c_int,
-            _height: ::std::os::raw::c_int,
-        ) {}
+            type_: PaintElementType,
+            dirty_rects: Option<&[Rect]>,
+            buffer: *const u8,
+            width: ::std::os::raw::c_int,
+            height: ::std::os::raw::c_int,
+        ) {
+            if type_.get_raw() != PaintElementType::VIEW.get_raw() || buffer.is_null() || width <= 0 || height <= 0 {
+                return;
+            }
+            let (w, h) = (width as usize, height as usize);
+            let row = w * 4;
+            // SAFETY: CEF hands a width*height*4 BGRA buffer for the duration of OnPaint.
+            let src = unsafe { std::slice::from_raw_parts(buffer, row * h) };
+            let mut p = self.slot.paint.lock().unwrap();
+            if (p.width, p.height) != (w, h) {
+                *p = Paint { width: w, height: h, data: src.to_vec() };
+                return;
+            }
+            for r in dirty_rects.unwrap_or(&[]) {
+                let clamp = |v: i32, max: usize| (v.max(0) as usize).min(max);
+                let (x0, x1) = (clamp(r.x, w), clamp(r.x + r.width, w));
+                for y in clamp(r.y, h)..clamp(r.y + r.height, h) {
+                    let (a, b) = (y * row + x0 * 4, y * row + x1 * 4);
+                    p.data[a..b].copy_from_slice(&src[a..b]);
+                }
+            }
+        }
     }
 }
 
@@ -496,7 +539,7 @@ pub struct PageHandle {
 /// A new about:blank windowless page in `context` (a fresh in-memory cookie
 /// jar and cache per context id), its event stream, and its paint slot.
 pub async fn create_page(context: &str, width: i32, height: i32) -> Result<(PageHandle, mpsc::UnboundedReceiver<Event>)> {
-    let slot = Arc::new(Slot { id: AtomicI32::new(-1), view: Mutex::new((width, height)) });
+    let slot = Arc::new(Slot { id: AtomicI32::new(-1), view: Mutex::new((width, height)), paint: Mutex::new(Paint::default()) });
     let (tx, rx) = mpsc::unbounded_channel();
     let ctx = context.to_string();
     let s = slot.clone();
@@ -636,4 +679,20 @@ pub async fn resize(page: &PageHandle, width: i32, height: i32) -> Result<()> {
 /// touches CEF (its calls can re-enter our handlers synchronously).
 fn host_of(id: i32) -> Option<BrowserHost> {
     UI.with(|u| u.borrow().browsers.get(&id).and_then(|b| b.browser.host()))
+}
+
+/// The top `rows` of page `id`'s last painted view, copied once into a frame
+/// segment. A painted size other than the view's means the view has not
+/// painted at its current size yet: fail hard rather than return stale pixels.
+pub fn read_view(page: &PageHandle, rows: usize) -> Result<Frame> {
+    let (vw, vh) = *page.slot.view.lock().unwrap();
+    let p = page.slot.paint.lock().unwrap();
+    if (p.width, p.height) != (vw as usize, vh as usize) {
+        bail!("the view painted {}x{}, not its {vw}x{vh} size", p.width, p.height);
+    }
+    let rows = rows.min(p.height);
+    let stride = p.width * 4;
+    let seg = Segment::create(stride * rows)?;
+    seg.as_mut_slice().copy_from_slice(&p.data[..stride * rows]);
+    Ok(Frame { seg, width: p.width, height: rows, stride })
 }

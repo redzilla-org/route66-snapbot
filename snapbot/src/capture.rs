@@ -462,7 +462,10 @@ async fn capture_with(
     }
     phase("settle", &format!("wait-ms={wait_ms}"));
     phase("screenshot-start", &format!("full-page={full_page}"));
-    let shot = tokio::time::timeout(Duration::from_secs(30), page.screenshot(full_page))
+    // A full-page evidence shot is the whole document, whose height is not
+    // known before capture; a viewport shot reads the painted view.
+    let shot = async { if full_page { page.screenshot_document().await } else { page.screenshot(false).await } };
+    let shot = tokio::time::timeout(Duration::from_secs(30), shot)
         .await
         .map_err(|_| anyhow!("screenshot exceeded 30s (phase=screenshot)"))??;
     // Attested evidence stays synchronous (owner 2026-10-07): the statement signs
