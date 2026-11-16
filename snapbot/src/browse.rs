@@ -669,8 +669,11 @@ async fn run_step(step: &Step, page: &Page, ctx: &mut RunCtx) -> Result<Option<V
         return Ok(value);
     }
     // A page-changing step with no image finishes when its result is painted:
-    // the generation recorded now, the first paint after it.
-    if matches!(step.op.as_str(), "goto" | "click" | "fill" | "check" | "press" | "type" | "evaluate") {
+    // the generation recorded now, the first paint after it. An evaluate is a
+    // read (location.href, DOM state): it damages nothing, so off-screen
+    // rendering never paints after it and a paint wait only times out. An
+    // evaluate whose image follows still completes on its reply (armed path).
+    if matches!(step.op.as_str(), "goto" | "click" | "fill" | "check" | "press" | "type") {
         let since = page.paint_generation();
         let w = Instant::now();
         tokio::time::timeout(Duration::from_millis(deadline), page.painted_after(since))
