@@ -89,6 +89,11 @@ pub async fn close_page(page: &Page) -> Result<()> {
     cefhost::close_page(page.handle.id).await
 }
 
+/// Drop every pooled connection of `context`; its cache and cookies stay.
+pub async fn close_connections(context: &str) -> Result<()> {
+    cefhost::close_all_connections(context).await
+}
+
 /// A document response the main frame received for one loader.
 #[derive(Clone, Debug)]
 pub struct DocResponse {

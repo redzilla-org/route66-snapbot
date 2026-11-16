@@ -99,6 +99,11 @@ RUN touch ocrd-rust/src/lib.rs snapbot/src/main.rs \
 RUN cargo test --release --workspace --locked \
     && echo ok > /out/unit-tests.ok
 
+# route66 GH #4487 (CI DEV premerge-97b320de, snapbot RequestId
+# 5a77a505-c349-47a2-a0c2-424ce49e367b): a browse after a sandbox freeze must
+# not ride a socket that died while frozen. One real CEF browser, local server.
+RUN /out/bootstrap stale-socket     && echo ok > /out/stale-socket.ok
+
 # ---------------------------------------------------------------------------
 # fonts: the font set the baselines were rendered with. Only fonts.tar.br is
 # taken from the integrity-checked @sparticuz/chromium 149.0.0 tarball; its
@@ -140,6 +145,7 @@ ENV TESSDATA_PREFIX=/opt/snapbot/tessdata \
 # Pulling the unit-test marker makes the test layer a dependency of this
 # stage, so a BuildKit build (which skips unreferenced stages) still runs it.
 COPY --from=native-build /out/unit-tests.ok /tmp/unit-tests.ok
+COPY --from=native-build /out/stale-socket.ok /tmp/stale-socket.ok
 # The ldd assertion (owner 2026-10-07: the static-musl `! ldd` is replaced):
 # every shared library the handler and libcef.so need resolves in this
 # userland; a single "not found" fails the build. The version command also

@@ -808,6 +808,40 @@ pub async fn dispose_context(context: &str) -> Result<()> {
     Ok(())
 }
 
+wrap_completion_callback! {
+    struct ConnectionsClosed {
+        tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    }
+
+    impl CompletionCallback {
+        fn on_complete(&self) {
+            if let Some(tx) = self.tx.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+}
+
+/// Close every idle and active connection (HTTP/1, HTTP/2, QUIC) of
+/// `context`, keeping its HTTP cache, cookies and DNS; resolves when Chromium
+/// reports them closed. A context not yet created has none.
+pub async fn close_all_connections(context: &str) -> Result<()> {
+    let ctx = context.to_string();
+    let wait = ui_call(move || {
+        UI.with(|u| u.borrow().contexts.get(&ctx).cloned()).map(|rc| {
+            let (tx, rx) = oneshot::channel();
+            let mut cb = ConnectionsClosed::new(Arc::new(Mutex::new(Some(tx))));
+            rc.close_all_connections(Some(&mut cb));
+            rx
+        })
+    })
+    .await?;
+    if let Some(w) = wait {
+        tokio::time::timeout(Duration::from_secs(5), w).await.map_err(|_| anyhow!("connections of context {context} did not close within 5s"))?.ok();
+    }
+    Ok(())
+}
+
 /// Close one page's browser and wait for it; its request context stays open.
 pub async fn close_page(id: i32) -> Result<()> {
     let wait = ui_call(move || {

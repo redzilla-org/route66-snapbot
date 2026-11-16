@@ -26,7 +26,7 @@ use base64::Engine as _;
 use regex::Regex;
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -107,6 +107,43 @@ pub async fn warm(extra: &Value) -> Result<()> {
     // WHY: opening and closing one page creates the CEF request context now, in init.
     let page = browser::new_page(Some(REQUEST_CONTEXT)).await.map_err(|e| anyhow!("warm: the browsing context could not be opened: {e:#}"))?;
     browser::close_page(&page).await?;
+    mark_idle();
+    Ok(())
+}
+
+/// WHY (route66 GH #4487, CI DEV
+/// arn:aws:states:us-east-2:686255971907:execution:chicago-dev-ci-orchestrator:premerge-97b320de45dd2235b601ba75713852fa116faf53,
+/// snapbot RequestId 5a77a505-c349-47a2-a0c2-424ce49e367b): Lambda freezes the
+/// sandbox between invocations. After a 4.95 s freeze the next document
+/// request went out on a pooled connection that had died meanwhile and never
+/// reached CloudFront. Back-to-back requests keep their warm sockets; after an
+/// idle gap longer than this, every pooled connection is dropped before the
+/// page opens, so a post-freeze request always dials fresh. The HTTP cache,
+/// DNS and TLS session cache stay warm.
+const FREEZE_GAP: Duration = Duration::from_millis(1000);
+
+/// Wall-clock ms when the last request released its page (0: none yet). Wall
+/// clock, because a frozen sandbox's monotonic clock need not advance.
+static IDLE_SINCE_MS: AtomicU64 = AtomicU64::new(0);
+
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+fn mark_idle() {
+    IDLE_SINCE_MS.store(wall_ms(), Ordering::SeqCst);
+}
+
+/// Drop the context's pooled connections when the process sat idle (frozen)
+/// longer than FREEZE_GAP since the last request.
+async fn drop_stale_connections() -> Result<()> {
+    let since = IDLE_SINCE_MS.load(Ordering::SeqCst);
+    let gap = wall_ms().saturating_sub(since);
+    if since != 0 && gap > FREEZE_GAP.as_millis() as u64 {
+        let t = Instant::now();
+        browser::close_connections(REQUEST_CONTEXT).await.map_err(|e| anyhow!("idle {gap}ms: pooled connections could not be dropped: {e:#}"))?;
+        println!("[browse] idle {gap}ms > {}ms: pooled connections dropped in {}ms", FREEZE_GAP.as_millis(), t.elapsed().as_millis());
+    }
     Ok(())
 }
 
@@ -942,6 +979,7 @@ where
     let page = {
         let mut st = pool().lock().await;
         ensure_browser(&mut st, browser_args).await?;
+        drop_stale_connections().await?;
         browser::new_page(Some(REQUEST_CONTEXT)).await.map_err(|e| anyhow!("no page could be opened for this request: {e:#}"))?
     };
     let acquire_ms = acquire_start.elapsed().as_millis() as u64;
@@ -973,6 +1011,7 @@ where
         "store": "s3",
     });
     drop(st);
+    mark_idle();
     crate::runtime::diagnostic_phase("page-released");
     Ok((result?, worker))
 }

@@ -5,6 +5,7 @@
 //!   snapbot kumo-runtime     local pool dispatcher (SNAPBOT_POOL_PROCESSES lanes)
 //!   snapbot kumo-lane        one pool lane (started by kumo-runtime)
 //!   snapbot bench <url> <dir> OCR cost measurements (Dockerfile.test only)
+//!   snapbot stale-socket     route66 GH #4487 freeze reproduction (Dockerfile.test only)
 //!   snapbot --version
 //!   snapbot --type=...       a CEF child process (renderer, GPU, utility)
 
@@ -29,6 +30,7 @@ mod ocr;
 mod pngenc;
 mod runtime;
 mod shm;
+mod stale_socket;
 mod inspect;
 mod store;
 mod writer;
@@ -70,6 +72,8 @@ async fn run() -> Result<()> {
             anyhow::ensure!(a.len() == 2, "usage: snapbot bench <url> <best-tessdata-dir>");
             bench::run(&a[0], &a[1]).await
         }
+        // Test-image only: a browse after a sandbox freeze never rides a pre-freeze socket.
+        "stale-socket" => stale_socket::run().await,
         "" | "index.handler" | "fetch-hop.handler" => {
             let h = if arg.is_empty() { handler } else { arg };
             init(&h)?;
@@ -157,7 +161,7 @@ fn spawn_sampler() {
 /// load Chromium at all.
 fn needs_chromium() -> bool {
     match std::env::args().nth(1).unwrap_or_default().as_str() {
-        "kumo-lane" | "bench" | "index.handler" => true,
+        "kumo-lane" | "bench" | "stale-socket" | "index.handler" => true,
         "" => !handler_name().starts_with("fetch-hop"),
         _ => false,
     }
