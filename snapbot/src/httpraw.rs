@@ -157,7 +157,8 @@ pub async fn capture_http_raw(event: &Value) -> Result<Value> {
     let cookies = normalize_cookies(event.get("cookies").filter(|v| js::truthy(Some(v))).or_else(|| event.get("session_cookies")), &requested)?;
     let mut req_headers = Map::new();
     req_headers.insert("accept".into(), json!("*/*"));
-    req_headers.insert("user-agent".into(), json!("r66-evidence-attestor"));
+    // WHY: owner, verbatim: "User Agent must include the words 'Testing' and 'Snapbot'".
+    req_headers.insert("user-agent".into(), json!("r66-evidence-attestor Snapbot Testing"));
     if let Some(h) = event.get("headers").and_then(Value::as_object) {
         for (k, v) in h {
             if k.to_lowercase() != "cookie" {

@@ -419,6 +419,14 @@ pub fn initialize_or_exit() {
         log_file: CefString::from(root.join("cef.log").to_string_lossy().as_ref()),
         // Opaque white page background (see create_page).
         background_color: 0xFFFF_FFFF,
+        // WHY: every page snapbot loads must be identifiable as test traffic in
+        // server logs (the /agent/valuations request log showed a snapbot
+        // capture as a visitor). Owner, verbatim: "User Agent must include the
+        // words 'Testing' and 'Snapbot'". The product token keeps Chrome/<major>
+        // so sites sniffing Chrome render the same page.
+        user_agent_product: CefString::from(
+            format!("Chrome/{}.0.0.0 Snapbot Testing", sys::CHROME_VERSION_MAJOR).as_str(),
+        ),
         ..Default::default()
     };
     if initialize(Some(args.as_main_args()), Some(&settings), Some(&mut app), std::ptr::null_mut()) != 1 {
